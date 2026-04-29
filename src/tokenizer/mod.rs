@@ -4,9 +4,21 @@ use std::path::PathBuf;
 
 use arrow_array::Array;
 use arrow_array::cast::AsArray;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReader;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 pub type TokenId = u32;
+
+/// Returns the prefix of `text` that fits within `remaining` bytes,
+/// truncated at the nearest UTF-8 char boundary. Returns `None` if
+/// the budget is too small to fit even one char.
+fn fit_within_budget(text: &str, remaining: usize) -> Option<&str> {
+    if text.len() <= remaining {
+        return Some(text);
+    }
+    let cut = text.floor_char_boundary(remaining);
+    if cut == 0 { None } else { Some(&text[..cut]) }
+}
 
 pub struct BpeTokenizerTrainer {
     corpus_path: PathBuf,
@@ -42,29 +54,89 @@ impl BpeTokenizerTrainer {
         parquet_files.sort();
 
         Ok(CorpusIter {
-            parquet_files,
-            file_idx: 0,
-            reader: None,
-            batch: None,
-            row_idx: 0,
+            files: parquet_files.into_iter(),
+            state: State::NeedFile,
             chars_read: 0,
             max_chars: self.max_chars,
-            done: false,
         })
     }
 }
 
-use parquet::arrow::arrow_reader::ParquetRecordBatchReader;
+enum State {
+    NeedFile,
+    FetchingBatch(ParquetRecordBatchReader),
+    InBatch {
+        reader: ParquetRecordBatchReader,
+        batch: arrow_array::RecordBatch,
+        row_idx: usize,
+    },
+    Done,
+}
+
+struct BatchResult {
+    /// The item to yield, if any.
+    yielded: Option<io::Result<String>>,
+    /// True if the byte budget is exhausted — iterator should terminate after this.
+    budget_exhausted: bool,
+    /// Row index to resume from; only meaningful when the caller decides to continue.
+    next_row_idx: usize,
+}
+
+fn read_from_batch(
+    batch: &arrow_array::RecordBatch,
+    start_row: usize,
+    remaining: usize,
+) -> BatchResult {
+    let Some(text_col) = batch.column_by_name("text") else {
+        return BatchResult {
+            yielded: Some(Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "missing 'text' column",
+            ))),
+            budget_exhausted: false,
+            next_row_idx: start_row,
+        };
+    };
+    let strings = text_col.as_string::<i32>();
+
+    let mut row_idx = start_row;
+    while row_idx < strings.len() {
+        let i = row_idx;
+        row_idx += 1;
+
+        if strings.is_null(i) {
+            continue;
+        }
+
+        let text = strings.value(i);
+        let Some(prefix) = fit_within_budget(text, remaining) else {
+            return BatchResult {
+                yielded: None,
+                budget_exhausted: true,
+                next_row_idx: row_idx,
+            };
+        };
+
+        let truncated = prefix.len() < text.len();
+        return BatchResult {
+            yielded: Some(Ok(prefix.to_string())),
+            budget_exhausted: truncated,
+            next_row_idx: row_idx,
+        };
+    }
+
+    BatchResult {
+        yielded: None,
+        budget_exhausted: false,
+        next_row_idx: row_idx,
+    }
+}
 
 pub struct CorpusIter {
-    parquet_files: Vec<PathBuf>,
-    file_idx: usize,
-    reader: Option<ParquetRecordBatchReader>,
-    batch: Option<arrow_array::RecordBatch>,
-    row_idx: usize,
+    files: std::vec::IntoIter<PathBuf>,
+    state: State,
     chars_read: usize,
     max_chars: usize,
-    done: bool,
 }
 
 impl Iterator for CorpusIter {
@@ -72,93 +144,70 @@ impl Iterator for CorpusIter {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            if self.done {
-                return None;
-            }
+            match std::mem::replace(&mut self.state, State::Done) {
+                State::Done => return None,
 
-            // Try to yield from the current batch
-            if let Some(batch) = &self.batch {
-                let text_col = match batch.column_by_name("text") {
-                    Some(col) => col,
-                    None => {
-                        self.done = true;
-                        return Some(Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "missing 'text' column",
-                        )));
-                    }
-                };
-                let strings = text_col.as_string::<i32>();
-
-                while self.row_idx < strings.len() {
-                    let i = self.row_idx;
-                    self.row_idx += 1;
-
-                    if strings.is_null(i) {
-                        continue;
-                    }
-                    let text = strings.value(i);
-                    let remaining = self.max_chars - self.chars_read;
-                    if text.len() > remaining {
-                        let truncated = &text[..text.floor_char_boundary(remaining)];
-                        self.done = true;
-                        if !truncated.is_empty() {
-                            return Some(Ok(truncated.to_string()));
+                State::NeedFile => {
+                    let path = self.files.next()?;
+                    let file = match fs::File::open(path) {
+                        Ok(f) => f,
+                        Err(e) => return Some(Err(e)),
+                    };
+                    let reader = match ParquetRecordBatchReaderBuilder::try_new(file)
+                        .and_then(|b| b.build())
+                    {
+                        Ok(r) => r,
+                        Err(e) => {
+                            return Some(Err(io::Error::new(io::ErrorKind::InvalidData, e)));
                         }
-                        return None;
-                    }
-                    self.chars_read += text.len();
-                    return Some(Ok(text.to_string()));
+                    };
+                    self.state = State::FetchingBatch(reader);
                 }
 
-                // Batch exhausted, fall through to load next batch
-                self.batch = None;
-            }
-
-            // Try to get the next batch from the current reader
-            if let Some(reader) = &mut self.reader {
-                match reader.next() {
+                State::FetchingBatch(mut reader) => match reader.next() {
                     Some(Ok(batch)) => {
-                        self.batch = Some(batch);
-                        self.row_idx = 0;
-                        continue;
+                        self.state = State::InBatch {
+                            reader,
+                            batch,
+                            row_idx: 0,
+                        };
                     }
                     Some(Err(e)) => {
-                        self.done = true;
                         return Some(Err(io::Error::new(io::ErrorKind::InvalidData, e)));
                     }
                     None => {
-                        // Reader exhausted, fall through to open next file
-                        self.reader = None;
+                        self.state = State::NeedFile;
+                    }
+                },
+
+                State::InBatch {
+                    reader,
+                    batch,
+                    row_idx,
+                } => {
+                    let remaining = self.max_chars - self.chars_read;
+                    let result = read_from_batch(&batch, row_idx, remaining);
+                    match result.yielded {
+                        Some(Ok(text)) => {
+                            self.chars_read += text.len();
+                            if !result.budget_exhausted {
+                                self.state = State::InBatch {
+                                    reader,
+                                    batch,
+                                    row_idx: result.next_row_idx,
+                                };
+                            }
+                            return Some(Ok(text));
+                        }
+                        Some(Err(e)) => return Some(Err(e)),
+                        None => {
+                            if !result.budget_exhausted {
+                                self.state = State::FetchingBatch(reader);
+                            }
+                        }
                     }
                 }
             }
-
-            // Try to open the next parquet file
-            if self.file_idx >= self.parquet_files.len() {
-                self.done = true;
-                return None;
-            }
-
-            let path = &self.parquet_files[self.file_idx];
-            self.file_idx += 1;
-
-            let file = match fs::File::open(path) {
-                Ok(f) => f,
-                Err(e) => {
-                    self.done = true;
-                    return Some(Err(e));
-                }
-            };
-            let reader =
-                match ParquetRecordBatchReaderBuilder::try_new(file).and_then(|b| b.build()) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        self.done = true;
-                        return Some(Err(io::Error::new(io::ErrorKind::InvalidData, e)));
-                    }
-                };
-            self.reader = Some(reader);
         }
     }
 }
@@ -166,6 +215,31 @@ impl Iterator for CorpusIter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fit_within_budget_fits_when_under_budget() {
+        assert_eq!(fit_within_budget("hello", 100), Some("hello"));
+        assert_eq!(fit_within_budget("hello", 5), Some("hello"));
+    }
+
+    #[test]
+    fn fit_within_budget_truncates_at_byte_boundary() {
+        assert_eq!(fit_within_budget("hello world", 5), Some("hello"));
+    }
+
+    #[test]
+    fn fit_within_budget_truncates_at_char_boundary() {
+        // "café" is 5 bytes (é is 2 bytes); budget 4 falls inside é,
+        // so the cut should snap back to byte 3.
+        assert_eq!(fit_within_budget("café", 4), Some("caf"));
+    }
+
+    #[test]
+    fn fit_within_budget_returns_none_when_no_char_fits() {
+        assert_eq!(fit_within_budget("anything", 0), None);
+        // 2-byte char with a 1-byte budget: nothing fits.
+        assert_eq!(fit_within_budget("é", 1), None);
+    }
 
     #[test]
     fn read_corpus_not_a_directory() {
