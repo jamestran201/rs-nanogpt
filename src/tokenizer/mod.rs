@@ -14,9 +14,9 @@ pub struct BpeTokenizerTrainer {
 }
 
 impl BpeTokenizerTrainer {
-    pub fn new(corpus_path: PathBuf, max_chars: usize) -> Self {
+    pub fn new(corpus_path: impl Into<PathBuf>, max_chars: usize) -> Self {
         Self {
-            corpus_path,
+            corpus_path: corpus_path.into(),
             max_chars,
         }
     }
@@ -169,7 +169,7 @@ mod tests {
 
     #[test]
     fn read_corpus_not_a_directory() {
-        let trainer = BpeTokenizerTrainer::new(PathBuf::from("Cargo.toml"), 1000);
+        let trainer = BpeTokenizerTrainer::new("Cargo.toml", 1000);
         let err = trainer
             .read_corpus()
             .err()
@@ -179,7 +179,7 @@ mod tests {
 
     #[test]
     fn read_corpus_respects_max_chars() {
-        let trainer = BpeTokenizerTrainer::new(PathBuf::from("data"), 10000);
+        let trainer = BpeTokenizerTrainer::new("data", 10000);
         let corpus: Vec<String> = trainer
             .read_corpus()
             .unwrap()
