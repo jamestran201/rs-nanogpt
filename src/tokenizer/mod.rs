@@ -4,10 +4,21 @@ use std::path::PathBuf;
 
 use arrow_array::Array;
 use arrow_array::cast::AsArray;
+use fancy_regex::Regex;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReader;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 pub type TokenId = u32;
+
+const REGEX_PATTERNS: &[&str] = &[
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?",
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?",
+    r"\p{N}{1,3}",
+    r" ?[^\s\p{L}\p{N}]+[\r\n/]*",
+    r"\s*[\r\n]+",
+    r"\s+(?!\S)",
+    r"\s+",
+];
 
 /// Returns the prefix of `text` that fits within `remaining` bytes,
 /// truncated at the nearest UTF-8 char boundary. Returns `None` if
@@ -23,14 +34,32 @@ fn fit_within_budget(text: &str, remaining: usize) -> Option<&str> {
 pub struct BpeTokenizerTrainer {
     corpus_path: PathBuf,
     max_chars: usize,
+    pre_tokenize_pattern: Regex
 }
 
 impl BpeTokenizerTrainer {
     pub fn new(corpus_path: impl Into<PathBuf>, max_chars: usize) -> Self {
+        let pattern =
+            Regex::new(&REGEX_PATTERNS.join("|")).expect("Built-in regex pattern should be valid");
+
         Self {
             corpus_path: corpus_path.into(),
             max_chars,
+            pre_tokenize_pattern: pattern,
         }
+    }
+
+    fn pre_tokenize<'a>(pattern: Regex, text: &'a str) -> Vec<&'a str> {
+        let mut pieces = Vec::new();
+        let mut start = 0;
+        while let Some(m) = pattern
+            .find_from_pos(text, start)
+            .expect("Unexpected regex error in pre_tokenize")
+        {
+            pieces.push(&text[m.start()..m.end()]);
+            start = m.end();
+        }
+        pieces
     }
 
     pub fn read_corpus(&self) -> io::Result<CorpusIter> {
@@ -239,6 +268,64 @@ mod tests {
         assert_eq!(fit_within_budget("anything", 0), None);
         // 2-byte char with a 1-byte budget: nothing fits.
         assert_eq!(fit_within_budget("é", 1), None);
+    }
+
+    fn make_pattern() -> Regex {
+        Regex::new(&REGEX_PATTERNS.join("|")).unwrap()
+    }
+
+    #[test]
+    fn pre_tokenize_empty_string() {
+        let pieces = BpeTokenizerTrainer::pre_tokenize(make_pattern(), "");
+        assert!(pieces.is_empty());
+    }
+
+    #[test]
+    fn pre_tokenize_splits_words_with_leading_space() {
+        let pieces = BpeTokenizerTrainer::pre_tokenize(make_pattern(), "hello world");
+        assert_eq!(pieces, vec!["hello", " world"]);
+    }
+
+    #[test]
+    fn pre_tokenize_groups_digits_in_chunks_of_three() {
+        let pieces = BpeTokenizerTrainer::pre_tokenize(make_pattern(), "12345");
+        assert_eq!(pieces, vec!["123", "45"]);
+    }
+
+    #[test]
+    fn pre_tokenize_keeps_contractions_attached() {
+        let pieces = BpeTokenizerTrainer::pre_tokenize(make_pattern(), "don't");
+        assert_eq!(pieces, vec!["don't"]);
+    }
+
+    #[test]
+    fn pre_tokenize_pieces_concatenate_to_input() {
+        let input = "Hello, World! It's 2026, isn't it?";
+        let pieces = BpeTokenizerTrainer::pre_tokenize(make_pattern(), input);
+        assert_eq!(pieces.concat(), input);
+    }
+
+    #[test]
+    fn pre_tokenize_handles_newlines_without_dropping_bytes() {
+        let input = "hello\n\nworld";
+        let pieces = BpeTokenizerTrainer::pre_tokenize(make_pattern(), input);
+        assert_eq!(pieces.concat(), input);
+    }
+
+    #[test]
+    fn pre_tokenize_separates_punctuation_from_words() {
+        let pieces = BpeTokenizerTrainer::pre_tokenize(make_pattern(), "hi!");
+        assert_eq!(pieces, vec!["hi", "!"]);
+    }
+
+    #[test]
+    fn new_initializes_pre_tokenize_pattern() {
+        let trainer = BpeTokenizerTrainer::new("data", 100);
+        let pieces = BpeTokenizerTrainer::pre_tokenize(
+            trainer.pre_tokenize_pattern.clone(),
+            "hello world",
+        );
+        assert_eq!(pieces, vec!["hello", " world"]);
     }
 
     #[test]
