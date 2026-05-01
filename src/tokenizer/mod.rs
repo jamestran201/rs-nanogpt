@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
@@ -9,6 +10,15 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReader;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 pub type TokenId = u32;
+
+type Pair = (Vec<u8>, Vec<u8>);
+
+struct WordState {
+    bytes: Vec<Vec<u8>>,
+    next: Vec<Option<usize>>,
+    prev: Vec<Option<usize>>,
+    count: u64,
+}
 
 const REGEX_PATTERNS: &[&str] = &[
     r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?",
@@ -34,7 +44,7 @@ fn fit_within_budget(text: &str, remaining: usize) -> Option<&str> {
 pub struct BpeTokenizerTrainer {
     corpus_path: PathBuf,
     max_chars: usize,
-    pre_tokenize_pattern: Regex
+    pre_tokenize_pattern: Regex,
 }
 
 impl BpeTokenizerTrainer {
@@ -49,7 +59,7 @@ impl BpeTokenizerTrainer {
         }
     }
 
-    fn pre_tokenize<'a>(pattern: Regex, text: &'a str) -> Vec<&'a str> {
+    fn pre_tokenize<'a>(pattern: &Regex, text: &'a str) -> Vec<&'a str> {
         let mut pieces = Vec::new();
         let mut start = 0;
         while let Some(m) = pattern
@@ -60,6 +70,46 @@ impl BpeTokenizerTrainer {
             start = m.end();
         }
         pieces
+    }
+
+    fn count_pieces<I>(pattern: &Regex, docs: I) -> io::Result<HashMap<String, u64>>
+    where
+        I: IntoIterator<Item = io::Result<String>>,
+    {
+        let mut counts: HashMap<String, u64> = HashMap::new();
+        for doc in docs {
+            let doc = doc?;
+            for piece in Self::pre_tokenize(pattern, &doc) {
+                if let Some(c) = counts.get_mut(piece) {
+                    *c += 1;
+                } else {
+                    counts.insert(piece.to_string(), 1);
+                }
+            }
+        }
+        Ok(counts)
+    }
+
+    fn init_words(counts: HashMap<String, u64>) -> Vec<WordState> {
+        counts
+            .into_iter()
+            .map(|(piece, count)| {
+                let n = piece.len();
+                let bytes: Vec<Vec<u8>> = piece.as_bytes().iter().map(|b| vec![*b]).collect();
+                let next: Vec<Option<usize>> = (0..n)
+                    .map(|i| if i + 1 < n { Some(i + 1) } else { None })
+                    .collect();
+                let prev: Vec<Option<usize>> = (0..n)
+                    .map(|i| if i > 0 { Some(i - 1) } else { None })
+                    .collect();
+                WordState {
+                    bytes,
+                    next,
+                    prev,
+                    count,
+                }
+            })
+            .collect()
     }
 
     pub fn read_corpus(&self) -> io::Result<CorpusIter> {
@@ -276,55 +326,147 @@ mod tests {
 
     #[test]
     fn pre_tokenize_empty_string() {
-        let pieces = BpeTokenizerTrainer::pre_tokenize(make_pattern(), "");
+        let pieces = BpeTokenizerTrainer::pre_tokenize(&make_pattern(), "");
         assert!(pieces.is_empty());
     }
 
     #[test]
     fn pre_tokenize_splits_words_with_leading_space() {
-        let pieces = BpeTokenizerTrainer::pre_tokenize(make_pattern(), "hello world");
+        let pieces = BpeTokenizerTrainer::pre_tokenize(&make_pattern(), "hello world");
         assert_eq!(pieces, vec!["hello", " world"]);
     }
 
     #[test]
     fn pre_tokenize_groups_digits_in_chunks_of_three() {
-        let pieces = BpeTokenizerTrainer::pre_tokenize(make_pattern(), "12345");
+        let pieces = BpeTokenizerTrainer::pre_tokenize(&make_pattern(), "12345");
         assert_eq!(pieces, vec!["123", "45"]);
     }
 
     #[test]
     fn pre_tokenize_keeps_contractions_attached() {
-        let pieces = BpeTokenizerTrainer::pre_tokenize(make_pattern(), "don't");
+        let pieces = BpeTokenizerTrainer::pre_tokenize(&make_pattern(), "don't");
         assert_eq!(pieces, vec!["don't"]);
     }
 
     #[test]
     fn pre_tokenize_pieces_concatenate_to_input() {
         let input = "Hello, World! It's 2026, isn't it?";
-        let pieces = BpeTokenizerTrainer::pre_tokenize(make_pattern(), input);
+        let pieces = BpeTokenizerTrainer::pre_tokenize(&make_pattern(), input);
         assert_eq!(pieces.concat(), input);
     }
 
     #[test]
     fn pre_tokenize_handles_newlines_without_dropping_bytes() {
         let input = "hello\n\nworld";
-        let pieces = BpeTokenizerTrainer::pre_tokenize(make_pattern(), input);
+        let pieces = BpeTokenizerTrainer::pre_tokenize(&make_pattern(), input);
         assert_eq!(pieces.concat(), input);
     }
 
     #[test]
     fn pre_tokenize_separates_punctuation_from_words() {
-        let pieces = BpeTokenizerTrainer::pre_tokenize(make_pattern(), "hi!");
+        let pieces = BpeTokenizerTrainer::pre_tokenize(&make_pattern(), "hi!");
         assert_eq!(pieces, vec!["hi", "!"]);
+    }
+
+    fn counts_from(entries: &[(&str, u64)]) -> HashMap<String, u64> {
+        entries.iter().map(|(s, c)| (s.to_string(), *c)).collect()
+    }
+
+    #[test]
+    fn init_words_empty() {
+        let words = BpeTokenizerTrainer::init_words(HashMap::new());
+        assert!(words.is_empty());
+    }
+
+    #[test]
+    fn init_words_single_piece_builds_correct_links() {
+        let words = BpeTokenizerTrainer::init_words(counts_from(&[("hi", 1)]));
+        assert_eq!(words.len(), 1);
+        let w = &words[0];
+        assert_eq!(w.bytes, vec![vec![b'h'], vec![b'i']]);
+        assert_eq!(w.next, vec![Some(1), None]);
+        assert_eq!(w.prev, vec![None, Some(0)]);
+        assert_eq!(w.count, 1);
+    }
+
+    #[test]
+    fn init_words_single_byte_piece() {
+        let words = BpeTokenizerTrainer::init_words(counts_from(&[("a", 1)]));
+        assert_eq!(words.len(), 1);
+        let w = &words[0];
+        assert_eq!(w.bytes, vec![vec![b'a']]);
+        assert_eq!(w.next, vec![None]);
+        assert_eq!(w.prev, vec![None]);
+        assert_eq!(w.count, 1);
+    }
+
+    #[test]
+    fn init_words_preserves_count() {
+        let words = BpeTokenizerTrainer::init_words(counts_from(&[("the", 3)]));
+        assert_eq!(words.len(), 1);
+        assert_eq!(words[0].count, 3);
+        assert_eq!(words[0].bytes, vec![vec![b't'], vec![b'h'], vec![b'e']]);
+    }
+
+    #[test]
+    fn init_words_distinct_pieces() {
+        let words = BpeTokenizerTrainer::init_words(counts_from(&[("a", 2), ("b", 1)]));
+        assert_eq!(words.len(), 2);
+        let counts: HashMap<Vec<u8>, u64> = words
+            .iter()
+            .map(|w| (w.bytes.iter().flatten().copied().collect(), w.count))
+            .collect();
+        assert_eq!(counts.get(&vec![b'a']), Some(&2));
+        assert_eq!(counts.get(&vec![b'b']), Some(&1));
+    }
+
+    #[test]
+    fn init_words_splits_multibyte_chars_into_bytes() {
+        // "é" is 0xC3 0xA9 in UTF-8 — BPE operates on bytes, so 2 nodes.
+        let words = BpeTokenizerTrainer::init_words(counts_from(&[("é", 1)]));
+        assert_eq!(words.len(), 1);
+        let w = &words[0];
+        assert_eq!(w.bytes, vec![vec![0xC3], vec![0xA9]]);
+        assert_eq!(w.next, vec![Some(1), None]);
+        assert_eq!(w.prev, vec![None, Some(0)]);
+    }
+
+    #[test]
+    fn count_pieces_aggregates_across_documents() {
+        let pattern = make_pattern();
+        let docs = vec![Ok("hello world".to_string()), Ok("hello hello".to_string())];
+        let counts = BpeTokenizerTrainer::count_pieces(&pattern, docs).unwrap();
+        // "hello" once at start of doc1, "hello" at start of doc2, " hello" once.
+        // " world" once.
+        assert_eq!(counts.get("hello"), Some(&2));
+        assert_eq!(counts.get(" hello"), Some(&1));
+        assert_eq!(counts.get(" world"), Some(&1));
+    }
+
+    #[test]
+    fn count_pieces_propagates_io_errors() {
+        let pattern = make_pattern();
+        let docs: Vec<io::Result<String>> = vec![
+            Ok("ok".to_string()),
+            Err(io::Error::new(io::ErrorKind::Other, "boom")),
+        ];
+        let result = BpeTokenizerTrainer::count_pieces(&pattern, docs);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn count_pieces_empty_iterator() {
+        let pattern = make_pattern();
+        let docs: Vec<io::Result<String>> = vec![];
+        let counts = BpeTokenizerTrainer::count_pieces(&pattern, docs).unwrap();
+        assert!(counts.is_empty());
     }
 
     #[test]
     fn new_initializes_pre_tokenize_pattern() {
         let trainer = BpeTokenizerTrainer::new("data", 100);
-        let pieces = BpeTokenizerTrainer::pre_tokenize(
-            trainer.pre_tokenize_pattern.clone(),
-            "hello world",
-        );
+        let pieces =
+            BpeTokenizerTrainer::pre_tokenize(&trainer.pre_tokenize_pattern, "hello world");
         assert_eq!(pieces, vec!["hello", " world"]);
     }
 
