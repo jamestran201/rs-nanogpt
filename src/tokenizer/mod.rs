@@ -13,7 +13,7 @@ pub type TokenId = u32;
 
 type Pair = (Vec<u8>, Vec<u8>);
 
-struct WordState {
+struct PreTokenState {
     bytes: Vec<Vec<u8>>,
     next: Vec<Option<usize>>,
     prev: Vec<Option<usize>>,
@@ -60,49 +60,49 @@ impl BpeTokenizerTrainer {
     }
 
     fn pre_tokenize<'a>(pattern: &Regex, text: &'a str) -> Vec<&'a str> {
-        let mut pieces = Vec::new();
+        let mut pretokens = Vec::new();
         let mut start = 0;
         while let Some(m) = pattern
             .find_from_pos(text, start)
             .expect("Unexpected regex error in pre_tokenize")
         {
-            pieces.push(&text[m.start()..m.end()]);
+            pretokens.push(&text[m.start()..m.end()]);
             start = m.end();
         }
-        pieces
+        pretokens
     }
 
-    fn count_pieces<I>(pattern: &Regex, docs: I) -> io::Result<HashMap<String, u64>>
+    fn count_pretokens<I>(pattern: &Regex, docs: I) -> io::Result<HashMap<String, u64>>
     where
         I: IntoIterator<Item = io::Result<String>>,
     {
         let mut counts: HashMap<String, u64> = HashMap::new();
         for doc in docs {
             let doc = doc?;
-            for piece in Self::pre_tokenize(pattern, &doc) {
-                if let Some(c) = counts.get_mut(piece) {
+            for pretoken in Self::pre_tokenize(pattern, &doc) {
+                if let Some(c) = counts.get_mut(pretoken) {
                     *c += 1;
                 } else {
-                    counts.insert(piece.to_string(), 1);
+                    counts.insert(pretoken.to_string(), 1);
                 }
             }
         }
         Ok(counts)
     }
 
-    fn init_words(counts: HashMap<String, u64>) -> Vec<WordState> {
+    fn init_pretoken_states(counts: HashMap<String, u64>) -> Vec<PreTokenState> {
         counts
             .into_iter()
-            .map(|(piece, count)| {
-                let n = piece.len();
-                let bytes: Vec<Vec<u8>> = piece.as_bytes().iter().map(|b| vec![*b]).collect();
+            .map(|(pretoken, count)| {
+                let n = pretoken.len();
+                let bytes: Vec<Vec<u8>> = pretoken.as_bytes().iter().map(|b| vec![*b]).collect();
                 let next: Vec<Option<usize>> = (0..n)
                     .map(|i| if i + 1 < n { Some(i + 1) } else { None })
                     .collect();
                 let prev: Vec<Option<usize>> = (0..n)
                     .map(|i| if i > 0 { Some(i - 1) } else { None })
                     .collect();
-                WordState {
+                PreTokenState {
                     bytes,
                     next,
                     prev,
@@ -134,14 +134,14 @@ impl BpeTokenizerTrainer {
 
         Ok(CorpusIter {
             files: parquet_files.into_iter(),
-            state: State::NeedFile,
+            state: CorpusIterState::NeedFile,
             chars_read: 0,
             max_chars: self.max_chars,
         })
     }
 }
 
-enum State {
+enum CorpusIterState {
     NeedFile,
     FetchingBatch(ParquetRecordBatchReader),
     InBatch {
@@ -213,7 +213,7 @@ fn read_from_batch(
 
 pub struct CorpusIter {
     files: std::vec::IntoIter<PathBuf>,
-    state: State,
+    state: CorpusIterState,
     chars_read: usize,
     max_chars: usize,
 }
@@ -223,10 +223,10 @@ impl Iterator for CorpusIter {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            match std::mem::replace(&mut self.state, State::Done) {
-                State::Done => return None,
+            match std::mem::replace(&mut self.state, CorpusIterState::Done) {
+                CorpusIterState::Done => return None,
 
-                State::NeedFile => {
+                CorpusIterState::NeedFile => {
                     let path = self.files.next()?;
                     let file = match fs::File::open(path) {
                         Ok(f) => f,
@@ -240,12 +240,12 @@ impl Iterator for CorpusIter {
                             return Some(Err(io::Error::new(io::ErrorKind::InvalidData, e)));
                         }
                     };
-                    self.state = State::FetchingBatch(reader);
+                    self.state = CorpusIterState::FetchingBatch(reader);
                 }
 
-                State::FetchingBatch(mut reader) => match reader.next() {
+                CorpusIterState::FetchingBatch(mut reader) => match reader.next() {
                     Some(Ok(batch)) => {
-                        self.state = State::InBatch {
+                        self.state = CorpusIterState::InBatch {
                             reader,
                             batch,
                             row_idx: 0,
@@ -255,11 +255,11 @@ impl Iterator for CorpusIter {
                         return Some(Err(io::Error::new(io::ErrorKind::InvalidData, e)));
                     }
                     None => {
-                        self.state = State::NeedFile;
+                        self.state = CorpusIterState::NeedFile;
                     }
                 },
 
-                State::InBatch {
+                CorpusIterState::InBatch {
                     reader,
                     batch,
                     row_idx,
@@ -270,7 +270,7 @@ impl Iterator for CorpusIter {
                         Some(Ok(text)) => {
                             self.chars_read += text.len();
                             if !result.budget_exhausted {
-                                self.state = State::InBatch {
+                                self.state = CorpusIterState::InBatch {
                                     reader,
                                     batch,
                                     row_idx: result.next_row_idx,
@@ -281,7 +281,7 @@ impl Iterator for CorpusIter {
                         Some(Err(e)) => return Some(Err(e)),
                         None => {
                             if !result.budget_exhausted {
-                                self.state = State::FetchingBatch(reader);
+                                self.state = CorpusIterState::FetchingBatch(reader);
                             }
                         }
                     }
@@ -373,14 +373,14 @@ mod tests {
     }
 
     #[test]
-    fn init_words_empty() {
-        let words = BpeTokenizerTrainer::init_words(HashMap::new());
+    fn init_pretoken_states_empty() {
+        let words = BpeTokenizerTrainer::init_pretoken_states(HashMap::new());
         assert!(words.is_empty());
     }
 
     #[test]
-    fn init_words_single_piece_builds_correct_links() {
-        let words = BpeTokenizerTrainer::init_words(counts_from(&[("hi", 1)]));
+    fn init_pretoken_states_single_piece_builds_correct_links() {
+        let words = BpeTokenizerTrainer::init_pretoken_states(counts_from(&[("hi", 1)]));
         assert_eq!(words.len(), 1);
         let w = &words[0];
         assert_eq!(w.bytes, vec![vec![b'h'], vec![b'i']]);
@@ -390,8 +390,8 @@ mod tests {
     }
 
     #[test]
-    fn init_words_single_byte_piece() {
-        let words = BpeTokenizerTrainer::init_words(counts_from(&[("a", 1)]));
+    fn init_pretoken_states_single_byte_piece() {
+        let words = BpeTokenizerTrainer::init_pretoken_states(counts_from(&[("a", 1)]));
         assert_eq!(words.len(), 1);
         let w = &words[0];
         assert_eq!(w.bytes, vec![vec![b'a']]);
@@ -401,16 +401,16 @@ mod tests {
     }
 
     #[test]
-    fn init_words_preserves_count() {
-        let words = BpeTokenizerTrainer::init_words(counts_from(&[("the", 3)]));
+    fn init_pretoken_states_preserves_count() {
+        let words = BpeTokenizerTrainer::init_pretoken_states(counts_from(&[("the", 3)]));
         assert_eq!(words.len(), 1);
         assert_eq!(words[0].count, 3);
         assert_eq!(words[0].bytes, vec![vec![b't'], vec![b'h'], vec![b'e']]);
     }
 
     #[test]
-    fn init_words_distinct_pieces() {
-        let words = BpeTokenizerTrainer::init_words(counts_from(&[("a", 2), ("b", 1)]));
+    fn init_pretoken_states_distinct_pieces() {
+        let words = BpeTokenizerTrainer::init_pretoken_states(counts_from(&[("a", 2), ("b", 1)]));
         assert_eq!(words.len(), 2);
         let counts: HashMap<Vec<u8>, u64> = words
             .iter()
@@ -421,9 +421,9 @@ mod tests {
     }
 
     #[test]
-    fn init_words_splits_multibyte_chars_into_bytes() {
+    fn init_pretoken_states_splits_multibyte_chars_into_bytes() {
         // "é" is 0xC3 0xA9 in UTF-8 — BPE operates on bytes, so 2 nodes.
-        let words = BpeTokenizerTrainer::init_words(counts_from(&[("é", 1)]));
+        let words = BpeTokenizerTrainer::init_pretoken_states(counts_from(&[("é", 1)]));
         assert_eq!(words.len(), 1);
         let w = &words[0];
         assert_eq!(w.bytes, vec![vec![0xC3], vec![0xA9]]);
@@ -432,10 +432,10 @@ mod tests {
     }
 
     #[test]
-    fn count_pieces_aggregates_across_documents() {
+    fn count_pretokens_aggregates_across_documents() {
         let pattern = make_pattern();
         let docs = vec![Ok("hello world".to_string()), Ok("hello hello".to_string())];
-        let counts = BpeTokenizerTrainer::count_pieces(&pattern, docs).unwrap();
+        let counts = BpeTokenizerTrainer::count_pretokens(&pattern, docs).unwrap();
         // "hello" once at start of doc1, "hello" at start of doc2, " hello" once.
         // " world" once.
         assert_eq!(counts.get("hello"), Some(&2));
@@ -444,21 +444,21 @@ mod tests {
     }
 
     #[test]
-    fn count_pieces_propagates_io_errors() {
+    fn count_pretokens_propagates_io_errors() {
         let pattern = make_pattern();
         let docs: Vec<io::Result<String>> = vec![
             Ok("ok".to_string()),
             Err(io::Error::new(io::ErrorKind::Other, "boom")),
         ];
-        let result = BpeTokenizerTrainer::count_pieces(&pattern, docs);
+        let result = BpeTokenizerTrainer::count_pretokens(&pattern, docs);
         assert!(result.is_err());
     }
 
     #[test]
-    fn count_pieces_empty_iterator() {
+    fn count_pretokens_empty_iterator() {
         let pattern = make_pattern();
         let docs: Vec<io::Result<String>> = vec![];
-        let counts = BpeTokenizerTrainer::count_pieces(&pattern, docs).unwrap();
+        let counts = BpeTokenizerTrainer::count_pretokens(&pattern, docs).unwrap();
         assert!(counts.is_empty());
     }
 
