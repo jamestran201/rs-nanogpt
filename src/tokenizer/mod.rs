@@ -72,12 +72,12 @@ impl BpeTokenizerTrainer {
         pretokens
     }
 
-    fn count_pretokens<I>(pattern: &Regex, docs: I) -> io::Result<HashMap<String, u64>>
+    fn count_pretokens<I>(pattern: &Regex, corpus_iter: I) -> io::Result<HashMap<String, u64>>
     where
         I: IntoIterator<Item = io::Result<String>>,
     {
         let mut counts: HashMap<String, u64> = HashMap::new();
-        for doc in docs {
+        for doc in corpus_iter {
             let doc = doc?;
             for pretoken in Self::pre_tokenize(pattern, &doc) {
                 if let Some(c) = counts.get_mut(pretoken) {
@@ -112,6 +112,24 @@ impl BpeTokenizerTrainer {
             .collect()
     }
 
+    fn init_pair_tables(
+        states: &[PreTokenState],
+    ) -> (HashMap<Pair, u64>, HashMap<Pair, Vec<(usize, usize)>>) {
+        let mut pair_counts: HashMap<Pair, u64> = HashMap::new();
+        let mut pair_locations: HashMap<Pair, Vec<(usize, usize)>> = HashMap::new();
+
+        for (state_idx, state) in states.iter().enumerate() {
+            for left in 0..state.bytes.len() {
+                let Some(right) = state.next[left] else { continue };
+                let pair = (state.bytes[left].clone(), state.bytes[right].clone());
+                *pair_counts.entry(pair.clone()).or_insert(0) += state.count;
+                pair_locations.entry(pair).or_default().push((state_idx, left));
+            }
+        }
+
+        (pair_counts, pair_locations)
+    }
+
     pub fn read_corpus(&self) -> io::Result<CorpusIter> {
         if !self.corpus_path.is_dir() {
             return Err(io::Error::new(
@@ -138,6 +156,12 @@ impl BpeTokenizerTrainer {
             chars_read: 0,
             max_chars: self.max_chars,
         })
+    }
+
+    fn prepare_pretoken_states(&self) -> io::Result<Vec<PreTokenState>> {
+        let corpus_iter = self.read_corpus()?;
+        let counts = Self::count_pretokens(&self.pre_tokenize_pattern, corpus_iter)?;
+        Ok(Self::init_pretoken_states(counts))
     }
 }
 
@@ -432,6 +456,59 @@ mod tests {
     }
 
     #[test]
+    fn init_pair_tables_empty_input() {
+        let (counts, locs) = BpeTokenizerTrainer::init_pair_tables(&[]);
+        assert!(counts.is_empty());
+        assert!(locs.is_empty());
+    }
+
+    #[test]
+    fn init_pair_tables_single_byte_state_has_no_pairs() {
+        let states = BpeTokenizerTrainer::init_pretoken_states(counts_from(&[("a", 4)]));
+        let (counts, locs) = BpeTokenizerTrainer::init_pair_tables(&states);
+        assert!(counts.is_empty());
+        assert!(locs.is_empty());
+    }
+
+    #[test]
+    fn init_pair_tables_two_byte_state_records_one_pair() {
+        let states = BpeTokenizerTrainer::init_pretoken_states(counts_from(&[("ab", 5)]));
+        let (counts, locs) = BpeTokenizerTrainer::init_pair_tables(&states);
+        let pair = (vec![b'a'], vec![b'b']);
+        assert_eq!(counts.get(&pair), Some(&5));
+        assert_eq!(locs.get(&pair), Some(&vec![(0, 0)]));
+        assert_eq!(counts.len(), 1);
+    }
+
+    #[test]
+    fn init_pair_tables_three_byte_state_records_adjacent_pairs() {
+        let states = BpeTokenizerTrainer::init_pretoken_states(counts_from(&[("abc", 2)]));
+        let (counts, locs) = BpeTokenizerTrainer::init_pair_tables(&states);
+        let ab = (vec![b'a'], vec![b'b']);
+        let bc = (vec![b'b'], vec![b'c']);
+        assert_eq!(counts.get(&ab), Some(&2));
+        assert_eq!(counts.get(&bc), Some(&2));
+        assert_eq!(locs.get(&ab), Some(&vec![(0, 0)]));
+        assert_eq!(locs.get(&bc), Some(&vec![(0, 1)]));
+    }
+
+    #[test]
+    fn init_pair_tables_aggregates_shared_pair_across_states() {
+        // Two distinct states sharing the (a,b) pair, with counts 3 and 4.
+        let states =
+            BpeTokenizerTrainer::init_pretoken_states(counts_from(&[("ab", 3), ("abx", 4)]));
+        let (counts, locs) = BpeTokenizerTrainer::init_pair_tables(&states);
+        let ab = (vec![b'a'], vec![b'b']);
+        assert_eq!(counts.get(&ab), Some(&7));
+        let ab_locs = locs.get(&ab).unwrap();
+        assert_eq!(ab_locs.len(), 2);
+        // HashMap iteration order over states is non-deterministic — assert as a set.
+        let set: std::collections::HashSet<_> = ab_locs.iter().copied().collect();
+        assert!(set.contains(&(0, 0)));
+        assert!(set.contains(&(1, 0)));
+    }
+
+    #[test]
     fn count_pretokens_aggregates_across_documents() {
         let pattern = make_pattern();
         let docs = vec![Ok("hello world".to_string()), Ok("hello hello".to_string())];
@@ -478,6 +555,17 @@ mod tests {
             .err()
             .expect("should fail for non-directory");
         assert_eq!(err.kind(), io::ErrorKind::NotADirectory);
+    }
+
+    #[test]
+    fn prepare_pretoken_states_produces_nonempty_states() {
+        let trainer = BpeTokenizerTrainer::new("data", 10000);
+        let states = trainer.prepare_pretoken_states().unwrap();
+        assert!(!states.is_empty());
+        for s in &states {
+            assert!(!s.bytes.is_empty());
+            assert!(s.count >= 1);
+        }
     }
 
     #[test]
