@@ -123,7 +123,9 @@ impl BpeTokenizerTrainer {
 
         for (state_idx, state) in states.iter().enumerate() {
             for left in 0..state.bytes.len() {
-                let Some(right) = state.next[left] else { continue };
+                let Some(right) = state.next[left] else {
+                    continue;
+                };
                 let pair = (state.bytes[left].clone(), state.bytes[right].clone());
                 let entry = pair_info.entry(pair).or_default();
                 entry.count += state.count;
@@ -140,6 +142,92 @@ impl BpeTokenizerTrainer {
             .filter(|(_, info)| info.count > 0)
             .max_by(|(p1, i1), (p2, i2)| i1.count.cmp(&i2.count).then_with(|| p1.cmp(p2)))
             .map(|(pair, _)| pair.clone())
+    }
+
+    fn merge_pair(
+        pair: Pair,
+        states: &mut [PreTokenState],
+        pair_info: &mut HashMap<Pair, PairInfo>,
+    ) -> Vec<u8> {
+        let mut merged = Vec::with_capacity(pair.0.len() + pair.1.len());
+        merged.extend_from_slice(&pair.0);
+        merged.extend_from_slice(&pair.1);
+
+        let locations = pair_info
+            .remove(&pair)
+            .map(|info| info.locations)
+            .unwrap_or_default();
+
+        let mut merged_any = false;
+
+        for (state_idx, left) in locations {
+            let state = &mut states[state_idx];
+
+            let Some(right) = state.next[left] else {
+                continue;
+            };
+            if state.bytes[left] != pair.0 || state.bytes[right] != pair.1 {
+                continue;
+            }
+
+            let before = state.prev[left];
+            let after = state.next[right];
+            let count = state.count;
+
+            if let Some(b_idx) = before {
+                let key = (state.bytes[b_idx].clone(), state.bytes[left].clone());
+                if let Some(info) = pair_info.get_mut(&key) {
+                    assert!(
+                        info.count >= count,
+                        "pair count underflow: left-neighbor pair count {} < merge count {}",
+                        info.count,
+                        count,
+                    );
+                    info.count -= count;
+                }
+            }
+            if let Some(a_idx) = after {
+                let key = (state.bytes[right].clone(), state.bytes[a_idx].clone());
+                if let Some(info) = pair_info.get_mut(&key) {
+                    assert!(
+                        info.count >= count,
+                        "pair count underflow: right-neighbor pair count {} < merge count {}",
+                        info.count,
+                        count,
+                    );
+                    info.count -= count;
+                }
+            }
+
+            state.bytes[left] = merged.clone();
+            state.bytes[right] = Vec::new();
+            state.next[left] = after;
+            if let Some(a_idx) = after {
+                state.prev[a_idx] = Some(left);
+            }
+
+            if let Some(b_idx) = before {
+                let key = (state.bytes[b_idx].clone(), merged.clone());
+                let entry = pair_info.entry(key).or_default();
+                entry.count += count;
+                entry.locations.push((state_idx, b_idx));
+            }
+            if let Some(a_idx) = after {
+                let key = (merged.clone(), state.bytes[a_idx].clone());
+                let entry = pair_info.entry(key).or_default();
+                entry.count += count;
+                entry.locations.push((state_idx, left));
+            }
+
+            merged_any = true;
+        }
+
+        assert!(
+            merged_any,
+            "merge_pair called on pair with no live locations — count/location invariant violated",
+        );
+
+        merged
     }
 
     pub fn read_corpus(&self) -> io::Result<CorpusIter> {
@@ -525,7 +613,10 @@ mod tests {
     }
 
     fn info(count: u64) -> PairInfo {
-        PairInfo { count, locations: Vec::new() }
+        PairInfo {
+            count,
+            locations: Vec::new(),
+        }
     }
 
     #[test]
@@ -586,6 +677,104 @@ mod tests {
             BpeTokenizerTrainer::find_best_pair(&counts),
             Some(pair(b"c", b"d"))
         );
+    }
+
+    /// Walks `state`'s linked list from the head and collects the live byte
+    /// sequences in order. Used to assert the post-merge shape of a state.
+    fn live_bytes(state: &PreTokenState) -> Vec<Vec<u8>> {
+        let head = (0..state.bytes.len())
+            .find(|&i| state.prev[i].is_none())
+            .expect("state must have a head");
+        let mut result = Vec::new();
+        let mut cur = Some(head);
+        while let Some(i) = cur {
+            result.push(state.bytes[i].clone());
+            cur = state.next[i];
+        }
+        result
+    }
+
+    fn setup(pretokens: &[(&str, u64)]) -> (Vec<PreTokenState>, HashMap<Pair, PairInfo>) {
+        let states = BpeTokenizerTrainer::init_pretoken_states(counts_from(pretokens));
+        let pair_info = BpeTokenizerTrainer::init_pair_tables(&states);
+        (states, pair_info)
+    }
+
+    #[test]
+    fn merge_pair_two_byte_word_collapses_to_single_node() {
+        let (mut states, mut info) = setup(&[("ab", 1)]);
+        let merged = BpeTokenizerTrainer::merge_pair(pair(b"a", b"b"), &mut states, &mut info);
+        assert_eq!(merged, b"ab".to_vec());
+        assert_eq!(live_bytes(&states[0]), vec![b"ab".to_vec()]);
+        assert!(info.get(&pair(b"a", b"b")).is_none());
+    }
+
+    #[test]
+    fn merge_pair_three_byte_word_updates_right_neighbor_pair() {
+        let (mut states, mut info) = setup(&[("abc", 1)]);
+        let merged = BpeTokenizerTrainer::merge_pair(pair(b"a", b"b"), &mut states, &mut info);
+        assert_eq!(merged, b"ab".to_vec());
+        assert_eq!(live_bytes(&states[0]), vec![b"ab".to_vec(), b"c".to_vec()]);
+        assert_eq!(info.get(&pair(b"b", b"c")).map(|i| i.count), Some(0));
+        let abc_entry = info.get(&pair(b"ab", b"c")).expect("(ab,c) should exist");
+        assert_eq!(abc_entry.count, 1);
+        assert_eq!(abc_entry.locations, vec![(0, 0)]);
+    }
+
+    #[test]
+    fn merge_pair_three_byte_word_updates_left_neighbor_pair() {
+        let (mut states, mut info) = setup(&[("xab", 1)]);
+        BpeTokenizerTrainer::merge_pair(pair(b"a", b"b"), &mut states, &mut info);
+        assert_eq!(live_bytes(&states[0]), vec![b"x".to_vec(), b"ab".to_vec()]);
+        assert_eq!(info.get(&pair(b"x", b"a")).map(|i| i.count), Some(0));
+        let entry = info.get(&pair(b"x", b"ab")).expect("(x,ab) should exist");
+        assert_eq!(entry.count, 1);
+        assert_eq!(entry.locations, vec![(0, 0)]);
+    }
+
+    #[test]
+    fn merge_pair_handles_repeated_non_overlapping_pair() {
+        let (mut states, mut info) = setup(&[("abab", 1)]);
+        BpeTokenizerTrainer::merge_pair(pair(b"a", b"b"), &mut states, &mut info);
+        assert_eq!(live_bytes(&states[0]), vec![b"ab".to_vec(), b"ab".to_vec()]);
+        assert!(info.get(&pair(b"a", b"b")).is_none());
+        let entry = info.get(&pair(b"ab", b"ab")).expect("(ab,ab) should exist");
+        assert_eq!(entry.count, 1);
+    }
+
+    #[test]
+    fn merge_pair_skips_stale_overlapping_locations() {
+        let (mut states, mut info) = setup(&[("aaa", 1)]);
+        BpeTokenizerTrainer::merge_pair(pair(b"a", b"a"), &mut states, &mut info);
+        assert_eq!(live_bytes(&states[0]), vec![b"aa".to_vec(), b"a".to_vec()]);
+        assert!(info.get(&pair(b"a", b"a")).is_none());
+        let entry = info.get(&pair(b"aa", b"a")).expect("(aa,a) should exist");
+        assert_eq!(entry.count, 1);
+    }
+
+    #[test]
+    fn merge_pair_aggregates_across_multiple_states() {
+        let (mut states, mut info) = setup(&[("ab", 3), ("abx", 4)]);
+        BpeTokenizerTrainer::merge_pair(pair(b"a", b"b"), &mut states, &mut info);
+        let (ab_state, abx_state): (&PreTokenState, &PreTokenState) = {
+            let mut iter = states.iter();
+            let s0 = iter.next().unwrap();
+            let s1 = iter.next().unwrap();
+            if s0.count == 3 { (s0, s1) } else { (s1, s0) }
+        };
+        assert_eq!(live_bytes(ab_state), vec![b"ab".to_vec()]);
+        assert_eq!(live_bytes(abx_state), vec![b"ab".to_vec(), b"x".to_vec()]);
+        assert!(info.get(&pair(b"a", b"b")).is_none());
+        let new_entry = info.get(&pair(b"ab", b"x")).expect("(ab,x) should exist");
+        assert_eq!(new_entry.count, 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "merge_pair called on pair with no live locations")]
+    fn merge_pair_panics_when_pair_has_no_live_locations() {
+        let (mut states, mut info) = setup(&[("ab", 1)]);
+        // (x, y) is not in pair_info at all → locations Vec is empty → no live merges.
+        BpeTokenizerTrainer::merge_pair(pair(b"x", b"y"), &mut states, &mut info);
     }
 
     #[test]
