@@ -20,6 +20,12 @@ struct PreTokenState {
     count: u64,
 }
 
+#[derive(Default)]
+struct PairInfo {
+    count: u64,
+    locations: Vec<(usize, usize)>,
+}
+
 const REGEX_PATTERNS: &[&str] = &[
     r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?",
     r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?",
@@ -112,22 +118,28 @@ impl BpeTokenizerTrainer {
             .collect()
     }
 
-    fn init_pair_tables(
-        states: &[PreTokenState],
-    ) -> (HashMap<Pair, u64>, HashMap<Pair, Vec<(usize, usize)>>) {
-        let mut pair_counts: HashMap<Pair, u64> = HashMap::new();
-        let mut pair_locations: HashMap<Pair, Vec<(usize, usize)>> = HashMap::new();
+    fn init_pair_tables(states: &[PreTokenState]) -> HashMap<Pair, PairInfo> {
+        let mut pair_info: HashMap<Pair, PairInfo> = HashMap::new();
 
         for (state_idx, state) in states.iter().enumerate() {
             for left in 0..state.bytes.len() {
                 let Some(right) = state.next[left] else { continue };
                 let pair = (state.bytes[left].clone(), state.bytes[right].clone());
-                *pair_counts.entry(pair.clone()).or_insert(0) += state.count;
-                pair_locations.entry(pair).or_default().push((state_idx, left));
+                let entry = pair_info.entry(pair).or_default();
+                entry.count += state.count;
+                entry.locations.push((state_idx, left));
             }
         }
 
-        (pair_counts, pair_locations)
+        pair_info
+    }
+
+    fn find_best_pair(pair_info: &HashMap<Pair, PairInfo>) -> Option<Pair> {
+        pair_info
+            .iter()
+            .filter(|(_, info)| info.count > 0)
+            .max_by(|(p1, i1), (p2, i2)| i1.count.cmp(&i2.count).then_with(|| p1.cmp(p2)))
+            .map(|(pair, _)| pair.clone())
     }
 
     pub fn read_corpus(&self) -> io::Result<CorpusIter> {
@@ -457,39 +469,40 @@ mod tests {
 
     #[test]
     fn init_pair_tables_empty_input() {
-        let (counts, locs) = BpeTokenizerTrainer::init_pair_tables(&[]);
-        assert!(counts.is_empty());
-        assert!(locs.is_empty());
+        let info = BpeTokenizerTrainer::init_pair_tables(&[]);
+        assert!(info.is_empty());
     }
 
     #[test]
     fn init_pair_tables_single_byte_state_has_no_pairs() {
         let states = BpeTokenizerTrainer::init_pretoken_states(counts_from(&[("a", 4)]));
-        let (counts, locs) = BpeTokenizerTrainer::init_pair_tables(&states);
-        assert!(counts.is_empty());
-        assert!(locs.is_empty());
+        let info = BpeTokenizerTrainer::init_pair_tables(&states);
+        assert!(info.is_empty());
     }
 
     #[test]
     fn init_pair_tables_two_byte_state_records_one_pair() {
         let states = BpeTokenizerTrainer::init_pretoken_states(counts_from(&[("ab", 5)]));
-        let (counts, locs) = BpeTokenizerTrainer::init_pair_tables(&states);
+        let info = BpeTokenizerTrainer::init_pair_tables(&states);
         let pair = (vec![b'a'], vec![b'b']);
-        assert_eq!(counts.get(&pair), Some(&5));
-        assert_eq!(locs.get(&pair), Some(&vec![(0, 0)]));
-        assert_eq!(counts.len(), 1);
+        let entry = info.get(&pair).expect("pair should be present");
+        assert_eq!(entry.count, 5);
+        assert_eq!(entry.locations, vec![(0, 0)]);
+        assert_eq!(info.len(), 1);
     }
 
     #[test]
     fn init_pair_tables_three_byte_state_records_adjacent_pairs() {
         let states = BpeTokenizerTrainer::init_pretoken_states(counts_from(&[("abc", 2)]));
-        let (counts, locs) = BpeTokenizerTrainer::init_pair_tables(&states);
+        let info = BpeTokenizerTrainer::init_pair_tables(&states);
         let ab = (vec![b'a'], vec![b'b']);
         let bc = (vec![b'b'], vec![b'c']);
-        assert_eq!(counts.get(&ab), Some(&2));
-        assert_eq!(counts.get(&bc), Some(&2));
-        assert_eq!(locs.get(&ab), Some(&vec![(0, 0)]));
-        assert_eq!(locs.get(&bc), Some(&vec![(0, 1)]));
+        let ab_entry = info.get(&ab).expect("ab pair should be present");
+        let bc_entry = info.get(&bc).expect("bc pair should be present");
+        assert_eq!(ab_entry.count, 2);
+        assert_eq!(ab_entry.locations, vec![(0, 0)]);
+        assert_eq!(bc_entry.count, 2);
+        assert_eq!(bc_entry.locations, vec![(0, 1)]);
     }
 
     #[test]
@@ -497,15 +510,82 @@ mod tests {
         // Two distinct states sharing the (a,b) pair, with counts 3 and 4.
         let states =
             BpeTokenizerTrainer::init_pretoken_states(counts_from(&[("ab", 3), ("abx", 4)]));
-        let (counts, locs) = BpeTokenizerTrainer::init_pair_tables(&states);
+        let info = BpeTokenizerTrainer::init_pair_tables(&states);
         let ab = (vec![b'a'], vec![b'b']);
-        assert_eq!(counts.get(&ab), Some(&7));
-        let ab_locs = locs.get(&ab).unwrap();
-        assert_eq!(ab_locs.len(), 2);
-        // HashMap iteration order over states is non-deterministic — assert as a set.
-        let set: std::collections::HashSet<_> = ab_locs.iter().copied().collect();
+        let entry = info.get(&ab).expect("ab pair should be present");
+        assert_eq!(entry.count, 7);
+        assert_eq!(entry.locations.len(), 2);
+        let set: std::collections::HashSet<_> = entry.locations.iter().copied().collect();
         assert!(set.contains(&(0, 0)));
         assert!(set.contains(&(1, 0)));
+    }
+
+    fn pair(a: &[u8], b: &[u8]) -> Pair {
+        (a.to_vec(), b.to_vec())
+    }
+
+    fn info(count: u64) -> PairInfo {
+        PairInfo { count, locations: Vec::new() }
+    }
+
+    #[test]
+    fn find_best_pair_empty_map_returns_none() {
+        let counts: HashMap<Pair, PairInfo> = HashMap::new();
+        assert_eq!(BpeTokenizerTrainer::find_best_pair(&counts), None);
+    }
+
+    #[test]
+    fn find_best_pair_all_zero_counts_returns_none() {
+        let mut counts: HashMap<Pair, PairInfo> = HashMap::new();
+        counts.insert(pair(b"a", b"b"), info(0));
+        counts.insert(pair(b"c", b"d"), info(0));
+        assert_eq!(BpeTokenizerTrainer::find_best_pair(&counts), None);
+    }
+
+    #[test]
+    fn find_best_pair_single_entry_returned() {
+        let mut counts: HashMap<Pair, PairInfo> = HashMap::new();
+        counts.insert(pair(b"a", b"b"), info(7));
+        assert_eq!(
+            BpeTokenizerTrainer::find_best_pair(&counts),
+            Some(pair(b"a", b"b"))
+        );
+    }
+
+    #[test]
+    fn find_best_pair_skips_zero_count_entries() {
+        let mut counts: HashMap<Pair, PairInfo> = HashMap::new();
+        counts.insert(pair(b"a", b"b"), info(0));
+        counts.insert(pair(b"c", b"d"), info(3));
+        assert_eq!(
+            BpeTokenizerTrainer::find_best_pair(&counts),
+            Some(pair(b"c", b"d"))
+        );
+    }
+
+    #[test]
+    fn find_best_pair_picks_highest_count() {
+        let mut counts: HashMap<Pair, PairInfo> = HashMap::new();
+        counts.insert(pair(b"a", b"b"), info(2));
+        counts.insert(pair(b"c", b"d"), info(9));
+        counts.insert(pair(b"e", b"f"), info(5));
+        assert_eq!(
+            BpeTokenizerTrainer::find_best_pair(&counts),
+            Some(pair(b"c", b"d"))
+        );
+    }
+
+    #[test]
+    fn find_best_pair_tie_broken_lexicographically() {
+        let mut counts: HashMap<Pair, PairInfo> = HashMap::new();
+        counts.insert(pair(b"a", b"b"), info(5));
+        counts.insert(pair(b"c", b"d"), info(5));
+        counts.insert(pair(b"a", b"a"), info(5));
+        // All tied at 5; lex-max pair wins.
+        assert_eq!(
+            BpeTokenizerTrainer::find_best_pair(&counts),
+            Some(pair(b"c", b"d"))
+        );
     }
 
     #[test]
