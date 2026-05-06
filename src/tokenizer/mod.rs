@@ -1,10 +1,13 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 use arrow_array::Array;
 use arrow_array::cast::AsArray;
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use fancy_regex::Regex;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReader;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -244,6 +247,25 @@ impl BpeTokenizerTrainer {
             merges.push(merged);
         }
         merges
+    }
+
+    fn write_vocab(output_path: &Path, merges: &[Vec<u8>]) -> io::Result<()> {
+        let file = fs::File::create(output_path)?;
+        let mut writer = io::BufWriter::new(file);
+
+        for byte in 0u32..256 {
+            let b64 = STANDARD.encode([byte as u8]);
+            writeln!(writer, "{} {}", b64, byte + 1)?;
+        }
+
+        for (i, merge) in merges.iter().enumerate() {
+            let rank = 257 + i;
+            let b64 = STANDARD.encode(merge);
+            writeln!(writer, "{} {}", b64, rank)?;
+        }
+
+        writer.flush()?;
+        Ok(())
     }
 
     pub fn read_corpus(&self) -> io::Result<CorpusIter> {
@@ -835,6 +857,99 @@ mod tests {
         let (mut states, mut info) = setup(&[("ab", 5), ("cd", 5)]);
         let merges = BpeTokenizerTrainer::learn_merges(&mut states, &mut info, 2);
         assert_eq!(merges, vec![b"cd".to_vec(), b"ab".to_vec()]);
+    }
+
+    #[test]
+    fn write_vocab_no_merges_writes_256_byte_lines() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        BpeTokenizerTrainer::write_vocab(temp.path(), &[]).unwrap();
+        let contents = fs::read_to_string(temp.path()).unwrap();
+        assert_eq!(contents.lines().count(), 256);
+    }
+
+    #[test]
+    fn write_vocab_byte_tokens_have_sequential_ranks_starting_at_one() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        BpeTokenizerTrainer::write_vocab(temp.path(), &[]).unwrap();
+        let contents = fs::read_to_string(temp.path()).unwrap();
+        for (i, line) in contents.lines().enumerate() {
+            let (_, rank_str) = line
+                .split_once(' ')
+                .expect("each line must have base64 and rank separated by space");
+            let rank: usize = rank_str.parse().unwrap();
+            assert_eq!(rank, i + 1);
+        }
+    }
+
+    #[test]
+    fn write_vocab_byte_tokens_decode_to_single_bytes() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        BpeTokenizerTrainer::write_vocab(temp.path(), &[]).unwrap();
+        let contents = fs::read_to_string(temp.path()).unwrap();
+        for (i, line) in contents.lines().enumerate() {
+            let (b64, _) = line.split_once(' ').unwrap();
+            let bytes = STANDARD.decode(b64).unwrap();
+            assert_eq!(bytes, vec![i as u8]);
+        }
+    }
+
+    #[test]
+    fn write_vocab_appends_merges_after_byte_tokens() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let merges = vec![b"ab".to_vec(), b"the".to_vec()];
+        BpeTokenizerTrainer::write_vocab(temp.path(), &merges).unwrap();
+        let contents = fs::read_to_string(temp.path()).unwrap();
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 258);
+
+        let (b64_first_merge, rank_first_merge) = lines[256].split_once(' ').unwrap();
+        assert_eq!(rank_first_merge, "257");
+        assert_eq!(STANDARD.decode(b64_first_merge).unwrap(), b"ab".to_vec());
+
+        let (b64_second_merge, rank_second_merge) = lines[257].split_once(' ').unwrap();
+        assert_eq!(rank_second_merge, "258");
+        assert_eq!(STANDARD.decode(b64_second_merge).unwrap(), b"the".to_vec());
+    }
+
+    #[test]
+    fn write_vocab_overwrites_existing_file() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        BpeTokenizerTrainer::write_vocab(temp.path(), &[b"ab".to_vec()]).unwrap();
+        BpeTokenizerTrainer::write_vocab(temp.path(), &[b"xy".to_vec(), b"zz".to_vec()]).unwrap();
+        let contents = fs::read_to_string(temp.path()).unwrap();
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 258);
+        let (b64_256, _) = lines[256].split_once(' ').unwrap();
+        assert_eq!(STANDARD.decode(b64_256).unwrap(), b"xy".to_vec());
+        let (b64_257, _) = lines[257].split_once(' ').unwrap();
+        assert_eq!(STANDARD.decode(b64_257).unwrap(), b"zz".to_vec());
+    }
+
+    #[test]
+    fn write_vocab_round_trips_via_reference_parser() {
+        // Mirrors the rs-text-chunker tiktoken parser: split_once(' '),
+        // parse rank as integer, base64-decode bytes.
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let merges = vec![b"hello".to_vec(), b" world".to_vec()];
+        BpeTokenizerTrainer::write_vocab(temp.path(), &merges).unwrap();
+        let contents = fs::read_to_string(temp.path()).unwrap();
+
+        let parsed: Vec<(u32, Vec<u8>)> = contents
+            .lines()
+            .map(|line| {
+                let (b64, rank_str) = line.split_once(' ').unwrap();
+                let rank: u32 = rank_str.parse().unwrap();
+                let bytes = STANDARD.decode(b64).unwrap();
+                (rank, bytes)
+            })
+            .collect();
+
+        assert_eq!(parsed.len(), 258);
+        for i in 0..256 {
+            assert_eq!(parsed[i], ((i + 1) as u32, vec![i as u8]));
+        }
+        assert_eq!(parsed[256], (257, b"hello".to_vec()));
+        assert_eq!(parsed[257], (258, b" world".to_vec()));
     }
 
     #[test]
