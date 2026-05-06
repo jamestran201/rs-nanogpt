@@ -230,6 +230,22 @@ impl BpeTokenizerTrainer {
         merged
     }
 
+    fn learn_merges(
+        states: &mut [PreTokenState],
+        pair_info: &mut HashMap<Pair, PairInfo>,
+        num_merges: usize,
+    ) -> Vec<Vec<u8>> {
+        let mut merges = Vec::with_capacity(num_merges);
+        for _ in 0..num_merges {
+            let Some(pair) = Self::find_best_pair(pair_info) else {
+                break;
+            };
+            let merged = Self::merge_pair(pair, states, pair_info);
+            merges.push(merged);
+        }
+        merges
+    }
+
     pub fn read_corpus(&self) -> io::Result<CorpusIter> {
         if !self.corpus_path.is_dir() {
             return Err(io::Error::new(
@@ -775,6 +791,50 @@ mod tests {
         let (mut states, mut info) = setup(&[("ab", 1)]);
         // (x, y) is not in pair_info at all → locations Vec is empty → no live merges.
         BpeTokenizerTrainer::merge_pair(pair(b"x", b"y"), &mut states, &mut info);
+    }
+
+    #[test]
+    fn learn_merges_zero_iterations_returns_empty() {
+        let (mut states, mut info) = setup(&[("ab", 1)]);
+        let merges = BpeTokenizerTrainer::learn_merges(&mut states, &mut info, 0);
+        assert!(merges.is_empty());
+    }
+
+    #[test]
+    fn learn_merges_no_pairs_returns_empty() {
+        let (mut states, mut info) = setup(&[("a", 4)]);
+        let merges = BpeTokenizerTrainer::learn_merges(&mut states, &mut info, 10);
+        assert!(merges.is_empty());
+    }
+
+    #[test]
+    fn learn_merges_repeated_pair_then_compounds() {
+        let (mut states, mut info) = setup(&[("abab", 1)]);
+        let merges = BpeTokenizerTrainer::learn_merges(&mut states, &mut info, 2);
+        assert_eq!(merges, vec![b"ab".to_vec(), b"abab".to_vec()]);
+    }
+
+    #[test]
+    fn learn_merges_picks_higher_count_pair_first() {
+        let (mut states, mut info) = setup(&[("ab", 5), ("cd", 3)]);
+        let merges = BpeTokenizerTrainer::learn_merges(&mut states, &mut info, 1);
+        assert_eq!(merges, vec![b"ab".to_vec()]);
+    }
+
+    #[test]
+    fn learn_merges_stops_early_when_corpus_exhausted() {
+        let (mut states, mut info) = setup(&[("ab", 1)]);
+        let merges = BpeTokenizerTrainer::learn_merges(&mut states, &mut info, 5);
+        assert_eq!(merges, vec![b"ab".to_vec()]);
+    }
+
+    #[test]
+    fn learn_merges_deterministic_tie_breaking() {
+        // (a,b) and (c,d) both have count 5; lex-max (c,d) wins first,
+        // then (a,b) is the only remaining pair.
+        let (mut states, mut info) = setup(&[("ab", 5), ("cd", 5)]);
+        let merges = BpeTokenizerTrainer::learn_merges(&mut states, &mut info, 2);
+        assert_eq!(merges, vec![b"cd".to_vec(), b"ab".to_vec()]);
     }
 
     #[test]
