@@ -290,7 +290,7 @@ impl BpeTokenizerTrainer {
         Ok(())
     }
 
-    pub fn read_corpus(&self) -> io::Result<CorpusIter> {
+    fn read_corpus(&self) -> io::Result<CorpusIter> {
         if !self.corpus_path.is_dir() {
             return Err(io::Error::new(
                 io::ErrorKind::NotADirectory,
