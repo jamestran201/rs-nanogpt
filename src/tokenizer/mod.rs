@@ -245,6 +245,9 @@ impl BpeTokenizerTrainer {
             };
             let merged = Self::merge_pair(pair, states, pair_info);
             merges.push(merged);
+            if merges.len() % 100 == 0 {
+                eprintln!("trained {} / {} merges", merges.len(), num_merges);
+            }
         }
         merges
     }
@@ -265,6 +268,25 @@ impl BpeTokenizerTrainer {
         }
 
         writer.flush()?;
+        Ok(())
+    }
+
+    pub fn train(&self, output_path: impl AsRef<Path>, vocab_size: usize) -> io::Result<()> {
+        if vocab_size < 256 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("vocab_size must be at least 256, got {vocab_size}"),
+            ));
+        }
+        let num_merges = vocab_size - 256;
+
+        let mut states = self.prepare_pretoken_states()?;
+        let mut pair_info = Self::init_pair_tables(&states);
+        let merges = Self::learn_merges(&mut states, &mut pair_info, num_merges);
+
+        eprintln!("trained {} merges (target: {})", merges.len(), num_merges);
+
+        Self::write_vocab(output_path.as_ref(), &merges)?;
         Ok(())
     }
 
@@ -950,6 +972,68 @@ mod tests {
         }
         assert_eq!(parsed[256], (257, b"hello".to_vec()));
         assert_eq!(parsed[257], (258, b" world".to_vec()));
+    }
+
+    #[test]
+    fn train_rejects_vocab_size_below_256() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let trainer = BpeTokenizerTrainer::new("data", 10000);
+        let err = trainer
+            .train(temp.path(), 100)
+            .err()
+            .expect("should error for vocab_size < 256");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn train_vocab_size_256_writes_only_byte_tokens() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let trainer = BpeTokenizerTrainer::new("data", 10000);
+        trainer.train(temp.path(), 256).unwrap();
+        let contents = fs::read_to_string(temp.path()).unwrap();
+        assert_eq!(contents.lines().count(), 256);
+    }
+
+    #[test]
+    fn train_writes_target_vocab_size() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let trainer = BpeTokenizerTrainer::new("data", 10000);
+        trainer.train(temp.path(), 300).unwrap();
+        let contents = fs::read_to_string(temp.path()).unwrap();
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 300);
+        for (i, line) in lines.iter().enumerate() {
+            let (_, rank_str) = line.split_once(' ').unwrap();
+            let rank: usize = rank_str.parse().unwrap();
+            assert_eq!(rank, i + 1);
+        }
+    }
+
+    #[test]
+    fn train_output_decodes_via_reference_parser() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let trainer = BpeTokenizerTrainer::new("data", 10000);
+        trainer.train(temp.path(), 300).unwrap();
+        let contents = fs::read_to_string(temp.path()).unwrap();
+
+        let parsed: Vec<(u32, Vec<u8>)> = contents
+            .lines()
+            .map(|line| {
+                let (b64, rank_str) = line.split_once(' ').unwrap();
+                let rank: u32 = rank_str.parse().unwrap();
+                let bytes = STANDARD.decode(b64).unwrap();
+                (rank, bytes)
+            })
+            .collect();
+
+        assert_eq!(parsed.len(), 300);
+        for i in 0..256 {
+            assert_eq!(parsed[i], ((i + 1) as u32, vec![i as u8]));
+        }
+        for i in 256..300 {
+            assert_eq!(parsed[i].0, (i + 1) as u32);
+            assert!(!parsed[i].1.is_empty(), "merge bytes should not be empty");
+        }
     }
 
     #[test]
