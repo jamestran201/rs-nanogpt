@@ -9,7 +9,8 @@ cargo run --release -- train-tokenizer \
     --corpus data \
     --output vocab.txt \
     --vocab-size 512 \
-    --max-chars 10000
+    --max-chars 10000 \
+    --doc-cap 10000
 ```
 
 Flags:
@@ -20,6 +21,7 @@ Flags:
 | `--output` | Path where the vocabulary will be written. |
 | `--vocab-size` | Target vocabulary size. Must be at least 256. Default: 512. |
 | `--max-chars` | Maximum number of bytes to read from the corpus. |
+| `--doc-cap` | Maximum bytes per document; longer documents are truncated at a UTF-8 char boundary so a few unusually long documents can't dominate BPE pair statistics. Default: 10000. |
 
 The output file is in tiktoken format — one token per line, `<base64-encoded-bytes> <rank>`, with the 256 single-byte tokens at ranks 1–256 and learned merges at ranks 257+.
 

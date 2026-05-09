@@ -85,17 +85,19 @@ fn fit_within_budget(text: &str, remaining: usize) -> Option<&str> {
 pub struct BpeTokenizerTrainer {
     corpus_path: PathBuf,
     max_chars: usize,
+    doc_cap: usize,
     pre_tokenize_pattern: Regex,
 }
 
 impl BpeTokenizerTrainer {
-    pub fn new(corpus_path: impl Into<PathBuf>, max_chars: usize) -> Self {
+    pub fn new(corpus_path: impl Into<PathBuf>, max_chars: usize, doc_cap: usize) -> Self {
         let pattern =
             Regex::new(&REGEX_PATTERNS.join("|")).expect("Built-in regex pattern should be valid");
 
         Self {
             corpus_path: corpus_path.into(),
             max_chars,
+            doc_cap,
             pre_tokenize_pattern: pattern,
         }
     }
@@ -366,6 +368,7 @@ impl BpeTokenizerTrainer {
             state: CorpusIterState::NeedFile,
             chars_read: 0,
             max_chars: self.max_chars,
+            doc_cap: self.doc_cap,
         })
     }
 
@@ -400,6 +403,7 @@ fn read_from_batch(
     batch: &arrow_array::RecordBatch,
     start_row: usize,
     remaining: usize,
+    doc_cap: usize,
 ) -> BatchResult {
     let Some(text_col) = batch.column_by_name("text") else {
         return BatchResult {
@@ -423,18 +427,26 @@ fn read_from_batch(
         }
 
         let text = strings.value(i);
-        let Some(prefix) = fit_within_budget(text, remaining) else {
-            return BatchResult {
-                yielded: None,
-                budget_exhausted: true,
-                next_row_idx: row_idx,
-            };
+        let doc_max = doc_cap.min(text.len());
+        let effective_max = doc_max.min(remaining);
+        // Only the global budget terminates iteration; doc_cap truncation does not.
+        let global_limited = remaining < doc_max;
+
+        let Some(prefix) = fit_within_budget(text, effective_max) else {
+            if global_limited {
+                return BatchResult {
+                    yielded: None,
+                    budget_exhausted: true,
+                    next_row_idx: row_idx,
+                };
+            }
+            // doc_cap is smaller than the first char's byte length; skip this doc.
+            continue;
         };
 
-        let truncated = prefix.len() < text.len();
         return BatchResult {
             yielded: Some(Ok(prefix.to_string())),
-            budget_exhausted: truncated,
+            budget_exhausted: global_limited,
             next_row_idx: row_idx,
         };
     }
@@ -451,6 +463,7 @@ pub struct CorpusIter {
     state: CorpusIterState,
     chars_read: usize,
     max_chars: usize,
+    doc_cap: usize,
 }
 
 impl Iterator for CorpusIter {
@@ -500,7 +513,7 @@ impl Iterator for CorpusIter {
                     row_idx,
                 } => {
                     let remaining = self.max_chars - self.chars_read;
-                    let result = read_from_batch(&batch, row_idx, remaining);
+                    let result = read_from_batch(&batch, row_idx, remaining, self.doc_cap);
                     match result.yielded {
                         Some(Ok(text)) => {
                             self.chars_read += text.len();
@@ -1139,7 +1152,7 @@ mod tests {
     #[test]
     fn train_rejects_vocab_size_below_256() {
         let temp = tempfile::NamedTempFile::new().unwrap();
-        let trainer = BpeTokenizerTrainer::new("data", 10000);
+        let trainer = BpeTokenizerTrainer::new("data", 10000, usize::MAX);
         let err = trainer
             .train(temp.path(), 100)
             .err()
@@ -1150,7 +1163,7 @@ mod tests {
     #[test]
     fn train_vocab_size_256_writes_only_byte_tokens() {
         let temp = tempfile::NamedTempFile::new().unwrap();
-        let trainer = BpeTokenizerTrainer::new("data", 10000);
+        let trainer = BpeTokenizerTrainer::new("data", 10000, usize::MAX);
         trainer.train(temp.path(), 256).unwrap();
         let contents = fs::read_to_string(temp.path()).unwrap();
         assert_eq!(contents.lines().count(), 256);
@@ -1159,7 +1172,7 @@ mod tests {
     #[test]
     fn train_writes_target_vocab_size() {
         let temp = tempfile::NamedTempFile::new().unwrap();
-        let trainer = BpeTokenizerTrainer::new("data", 10000);
+        let trainer = BpeTokenizerTrainer::new("data", 10000, usize::MAX);
         trainer.train(temp.path(), 300).unwrap();
         let contents = fs::read_to_string(temp.path()).unwrap();
         let lines: Vec<&str> = contents.lines().collect();
@@ -1174,7 +1187,7 @@ mod tests {
     #[test]
     fn train_output_decodes_via_reference_parser() {
         let temp = tempfile::NamedTempFile::new().unwrap();
-        let trainer = BpeTokenizerTrainer::new("data", 10000);
+        let trainer = BpeTokenizerTrainer::new("data", 10000, usize::MAX);
         trainer.train(temp.path(), 300).unwrap();
         let contents = fs::read_to_string(temp.path()).unwrap();
 
@@ -1231,7 +1244,7 @@ mod tests {
 
     #[test]
     fn new_initializes_pre_tokenize_pattern() {
-        let trainer = BpeTokenizerTrainer::new("data", 100);
+        let trainer = BpeTokenizerTrainer::new("data", 100, usize::MAX);
         let pieces =
             BpeTokenizerTrainer::pre_tokenize(&trainer.pre_tokenize_pattern, "hello world");
         assert_eq!(pieces, vec!["hello", " world"]);
@@ -1239,7 +1252,7 @@ mod tests {
 
     #[test]
     fn read_corpus_not_a_directory() {
-        let trainer = BpeTokenizerTrainer::new("Cargo.toml", 1000);
+        let trainer = BpeTokenizerTrainer::new("Cargo.toml", 1000, usize::MAX);
         let err = trainer
             .read_corpus()
             .err()
@@ -1249,7 +1262,7 @@ mod tests {
 
     #[test]
     fn prepare_pretoken_states_produces_nonempty_states() {
-        let trainer = BpeTokenizerTrainer::new("data", 10000);
+        let trainer = BpeTokenizerTrainer::new("data", 10000, usize::MAX);
         let states = trainer.prepare_pretoken_states().unwrap();
         assert!(!states.is_empty());
         for s in &states {
@@ -1260,7 +1273,7 @@ mod tests {
 
     #[test]
     fn read_corpus_respects_max_chars() {
-        let trainer = BpeTokenizerTrainer::new("data", 10000);
+        let trainer = BpeTokenizerTrainer::new("data", 10000, usize::MAX);
         let corpus: Vec<String> = trainer
             .read_corpus()
             .unwrap()
@@ -1269,5 +1282,65 @@ mod tests {
         let total_chars: usize = corpus.iter().map(|s| s.len()).sum();
         assert!(!corpus.is_empty());
         assert!(total_chars <= 10000);
+    }
+
+    fn batch_with_texts(texts: Vec<&str>) -> arrow_array::RecordBatch {
+        let arr: arrow_array::ArrayRef =
+            std::sync::Arc::new(arrow_array::StringArray::from(texts));
+        arrow_array::RecordBatch::try_from_iter([("text", arr)]).unwrap()
+    }
+
+    #[test]
+    fn doc_cap_no_truncation_when_doc_shorter() {
+        let doc = "x".repeat(1_000);
+        let batch = batch_with_texts(vec![doc.as_str()]);
+        let result = read_from_batch(&batch, 0, usize::MAX, 5_000);
+        let yielded = result.yielded.expect("must yield").unwrap();
+        assert_eq!(yielded.len(), 1_000);
+        assert!(!result.budget_exhausted);
+    }
+
+    #[test]
+    fn doc_cap_with_multibyte_truncates_at_char_boundary() {
+        // "abcdé" is 6 bytes (é is 2 bytes); cap=5 falls inside é, so the
+        // cut should snap back to byte 4.
+        let doc = "abcdé";
+        assert_eq!(doc.len(), 6);
+        let batch = batch_with_texts(vec![doc]);
+        let result = read_from_batch(&batch, 0, usize::MAX, 5);
+        let yielded = result.yielded.expect("must yield").unwrap();
+        assert!(yielded.len() <= 5);
+        assert_eq!(yielded, "abcd");
+        let _ = String::from_utf8(yielded.into_bytes()).expect("must round-trip via UTF-8");
+        assert!(!result.budget_exhausted);
+    }
+
+    #[test]
+    fn doc_cap_does_not_terminate_iteration() {
+        let long = "a".repeat(20_000);
+        let batch = batch_with_texts(vec![long.as_str(), "next"]);
+        let r1 = read_from_batch(&batch, 0, usize::MAX, 5_000);
+        let y1 = r1.yielded.expect("must yield").unwrap();
+        assert_eq!(y1.len(), 5_000);
+        assert!(
+            !r1.budget_exhausted,
+            "doc_cap truncation must not signal budget_exhausted"
+        );
+        let r2 = read_from_batch(&batch, r1.next_row_idx, usize::MAX, 5_000);
+        let y2 = r2.yielded.expect("must yield").unwrap();
+        assert_eq!(y2, "next");
+        assert!(!r2.budget_exhausted);
+    }
+
+    #[test]
+    fn global_budget_still_terminates() {
+        let long = "a".repeat(20_000);
+        let batch = batch_with_texts(vec![long.as_str()]);
+        // Global remaining (100) is smaller than doc_cap (5_000), so the
+        // global budget cuts us short and iteration must terminate.
+        let result = read_from_batch(&batch, 0, 100, 5_000);
+        let yielded = result.yielded.expect("must yield").unwrap();
+        assert_eq!(yielded.len(), 100);
+        assert!(result.budget_exhausted);
     }
 }

@@ -26,6 +26,11 @@ enum Command {
         /// Maximum number of bytes to read from the corpus.
         #[arg(long)]
         max_chars: usize,
+        /// Maximum bytes per document. Documents longer than this are
+        /// truncated (at a UTF-8 char boundary) so a few unusually long
+        /// documents can't dominate BPE pair statistics.
+        #[arg(long, default_value_t = 10_000)]
+        doc_cap: usize,
     },
 }
 
@@ -37,8 +42,9 @@ fn main() -> std::io::Result<()> {
             output,
             vocab_size,
             max_chars,
+            doc_cap,
         } => {
-            let trainer = BpeTokenizerTrainer::new(corpus, max_chars);
+            let trainer = BpeTokenizerTrainer::new(corpus, max_chars, doc_cap);
             trainer.train(output, vocab_size)?;
         }
     }
