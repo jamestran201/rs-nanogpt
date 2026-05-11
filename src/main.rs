@@ -1,7 +1,9 @@
 use std::path::PathBuf;
+use std::process;
 
 use clap::{Parser, Subcommand};
-use rs_nanogpt::tokenizer::BpeTokenizerTrainer;
+use rs_nanogpt::eval::tokenizer as tokenizer_eval;
+use rs_nanogpt::tokenizer::{BpeTokenizer, BpeTokenizerTrainer};
 
 #[derive(Parser)]
 #[command(name = "rs-nanogpt", version, about = "nanoGPT-style training tools")]
@@ -32,6 +34,12 @@ enum Command {
         #[arg(long, default_value_t = 10_000)]
         doc_cap: usize,
     },
+    /// Evaluate a trained tokenizer on a small set of text fixtures.
+    EvalTokenizer {
+        /// Path to a tiktoken-format vocabulary file.
+        #[arg(long)]
+        vocab: PathBuf,
+    },
 }
 
 fn main() -> std::io::Result<()> {
@@ -46,6 +54,14 @@ fn main() -> std::io::Result<()> {
         } => {
             let trainer = BpeTokenizerTrainer::new(corpus, max_chars, doc_cap);
             trainer.train(output, vocab_size)?;
+        }
+        Command::EvalTokenizer { vocab } => {
+            let tok = BpeTokenizer::from_file(vocab)?;
+            let results = tokenizer_eval::eval_fixtures(&tok);
+            tokenizer_eval::print_table(&results);
+            if !results.iter().all(|r| r.round_trip_ok) {
+                process::exit(1);
+            }
         }
     }
     Ok(())

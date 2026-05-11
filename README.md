@@ -26,3 +26,24 @@ Flags:
 The output file is in tiktoken format — one token per line, `<base64-encoded-bytes> <rank>`, with the 256 single-byte tokens at ranks 1–256 and learned merges at ranks 257+.
 
 Run `cargo run -- train-tokenizer --help` for the full flag list.
+
+## Evaluating a tokenizer
+
+Load a trained vocabulary, encode and decode a small set of built-in text fixtures, and print compression ratios:
+
+```sh
+cargo run --release -- eval-tokenizer --vocab target/vocab.txt
+```
+
+Example output:
+
+```
+fixture         bytes     tokens    bytes/token  round_trip
+en               2431       1189          2.045          ok
+korean            585        583          1.003          ok
+code              372        309          1.204          ok
+```
+
+Each fixture is encoded then decoded; `round_trip` is `ok` when the decoded bytes match the input exactly. `bytes/token` is the compression ratio — higher is better.
+
+The fixtures (English prose, Korean, and a code snippet) are embedded into the binary and live under `tests/fixtures/eval/`.

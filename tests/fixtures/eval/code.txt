@@ -1,0 +1,20 @@
+fn fibonacci(n: u32) -> u64 {
+    let (mut a, mut b) = (0u64, 1u64);
+    for _ in 0..n {
+        let next = a + b;
+        a = b;
+        b = next;
+    }
+    a
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn first_ten() {
+        let xs: Vec<u64> = (0..10).map(fibonacci).collect();
+        assert_eq!(xs, vec![0, 1, 1, 2, 3, 5, 8, 13, 21, 34]);
+    }
+}
