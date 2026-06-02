@@ -7,8 +7,14 @@ edition = "2024"
 arrow-array = "58.1.0"
 base64 = "0.22.1"
 candle-core = { git = "https://github.com/huggingface/candle.git", version = "0.10.2" }
+candle-nn = { git = "https://github.com/huggingface/candle.git", version = "0.10.2" }
 clap = { version = "4.6.1", features = ["derive"] }
 fancy-regex = "0.18.0"
 parquet = { version = "58.1.0", default-features = false, features = ["arrow", "zstd"] }
 rayon = "1.12.0"
 tempfile = "3.27.0"
+
+[features]
+default = []
+metal = ["candle-core/metal", "candle-nn/metal"]
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
