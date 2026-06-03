@@ -12,8 +12,7 @@ pub struct TokenEmbedding {
 
 impl TokenEmbedding {
     /// Register the embedding weight under `vb` and initialise it with
-    /// `Normal(0, 0.8)`
-    /// docstring claims 1.0). The weight is created as a trainable variable in
+    /// `Normal(0, 0.8)`. The weight is created as a trainable variable in
     /// the builder's `VarMap`, ready for the optimizer and checkpointing.
     pub fn new(cfg: &GptConfig, vb: VarBuilder) -> Result<Self> {
         let weight = vb.get_with_hints(
