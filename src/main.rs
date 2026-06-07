@@ -3,6 +3,10 @@ use std::process;
 
 use clap::{Parser, Subcommand};
 use rs_nanogpt::eval::tokenizer as tokenizer_eval;
+use rs_nanogpt::model::{
+    DEFAULT_N_EMBD, DEFAULT_N_HEAD, DEFAULT_N_LAYER, DEFAULT_NORM_EPS, DEFAULT_ROPE_BASE,
+    DEFAULT_SEQUENCE_LEN, DEFAULT_VOCAB_SIZE, GptConfig,
+};
 use rs_nanogpt::tokenizer::{BpeTokenizer, BpeTokenizerTrainer};
 
 #[derive(Parser)]
@@ -40,6 +44,30 @@ enum Command {
         #[arg(long)]
         vocab: PathBuf,
     },
+    /// Pretrain a GPT model.
+    Pretrain {
+        /// Tokenizer vocabulary size.
+        #[arg(long, default_value_t = DEFAULT_VOCAB_SIZE)]
+        vocab_size: usize,
+        /// Maximum context length (tokens per training example).
+        #[arg(long, default_value_t = DEFAULT_SEQUENCE_LEN)]
+        sequence_len: usize,
+        /// Number of transformer blocks.
+        #[arg(long, default_value_t = DEFAULT_N_LAYER)]
+        n_layer: usize,
+        /// Number of attention heads.
+        #[arg(long, default_value_t = DEFAULT_N_HEAD)]
+        n_head: usize,
+        /// Residual-stream width. Must be divisible by n_head.
+        #[arg(long, default_value_t = DEFAULT_N_EMBD)]
+        n_embd: usize,
+        /// RoPE frequency base (larger base = longer effective context).
+        #[arg(long, default_value_t = DEFAULT_ROPE_BASE)]
+        rope_base: f32,
+        /// RMSNorm epsilon.
+        #[arg(long, default_value_t = DEFAULT_NORM_EPS)]
+        norm_eps: f32,
+    },
 }
 
 fn main() -> std::io::Result<()> {
@@ -63,6 +91,46 @@ fn main() -> std::io::Result<()> {
                 process::exit(1);
             }
         }
+        Command::Pretrain {
+            vocab_size,
+            sequence_len,
+            n_layer,
+            n_head,
+            n_embd,
+            rope_base,
+            norm_eps,
+        } => {
+            let config = GptConfig {
+                vocab_size,
+                sequence_len,
+                n_layer,
+                n_head,
+                n_embd,
+                rope_base,
+                norm_eps,
+            };
+            if let Err(err) = config.validate() {
+                eprintln!("invalid config: {err}");
+                process::exit(1);
+            }
+            print_config_summary(&config);
+            // TODO(pretraining): assemble the GPT model, optimizer, data loader,
+            // WSD schedule, and training/eval loop. See
+            // writeups/pretraining-mvp-architecture.md.
+            eprintln!("\nnote: training loop not yet implemented (config scaffold only).");
+        }
     }
     Ok(())
+}
+
+fn print_config_summary(config: &GptConfig) {
+    println!("GPT config:");
+    println!("  vocab_size   {}", config.vocab_size);
+    println!("  sequence_len {}", config.sequence_len);
+    println!("  n_layer      {}", config.n_layer);
+    println!("  n_head       {}", config.n_head);
+    println!("  n_embd       {}", config.n_embd);
+    println!("  head_dim     {}  (n_embd / n_head)", config.head_dim());
+    println!("  rope_base    {}", config.rope_base);
+    println!("  norm_eps     {}", config.norm_eps);
 }
