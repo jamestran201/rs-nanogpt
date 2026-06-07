@@ -1,11 +1,13 @@
 use std::path::PathBuf;
 use std::process;
 
+use candle_core::DType;
+use candle_nn::{VarBuilder, VarMap};
 use clap::{Parser, Subcommand};
 use rs_nanogpt::eval::tokenizer as tokenizer_eval;
 use rs_nanogpt::model::{
     DEFAULT_N_EMBD, DEFAULT_N_HEAD, DEFAULT_N_LAYER, DEFAULT_NORM_EPS, DEFAULT_ROPE_BASE,
-    DEFAULT_SEQUENCE_LEN, DEFAULT_VOCAB_SIZE, GptConfig,
+    DEFAULT_SEQUENCE_LEN, DEFAULT_VOCAB_SIZE, Gpt, GptConfig, default_device,
 };
 use rs_nanogpt::tokenizer::{BpeTokenizer, BpeTokenizerTrainer};
 
@@ -114,12 +116,33 @@ fn main() -> std::io::Result<()> {
                 process::exit(1);
             }
             print_config_summary(&config);
-            // TODO(pretraining): assemble the GPT model, optimizer, data loader,
-            // WSD schedule, and training/eval loop. See
+            if let Err(err) = build_model(config) {
+                eprintln!("failed to build model: {err}");
+                process::exit(1);
+            }
+            // TODO(pretraining): add the transformer blocks, optimizer, data
+            // loader, WSD schedule, and training/eval loop. See
             // writeups/pretraining-mvp-architecture.md.
-            eprintln!("\nnote: training loop not yet implemented (config scaffold only).");
+            eprintln!("\nnote: training loop not yet implemented (model scaffold only).");
         }
     }
+    Ok(())
+}
+
+/// Build the GPT model on the selected device with fresh-init weights, holding
+/// its parameters in a `VarMap` (ready for the optimizer/checkpointing later).
+fn build_model(config: GptConfig) -> candle_core::Result<()> {
+    let device = default_device()?;
+    let varmap = VarMap::new();
+    let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+    let _model = Gpt::new(config, vb)?;
+
+    let n_params: usize = varmap
+        .all_vars()
+        .iter()
+        .map(|v| v.elem_count())
+        .sum();
+    println!("\nmodel built on {device:?}: {n_params} parameters");
     Ok(())
 }
 
