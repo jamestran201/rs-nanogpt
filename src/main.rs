@@ -120,9 +120,9 @@ fn main() -> std::io::Result<()> {
                 eprintln!("failed to build model: {err}");
                 process::exit(1);
             }
-            // TODO(pretraining): add the transformer blocks, optimizer, data
-            // loader, WSD schedule, and training/eval loop. See
-            // writeups/pretraining-mvp-architecture.md.
+            // TODO(pretraining): add the optimizer, data loader, WSD schedule,
+            // and training/eval loop (the full model forward pass now exists).
+            // See writeups/pretraining-mvp-architecture.md.
             eprintln!("\nnote: training loop not yet implemented (model scaffold only).");
         }
     }

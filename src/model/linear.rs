@@ -13,6 +13,13 @@ impl Linear {
         Self::with_init(in_dim, out_dim, Init::Uniform { lo: -s, up: s }, vb)
     }
 
+    /// `Normal(0, std)` init — used for the `lm_head` unembedding, with a
+    /// deliberately tiny `std` so the initial logits are near-uniform and the
+    /// loss starts at ≈ ln(vocab).
+    pub fn normal(in_dim: usize, out_dim: usize, std: f64, vb: VarBuilder) -> Result<Self> {
+        Self::with_init(in_dim, out_dim, Init::Randn { mean: 0.0, stdev: std }, vb)
+    }
+
     /// Zero init — used for the residual output projections (`c_proj`,
     /// `mlp.c_proj`). Starting these at zero makes each block the identity at
     /// init, so the residual stream is a clean highway and early training is

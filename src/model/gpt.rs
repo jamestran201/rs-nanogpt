@@ -1,23 +1,51 @@
 use candle_core::{Result, Tensor};
 use candle_nn::VarBuilder;
 
+use super::block::Block;
 use super::config::GptConfig;
 use super::embedding::TokenEmbedding;
+use super::linear::Linear;
+use super::rms_norm::rms_norm;
 
-/// The GPT model.
+/// The GPT model: token embedding → `n_layer` pre-norm transformer blocks →
+/// final RMSNorm → untied `lm_head` unembedding, producing logits `(B,T,vocab)`.
 pub struct Gpt {
     wte: TokenEmbedding,
+    blocks: Vec<Block>,
+    lm_head: Linear,
     config: GptConfig,
 }
 
 impl Gpt {
     pub fn new(cfg: GptConfig, vb: VarBuilder) -> Result<Self> {
+        let device = vb.device().clone();
         let wte = TokenEmbedding::new(&cfg, vb.pp("wte"))?;
-        Ok(Self { wte, config: cfg })
+
+        let blocks_vb = vb.pp("blocks");
+        let blocks = (0..cfg.n_layer)
+            .map(|i| Block::new(&cfg, blocks_vb.pp(i), &device))
+            .collect::<Result<Vec<_>>>()?;
+
+        // Untied unembedding: a separate matrix from `wte`, tiny-init so the
+        // initial logits are near-uniform and the loss starts at ≈ ln(vocab).
+        let lm_head = Linear::normal(cfg.n_embd, cfg.vocab_size, 0.001, vb.pp("lm_head"))?;
+
+        Ok(Self {
+            wte,
+            blocks,
+            lm_head,
+            config: cfg,
+        })
     }
 
+    /// Map token ids `idx: (B, T)` to logits `(B, T, vocab_size)`.
     pub fn forward(&self, idx: &Tensor) -> Result<Tensor> {
-        self.wte.forward(idx)
+        let mut x = self.wte.forward(idx)?;
+        for block in &self.blocks {
+            x = block.forward(&x)?;
+        }
+        let x = rms_norm(&x, self.config.norm_eps)?;
+        self.lm_head.forward(&x)
     }
 
     pub fn config(&self) -> &GptConfig {
@@ -35,7 +63,7 @@ mod tests {
         GptConfig {
             vocab_size: 32,
             sequence_len: 16,
-            n_layer: 1,
+            n_layer: 2,
             n_head: 2,
             n_embd: 8,
             rope_base: 100_000.0,
@@ -48,32 +76,65 @@ mod tests {
     }
 
     #[test]
-    fn forward_returns_b_t_n_embd() -> Result<()> {
+    fn forward_returns_b_t_vocab() -> Result<()> {
         let dev = Device::Cpu;
         let vm = VarMap::new();
         let cfg = tiny_cfg();
-        let n_embd = cfg.n_embd;
+        let vocab = cfg.vocab_size;
         let model = Gpt::new(cfg, builder(&vm, &dev))?;
 
         let idx = Tensor::new(&[[1u32, 2, 3], [4, 5, 6]], &dev)?; // (B=2, T=3)
-        assert_eq!(model.forward(&idx)?.dims(), &[2, 3, n_embd]);
+        assert_eq!(model.forward(&idx)?.dims(), &[2, 3, vocab]);
         Ok(())
     }
 
     #[test]
-    fn registers_only_wte_weight() -> Result<()> {
-        // Locks in the parameter naming: the embedding lives under `wte.weight`,
-        // leaving room for `blocks.*`, `lm_head`, etc. as the model grows.
+    fn registers_full_parameter_set() -> Result<()> {
+        // Locks in the parameter naming as the model grows: the embedding, one
+        // `blocks.{i}.*` group per layer, and the untied `lm_head`.
         let dev = Device::Cpu;
         let vm = VarMap::new();
         let cfg = tiny_cfg();
-        let (vocab, n_embd) = (cfg.vocab_size, cfg.n_embd);
+        let (vocab, n_embd, n_layer) = (cfg.vocab_size, cfg.n_embd, cfg.n_layer);
         let _model = Gpt::new(cfg, builder(&vm, &dev))?;
 
         let data = vm.data().lock().unwrap();
-        let keys: Vec<&String> = data.keys().collect();
-        assert_eq!(keys, vec!["wte.weight"]);
+        let mut keys: Vec<String> = data.keys().cloned().collect();
+        keys.sort();
+
+        let mut want = vec!["lm_head.weight".to_string(), "wte.weight".to_string()];
+        for i in 0..n_layer {
+            for name in [
+                "attn.c_k", "attn.c_proj", "attn.c_q", "attn.c_v", "mlp.c_fc", "mlp.c_proj",
+            ] {
+                want.push(format!("blocks.{i}.{name}.weight"));
+            }
+        }
+        want.sort();
+
+        assert_eq!(keys, want);
         assert_eq!(data["wte.weight"].dims(), &[vocab, n_embd]);
+        assert_eq!(data["lm_head.weight"].dims(), &[vocab, n_embd]);
+        Ok(())
+    }
+
+    #[test]
+    fn init_logits_are_near_uniform() -> Result<()> {
+        // At init every block is the identity (zero-init residual projections)
+        // and `lm_head` is tiny-init, so the logits are ~0 ⇒ softmax ≈ uniform,
+        // i.e. cross-entropy will start at ≈ ln(vocab).
+        let dev = Device::Cpu;
+        let vm = VarMap::new();
+        let cfg = tiny_cfg();
+        let model = Gpt::new(cfg, builder(&vm, &dev))?;
+
+        let idx = Tensor::new(&[[1u32, 2, 3, 4]], &dev)?;
+        let logits = model.forward(&idx)?.flatten_all()?.to_vec1::<f32>()?;
+        assert!(
+            logits.iter().all(|v| v.abs() < 0.05),
+            "expected near-zero init logits, got max {:?}",
+            logits.iter().cloned().fold(0.0f32, |m, v| m.max(v.abs()))
+        );
         Ok(())
     }
 }
