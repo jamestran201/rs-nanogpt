@@ -56,6 +56,7 @@ impl Gpt {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{Reduction, cross_entropy};
     use candle_core::{DType, Device};
     use candle_nn::VarMap;
 
@@ -134,6 +135,29 @@ mod tests {
             logits.iter().all(|v| v.abs() < 0.05),
             "expected near-zero init logits, got max {:?}",
             logits.iter().cloned().fold(0.0f32, |m, v| m.max(v.abs()))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn init_loss_is_near_ln_vocab() -> Result<()> {
+        let dev = Device::Cpu;
+        let vm = VarMap::new();
+        let cfg = tiny_cfg();
+        let vocab = cfg.vocab_size;
+        let model = Gpt::new(cfg, builder(&vm, &dev))?;
+
+        let idx = Tensor::new(&[[1u32, 2, 3, 4], [5, 6, 7, 8]], &dev)?; // (B=2, T=4)
+        let targets = Tensor::new(&[[2i64, 3, 4, 5], [6, 7, 8, 9]], &dev)?; // (B=2, T=4)
+
+        let logits = model.forward(&idx)?; // (2, 4, vocab)
+        let loss = cross_entropy(&logits, &targets, -1, Reduction::Mean)?.to_scalar::<f32>()?;
+
+        assert!(loss.is_finite(), "loss must be finite, got {loss}");
+        let expected = (vocab as f32).ln();
+        assert!(
+            (loss - expected).abs() < 0.1,
+            "got {loss}, want ≈ {expected}"
         );
         Ok(())
     }
