@@ -129,8 +129,6 @@ fn main() -> std::io::Result<()> {
     Ok(())
 }
 
-/// Build the GPT model on the selected device with fresh-init weights, holding
-/// its parameters in a `VarMap` (ready for the optimizer/checkpointing later).
 fn build_model(config: GptConfig) -> candle_core::Result<()> {
     let device = default_device()?;
     let varmap = VarMap::new();
