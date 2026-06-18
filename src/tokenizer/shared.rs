@@ -44,18 +44,18 @@ pub(crate) struct Vocab {
 }
 
 impl Vocab {
-    /// Token id space is 1-based to match tiktoken's wire format:
-    /// 1..=256 → single bytes, 257.. → learned merges. Id 0 is reserved.
+    /// Token id space is 0-based, matching tiktoken's wire format:
+    /// 0..=255 → single bytes, 256.. → learned merges.
     pub(crate) fn bytes_of(&self, id: TokenId) -> &[u8] {
-        if (id as usize) <= 256 {
-            &SINGLE_BYTE_TABLE[(id - 1) as usize]
+        if (id as usize) < 256 {
+            &SINGLE_BYTE_TABLE[id as usize]
         } else {
-            &self.merged[(id as usize) - 257]
+            &self.merged[(id as usize) - 256]
         }
     }
 
     pub(crate) fn push_merge(&mut self, bytes: Vec<u8>) -> TokenId {
-        let id = 257 + self.merged.len() as TokenId;
+        let id = 256 + self.merged.len() as TokenId;
         self.merged.push(bytes);
         id
     }

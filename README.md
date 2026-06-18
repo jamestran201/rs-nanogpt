@@ -23,7 +23,7 @@ Flags:
 | `--max-chars` | Maximum number of bytes to read from the corpus. |
 | `--doc-cap` | Maximum bytes per document; longer documents are truncated at a UTF-8 char boundary so a few unusually long documents can't dominate BPE pair statistics. Default: 10000. |
 
-The output file is in tiktoken format — one token per line, `<base64-encoded-bytes> <rank>`, with the 256 single-byte tokens at ranks 1–256 and learned merges at ranks 257+.
+The output file is in tiktoken format — one token per line, `<base64-encoded-bytes> <rank>`, with the 256 single-byte tokens at ranks 0–255 and learned merges at ranks 256+.
 
 Run `cargo run -- train-tokenizer --help` for the full flag list.
 

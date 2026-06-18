@@ -60,9 +60,9 @@ impl BpeTokenizer {
 
         entries.sort_by_key(|(rank, _)| *rank);
 
-        // Ranks must be a contiguous 1..=N sequence.
+        // Ranks must be a contiguous 0..=N-1 sequence.
         for (i, (rank, _)) in entries.iter().enumerate() {
-            let expected = (i + 1) as u32;
+            let expected = i as u32;
             if *rank != expected {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -72,7 +72,7 @@ impl BpeTokenizer {
         }
 
         // The first 256 entries must be the single-byte tokens 0x00..=0xFF
-        // in order, so id 1..=256 always decode to their corresponding byte.
+        // in order, so id 0..=255 always decode to their corresponding byte.
         if entries.len() < 256 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -119,7 +119,7 @@ impl BpeTokenizer {
                 byte_pair_ranks[bytes[0] as usize][bytes[1] as usize] = rank;
             }
 
-            if rank > 256 {
+            if rank >= 256 {
                 merged.push(bytes);
             }
         }
@@ -171,7 +171,7 @@ impl BpeTokenizer {
             return Vec::new();
         }
         if n == 1 {
-            return vec![(piece[0] as TokenId) + 1];
+            return vec![piece[0] as TokenId];
         }
 
         // Linked-list state, one entry per starting byte.
@@ -342,8 +342,8 @@ mod tests {
 
     #[test]
     fn from_file_rejects_rank_gap() {
-        // Two valid lines but ranks 1 and 3 — gap at 2.
-        let temp = write_vocab_file(&["AA== 1", "AQ== 3"]);
+        // Two valid lines but ranks 0 and 2 — gap at 1.
+        let temp = write_vocab_file(&["AA== 0", "AQ== 2"]);
         let err = BpeTokenizer::from_file(temp.path())
             .err()
             .expect("expected an error");
@@ -353,7 +353,7 @@ mod tests {
     #[test]
     fn from_file_rejects_too_few_entries() {
         // Only one entry — not the required 256 single bytes.
-        let temp = write_vocab_file(&["AA== 1"]);
+        let temp = write_vocab_file(&["AA== 0"]);
         let err = BpeTokenizer::from_file(temp.path())
             .err()
             .expect("expected an error");
@@ -362,11 +362,11 @@ mod tests {
 
     #[test]
     fn from_file_rejects_wrong_single_byte() {
-        // 256 lines but the byte at rank 1 is "ab" instead of 0x00.
+        // 256 lines but the byte at rank 0 is "ab" instead of 0x00.
         let mut lines: Vec<String> = Vec::with_capacity(256);
-        lines.push(format!("{} 1", STANDARD.encode(b"ab")));
+        lines.push(format!("{} 0", STANDARD.encode(b"ab")));
         for i in 1..256u32 {
-            lines.push(format!("{} {}", STANDARD.encode([i as u8]), i + 1));
+            lines.push(format!("{} {}", STANDARD.encode([i as u8]), i));
         }
         let line_refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
         let temp = write_vocab_file(&line_refs);
@@ -395,15 +395,15 @@ mod tests {
     fn decode_single_byte_token() {
         let vocab_file = train_tiny_vocab(256);
         let tok = BpeTokenizer::from_file(vocab_file.path()).unwrap();
-        // id 0x61 + 1 = 98 → byte 'a'
-        assert_eq!(tok.decode(&[(b'a' as TokenId) + 1]), "a");
+        // id 0x61 = 97 → byte 'a'
+        assert_eq!(tok.decode(&[b'a' as TokenId]), "a");
     }
 
     #[test]
     fn decode_byte_sequence_is_concatenation() {
         let vocab_file = train_tiny_vocab(256);
         let tok = BpeTokenizer::from_file(vocab_file.path()).unwrap();
-        let ids: Vec<TokenId> = b"hello".iter().map(|&b| (b as TokenId) + 1).collect();
+        let ids: Vec<TokenId> = b"hello".iter().map(|&b| b as TokenId).collect();
         assert_eq!(tok.decode(&ids), "hello");
     }
 
@@ -411,9 +411,9 @@ mod tests {
     fn decode_merge_token_returns_merged_bytes() {
         let vocab_file = train_tiny_vocab(300);
         let tok = BpeTokenizer::from_file(vocab_file.path()).unwrap();
-        // Merge id 257 must equal the bytes of vocab.merged[0].
+        // Merge id 256 must equal the bytes of vocab.merged[0].
         let expected = String::from_utf8(tok.vocab.merged[0].clone()).unwrap();
-        assert_eq!(tok.decode(&[257]), expected);
+        assert_eq!(tok.decode(&[256]), expected);
     }
 
     #[test]
@@ -427,7 +427,7 @@ mod tests {
     fn encode_single_char_byte_only_vocab() {
         let vocab_file = train_tiny_vocab(256);
         let tok = BpeTokenizer::from_file(vocab_file.path()).unwrap();
-        assert_eq!(tok.encode("a"), vec![(b'a' as TokenId) + 1]);
+        assert_eq!(tok.encode("a"), vec![b'a' as TokenId]);
     }
 
     #[test]
@@ -435,7 +435,7 @@ mod tests {
         // With no merges, encode just maps each byte to its 1-based id.
         let vocab_file = train_tiny_vocab(256);
         let tok = BpeTokenizer::from_file(vocab_file.path()).unwrap();
-        let expected: Vec<TokenId> = b"hi".iter().map(|&b| (b as TokenId) + 1).collect();
+        let expected: Vec<TokenId> = b"hi".iter().map(|&b| b as TokenId).collect();
         assert_eq!(tok.encode("hi"), expected);
     }
 
@@ -444,13 +444,13 @@ mod tests {
         // Force a vocab where the only merge is the (b'a', b'b') pair, so
         // encoding "ab" must produce that merge's id rather than two bytes.
         let mut lines: Vec<String> = (0..256u32)
-            .map(|i| format!("{} {}", STANDARD.encode([i as u8]), i + 1))
+            .map(|i| format!("{} {}", STANDARD.encode([i as u8]), i))
             .collect();
-        lines.push(format!("{} 257", STANDARD.encode(b"ab")));
+        lines.push(format!("{} 256", STANDARD.encode(b"ab")));
         let line_refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
         let temp = write_vocab_file(&line_refs);
         let tok = BpeTokenizer::from_file(temp.path()).unwrap();
-        assert_eq!(tok.encode("ab"), vec![257]);
+        assert_eq!(tok.encode("ab"), vec![256]);
     }
 
     fn assert_round_trip(tok: &BpeTokenizer, text: &str) {

@@ -176,12 +176,12 @@ mod tests {
         move || docs.clone().into_iter()
     }
 
-    /// A byte-level tokenizer: a 256-entry vocab where each token is a single byte, so `encode` maps byte `b` to id `b + 1`.
+    /// A byte-level tokenizer: a 256-entry vocab where each token is a single byte, so `encode` maps byte `b` to id `b`.
     fn byte_tokenizer(vocab_file: &mut tempfile::NamedTempFile) -> BpeTokenizer {
         use base64::Engine;
         use base64::engine::general_purpose::STANDARD;
         for b in 0u32..256 {
-            writeln!(vocab_file, "{} {}", STANDARD.encode([b as u8]), b + 1).unwrap();
+            writeln!(vocab_file, "{} {}", STANDARD.encode([b as u8]), b).unwrap();
         }
         vocab_file.flush().unwrap();
         BpeTokenizer::from_file(vocab_file.path()).unwrap()
@@ -202,7 +202,7 @@ mod tests {
     }
 
     fn byte_id(b: u8) -> u32 {
-        b as u32 + 1
+        b as u32
     }
 
     #[test]
@@ -369,7 +369,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut vocab_file = tempfile::NamedTempFile::new().unwrap();
         let tok = byte_tokenizer(&mut vocab_file);
-        // "abcde" → byte ids [a+1..e+1]; B=1, T=2 → first row = first 3 ids.
+        // "abcde" → byte ids [a..e]; B=1, T=2 → first row = first 3 ids.
         let mut loader = loader_over(dir.path(), &tok, Split::Val, "abcde", 1, 2);
 
         let batch = loader.next_batch(&Device::Cpu).unwrap();
@@ -416,7 +416,7 @@ mod tests {
         let batch = loader.next_batch(&dev).unwrap();
 
         let cfg = GptConfig {
-            vocab_size: 257, // byte ids are 1..=256
+            vocab_size: 256, // byte ids are 0..=255
             sequence_len: t,
             n_layer: 1,
             n_head: 1,
@@ -429,7 +429,7 @@ mod tests {
         let model = Gpt::new(cfg, vb).unwrap();
 
         let logits = model.forward(&batch.inputs).unwrap();
-        assert_eq!(logits.dims(), &[b, t, 257]);
+        assert_eq!(logits.dims(), &[b, t, 256]);
         let loss = cross_entropy(&logits, &batch.targets, -1, Reduction::Mean)
             .unwrap()
             .to_scalar::<f32>()

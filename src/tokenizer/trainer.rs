@@ -81,7 +81,7 @@ impl BpeTokenizerTrainer {
                 let tokens: Vec<TokenId> = pretoken
                     .as_bytes()
                     .iter()
-                    .map(|b| (*b as TokenId) + 1)
+                    .map(|b| *b as TokenId)
                     .collect();
                 let next: Vec<Option<usize>> = (0..n)
                     .map(|i| if i + 1 < n { Some(i + 1) } else { None })
@@ -252,15 +252,15 @@ impl BpeTokenizerTrainer {
 
         let mut rank: usize = 0;
         for byte in 0u32..256 {
-            rank += 1;
             let b64 = STANDARD.encode([byte as u8]);
             writeln!(writer, "{} {}", b64, rank)?;
+            rank += 1;
         }
 
         for merge in merges {
-            rank += 1;
             let b64 = STANDARD.encode(merge);
             writeln!(writer, "{} {}", b64, rank)?;
+            rank += 1;
         }
 
         writer.flush()?;
@@ -515,9 +515,9 @@ mod tests {
         build_pattern()
     }
 
-    /// Byte → 1-based TokenId. Single bytes occupy ids 1..=256.
+    /// Byte → 0-based TokenId. Single bytes occupy ids 0..=255.
     fn tid(b: u8) -> TokenId {
-        (b as TokenId) + 1
+        b as TokenId
     }
 
     #[test]
@@ -610,7 +610,7 @@ mod tests {
         assert_eq!(words.len(), 2);
         let counts: HashMap<Vec<u8>, u64> = words
             .iter()
-            .map(|w| (w.tokens.iter().map(|&id| (id - 1) as u8).collect(), w.count))
+            .map(|w| (w.tokens.iter().map(|&id| id as u8).collect(), w.count))
             .collect();
         assert_eq!(counts.get(&vec![b'a']), Some(&2));
         assert_eq!(counts.get(&vec![b'b']), Some(&1));
@@ -763,14 +763,14 @@ mod tests {
 
     #[test]
     fn find_best_pair_tie_breaks_by_bytes_not_by_token_id() {
-        // id 257 = b"a" — sorts before "b" lexically, but its numeric id (257)
-        // is greater than tid(b'b') = 99. If the comparator used numeric id, it
-        // would wrongly pick (257, 'b'). Lex-on-bytes picks ('b', 'b').
+        // id 256 = b"a" — sorts before "b" lexically, but its numeric id (256)
+        // is greater than tid(b'b') = 98. If the comparator used numeric id, it
+        // would wrongly pick (256, 'b'). Lex-on-bytes picks ('b', 'b').
         let vocab = Vocab {
             merged: vec![b"a".to_vec()],
         };
         let mut counts: HashMap<Pair, PairInfo> = HashMap::new();
-        counts.insert((257, tid(b'b')), info(5));
+        counts.insert((256, tid(b'b')), info(5));
         counts.insert((tid(b'b'), tid(b'b')), info(5));
         let best = BpeTokenizerTrainer::find_best_pair(&counts, &vocab);
         assert_eq!(best, Some((tid(b'b'), tid(b'b'))));
@@ -995,11 +995,11 @@ mod tests {
         assert_eq!(lines.len(), 258);
 
         let (b64_first_merge, rank_first_merge) = lines[256].split_once(' ').unwrap();
-        assert_eq!(rank_first_merge, "257");
+        assert_eq!(rank_first_merge, "256");
         assert_eq!(STANDARD.decode(b64_first_merge).unwrap(), b"ab".to_vec());
 
         let (b64_second_merge, rank_second_merge) = lines[257].split_once(' ').unwrap();
-        assert_eq!(rank_second_merge, "258");
+        assert_eq!(rank_second_merge, "257");
         assert_eq!(STANDARD.decode(b64_second_merge).unwrap(), b"the".to_vec());
     }
 
@@ -1047,7 +1047,7 @@ mod tests {
         for (i, line) in lines.iter().enumerate() {
             let (_, rank_str) = line.split_once(' ').unwrap();
             let rank: usize = rank_str.parse().unwrap();
-            assert_eq!(rank, i + 1);
+            assert_eq!(rank, i);
         }
     }
 
