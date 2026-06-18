@@ -9,7 +9,7 @@ use base64::engine::general_purpose::STANDARD;
 use fancy_regex::Regex;
 use rayon::prelude::*;
 
-use super::shared::{self, TokenId, Vocab, build_pattern};
+use super::shared::{self, NUM_SPECIAL_TOKENS, SPECIAL_TOKENS, TokenId, Vocab, build_pattern};
 
 const PARALLEL_THRESHOLD: usize = 100;
 
@@ -22,6 +22,9 @@ pub struct BpeTokenizer {
     // keys are slices borrowed (via the unsafe transmute below) from the arena.
     encoder: HashMap<&'static [u8], TokenId>,
     vocab: Vocab,
+    /// Id of the lowest special token (= `256 + merged.len()` = BOS). The 9
+    /// specials occupy `first_special_id ..= first_special_id + 8` just above the learned merges.
+    first_special_id: TokenId,
     pattern: Regex,
     byte_pair_ranks: Box<[[u32; 256]; 256]>,
     // Read indirectly: `encoder`'s keys are `&'static [u8]` slices into this
@@ -124,20 +127,60 @@ impl BpeTokenizer {
             }
         }
 
+        // Specials are appended in memory as a contiguous block above the
+        // learned merges; they are not stored in the file.
+        let first_special_id = 256 + merged.len() as TokenId;
+
         Ok(Self {
             encoder,
             vocab: Vocab { merged },
+            first_special_id,
             pattern: build_pattern(),
             byte_pair_ranks,
             arena,
         })
     }
 
+    pub fn bos_id(&self) -> TokenId {
+        self.first_special_id
+    }
+
+    /// Id of a named special token (e.g. `"<|bos|>"`), or `None` if `name` is
+    /// not one of the reserved specials.
+    pub fn special_id(&self, name: &str) -> Option<TokenId> {
+        SPECIAL_TOKENS
+            .iter()
+            .position(|s| *s == name)
+            .map(|i| self.first_special_id + i as TokenId)
+    }
+
+    /// Total vocabulary size implied by this tokenizer: the 256 single-byte
+    /// tokens + the learned merges + the special-token block (= highest token
+    /// id + 1). Matches the `vocab_size` the model embedding must be sized to.
+    pub fn vocab_size(&self) -> usize {
+        256 + self.vocab.merged.len() + NUM_SPECIAL_TOKENS
+    }
+
+    /// Bytes for a token id, dispatching across bytes/merges (delegated to
+    /// `Vocab`) and the special-token block. A special id renders as its literal
+    /// string (e.g. `<|bos|>`), matching tiktoken's decode behavior.
+    fn bytes_of(&self, id: TokenId) -> &[u8] {
+        if id < self.first_special_id {
+            self.vocab.bytes_of(id)
+        } else {
+            let idx = (id - self.first_special_id) as usize;
+            SPECIAL_TOKENS
+                .get(idx)
+                .unwrap_or_else(|| panic!("token id {id} is out of range (vocab_size {})", self.vocab_size()))
+                .as_bytes()
+        }
+    }
+
     pub fn decode(&self, ids: &[TokenId]) -> String {
-        let total: usize = ids.iter().map(|&id| self.vocab.bytes_of(id).len()).sum();
+        let total: usize = ids.iter().map(|&id| self.bytes_of(id).len()).sum();
         let mut bytes = Vec::with_capacity(total);
         for &id in ids {
-            bytes.extend_from_slice(self.vocab.bytes_of(id));
+            bytes.extend_from_slice(self.bytes_of(id));
         }
         String::from_utf8(bytes).expect("decoded token bytes should be valid UTF-8")
     }
@@ -287,16 +330,51 @@ mod tests {
     fn from_file_loads_trainer_output() {
         let vocab_file = train_tiny_vocab(300);
         let tok = BpeTokenizer::from_file(vocab_file.path()).unwrap();
-        assert_eq!(tok.encoder.len(), 300);
-        assert_eq!(tok.vocab.merged.len(), 44); // 300 - 256
+        // 300 total vocab = 256 bytes + 35 merges + 9 reserved specials.
+        assert_eq!(tok.encoder.len(), 291); // bytes + merges (file entries)
+        assert_eq!(tok.vocab.merged.len(), 35);
+        assert_eq!(tok.bos_id(), 291); // first special = 256 + 35 = V - 9
+        assert_eq!(tok.vocab_size(), 300);
     }
 
     #[test]
     fn from_file_byte_only_vocab() {
-        let vocab_file = train_tiny_vocab(256);
+        let vocab_file = train_tiny_vocab(265); // 256 bytes + 0 merges + 9 specials
         let tok = BpeTokenizer::from_file(vocab_file.path()).unwrap();
         assert_eq!(tok.encoder.len(), 256);
         assert!(tok.vocab.merged.is_empty());
+        assert_eq!(tok.bos_id(), 256); // first special sits right above the bytes
+    }
+
+    #[test]
+    fn special_ids_form_contiguous_top_block() {
+        let vocab_file = train_tiny_vocab(265); // byte-only: first special = 256
+        let tok = BpeTokenizer::from_file(vocab_file.path()).unwrap();
+        assert_eq!(tok.bos_id(), 256);
+        assert_eq!(tok.special_id("<|bos|>"), Some(256)); // first special
+        assert_eq!(tok.special_id("<|assistant_start|>"), Some(259)); // index 3
+        assert_eq!(tok.special_id("<|output_end|>"), Some(264)); // last special
+        assert_eq!(tok.special_id("not_a_special"), None);
+        assert_eq!(tok.vocab_size(), 265); // 256 + 9
+    }
+
+    #[test]
+    fn decode_renders_special_tokens() {
+        let vocab_file = train_tiny_vocab(265);
+        let tok = BpeTokenizer::from_file(vocab_file.path()).unwrap();
+        let bos = tok.bos_id();
+        assert_eq!(tok.decode(&[bos]), "<|bos|>");
+        let (a, b) = (b'a' as TokenId, b'b' as TokenId);
+        assert_eq!(tok.decode(&[bos, a, b]), "<|bos|>ab");
+    }
+
+    #[test]
+    fn encode_does_not_emit_special_ids() {
+        let vocab_file = train_tiny_vocab(265);
+        let tok = BpeTokenizer::from_file(vocab_file.path()).unwrap();
+        let ids = tok.encode("<|bos|>");
+        assert!(!ids.contains(&tok.bos_id()));
+        assert_eq!(tok.decode(&ids), "<|bos|>");
     }
 
     #[test]
@@ -386,14 +464,14 @@ mod tests {
 
     #[test]
     fn decode_empty() {
-        let vocab_file = train_tiny_vocab(256);
+        let vocab_file = train_tiny_vocab(265);
         let tok = BpeTokenizer::from_file(vocab_file.path()).unwrap();
         assert_eq!(tok.decode(&[]), "");
     }
 
     #[test]
     fn decode_single_byte_token() {
-        let vocab_file = train_tiny_vocab(256);
+        let vocab_file = train_tiny_vocab(265);
         let tok = BpeTokenizer::from_file(vocab_file.path()).unwrap();
         // id 0x61 = 97 → byte 'a'
         assert_eq!(tok.decode(&[b'a' as TokenId]), "a");
@@ -401,7 +479,7 @@ mod tests {
 
     #[test]
     fn decode_byte_sequence_is_concatenation() {
-        let vocab_file = train_tiny_vocab(256);
+        let vocab_file = train_tiny_vocab(265);
         let tok = BpeTokenizer::from_file(vocab_file.path()).unwrap();
         let ids: Vec<TokenId> = b"hello".iter().map(|&b| b as TokenId).collect();
         assert_eq!(tok.decode(&ids), "hello");
@@ -418,14 +496,14 @@ mod tests {
 
     #[test]
     fn encode_empty() {
-        let vocab_file = train_tiny_vocab(256);
+        let vocab_file = train_tiny_vocab(265);
         let tok = BpeTokenizer::from_file(vocab_file.path()).unwrap();
         assert_eq!(tok.encode(""), Vec::<TokenId>::new());
     }
 
     #[test]
     fn encode_single_char_byte_only_vocab() {
-        let vocab_file = train_tiny_vocab(256);
+        let vocab_file = train_tiny_vocab(265);
         let tok = BpeTokenizer::from_file(vocab_file.path()).unwrap();
         assert_eq!(tok.encode("a"), vec![b'a' as TokenId]);
     }
@@ -433,7 +511,7 @@ mod tests {
     #[test]
     fn encode_multi_char_byte_only_vocab_emits_bytes() {
         // With no merges, encode just maps each byte to its 1-based id.
-        let vocab_file = train_tiny_vocab(256);
+        let vocab_file = train_tiny_vocab(265);
         let tok = BpeTokenizer::from_file(vocab_file.path()).unwrap();
         let expected: Vec<TokenId> = b"hi".iter().map(|&b| b as TokenId).collect();
         assert_eq!(tok.encode("hi"), expected);

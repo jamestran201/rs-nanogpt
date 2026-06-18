@@ -12,6 +12,24 @@ pub(crate) const SINGLE_BYTE_TABLE: [[u8; 1]; 256] = {
     table
 };
 
+/// Reserved special tokens, in nanochat's order. The first entry (`<|bos|>`) is
+/// the document delimiter prepended to every document during pretraining; the
+/// rest are used only when rendering chat conversations for finetuning.
+/// `BpeTokenizer` assigns and resolves them; the vocab file never stores them.
+pub(crate) const SPECIAL_TOKENS: [&str; 9] = [
+    "<|bos|>",
+    "<|user_start|>",
+    "<|user_end|>",
+    "<|assistant_start|>",
+    "<|assistant_end|>",
+    "<|python_start|>",
+    "<|python_end|>",
+    "<|output_start|>",
+    "<|output_end|>",
+];
+
+pub(crate) const NUM_SPECIAL_TOKENS: usize = SPECIAL_TOKENS.len();
+
 pub(crate) const REGEX_PATTERNS: &[&str] = &[
     r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?",
     r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?",
@@ -44,8 +62,6 @@ pub(crate) struct Vocab {
 }
 
 impl Vocab {
-    /// Token id space is 0-based, matching tiktoken's wire format:
-    /// 0..=255 → single bytes, 256.. → learned merges.
     pub(crate) fn bytes_of(&self, id: TokenId) -> &[u8] {
         if (id as usize) < 256 {
             &SINGLE_BYTE_TABLE[id as usize]

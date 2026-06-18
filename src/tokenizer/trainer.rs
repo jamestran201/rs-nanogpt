@@ -12,7 +12,7 @@ use fancy_regex::Regex;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReader;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
-use super::shared::{TokenId, Vocab, build_pattern, pre_tokenize};
+use super::shared::{NUM_SPECIAL_TOKENS, TokenId, Vocab, build_pattern, pre_tokenize};
 
 const TOMBSTONE: TokenId = TokenId::MAX;
 
@@ -268,13 +268,19 @@ impl BpeTokenizerTrainer {
     }
 
     pub fn train(&self, output_path: impl AsRef<Path>, vocab_size: usize) -> io::Result<()> {
-        if vocab_size < 256 {
+        let min_vocab_size = 256 + NUM_SPECIAL_TOKENS;
+        if vocab_size < min_vocab_size {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("vocab_size must be at least 256, got {vocab_size}"),
+                format!(
+                    "vocab_size must be at least {min_vocab_size} \
+                     (256 bytes + {NUM_SPECIAL_TOKENS} reserved special tokens), got {vocab_size}"
+                ),
             ));
         }
-        let num_merges = vocab_size - 256;
+        // Reserve the top `NUM_SPECIAL_TOKENS` ids for the special-token block,
+        // so the trained merges leave room for them below `vocab_size`.
+        let num_merges = vocab_size - 256 - NUM_SPECIAL_TOKENS;
 
         let mut states = self.prepare_pretoken_states()?;
         let mut pair_info = Self::init_pair_tables(&states);
@@ -1018,32 +1024,35 @@ mod tests {
     }
 
     #[test]
-    fn train_rejects_vocab_size_below_256() {
+    fn train_rejects_vocab_size_below_265() {
+        // Floor is 256 bytes + 9 reserved specials = 265.
         let temp = tempfile::NamedTempFile::new().unwrap();
         let trainer = BpeTokenizerTrainer::new("data", 10000, usize::MAX);
         let err = trainer
-            .train(temp.path(), 100)
-            .expect_err("should error for vocab_size < 256");
+            .train(temp.path(), 264)
+            .expect_err("should error for vocab_size < 265");
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]
-    fn train_vocab_size_256_writes_only_byte_tokens() {
+    fn train_vocab_size_265_writes_only_byte_tokens() {
+        // 265 = 256 bytes + 0 merges + 9 reserved specials.
         let temp = tempfile::NamedTempFile::new().unwrap();
         let trainer = BpeTokenizerTrainer::new("data", 10000, usize::MAX);
-        trainer.train(temp.path(), 256).unwrap();
+        trainer.train(temp.path(), 265).unwrap();
         let contents = fs::read_to_string(temp.path()).unwrap();
         assert_eq!(contents.lines().count(), 256);
     }
 
     #[test]
-    fn train_writes_target_vocab_size() {
+    fn train_writes_bytes_and_merges_reserving_specials() {
         let temp = tempfile::NamedTempFile::new().unwrap();
         let trainer = BpeTokenizerTrainer::new("data", 10000, usize::MAX);
         trainer.train(temp.path(), 300).unwrap();
         let contents = fs::read_to_string(temp.path()).unwrap();
         let lines: Vec<&str> = contents.lines().collect();
-        assert_eq!(lines.len(), 300);
+        // File holds bytes + merges only: 256 + (300 - 256 - 9) = 291.
+        assert_eq!(lines.len(), 291);
         for (i, line) in lines.iter().enumerate() {
             let (_, rank_str) = line.split_once(' ').unwrap();
             let rank: usize = rank_str.parse().unwrap();

@@ -13,11 +13,13 @@ use super::parquet::{ShardTextIter, Split, list_shards, shards_for_split};
 /// `BatchAssembler` calls it again whenever the current epoch runs out, yielding
 /// an effectively infinite token stream.
 ///
-/// Caveat — cross-document contamination: documents are concatenated into one
-/// flat stream and chopped on fixed `T+1` boundaries, with no separator token.
-/// So at each document seam the model is trained on one spurious next-token pair
-/// (predict the first token of doc N+1 from the last token of doc N)
-/// — those two tokens are unrelated.
+/// Caveat — flat packing, not yet BOS-aligned: documents arrive BOS-prefixed
+/// (see `encode_docs`), so each seam carries a learned "new document" signal,
+/// but they are still concatenated into one flat stream and chopped on fixed
+/// `T+1` boundaries. A row can begin mid-document; the only residual artifact is
+/// the spurious pair at each seam (an unrelated doc's last token → the next
+/// doc's BOS). Stage 2's BOS-aligned best-fit packing makes every row start on a
+/// BOS.
 pub(crate) struct BatchAssembler<F, I>
 where
     F: Fn() -> I,
@@ -115,8 +117,13 @@ pub(crate) fn encode_docs<'a>(
 ) -> impl Iterator<Item = Vec<u32>> + 'a {
     ShardTextIter::new(shards).filter_map(move |res| {
         let text = res.unwrap_or_else(|e| panic!("failed reading shard text: {e}"));
-        let tokens = tokenizer.encode(&text);
-        (!tokens.is_empty()).then_some(tokens)
+        let body = tokenizer.encode(&text);
+        (!body.is_empty()).then(|| {
+            let mut tokens = Vec::with_capacity(body.len() + 1);
+            tokens.push(tokenizer.bos_id());
+            tokens.extend(body);
+            tokens
+        })
     })
 }
 
@@ -299,11 +306,12 @@ mod tests {
         let tok = byte_tokenizer(&mut vocab_file);
 
         let docs: Vec<Vec<u32>> = encode_docs(vec![shard], &tok).collect();
+        let bos = tok.bos_id();
         assert_eq!(
             docs,
             vec![
-                vec![byte_id(b'a'), byte_id(b'b')],
-                vec![byte_id(b'c'), byte_id(b'd')],
+                vec![bos, byte_id(b'a'), byte_id(b'b')],
+                vec![bos, byte_id(b'c'), byte_id(b'd')],
             ]
         );
     }
@@ -369,15 +377,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut vocab_file = tempfile::NamedTempFile::new().unwrap();
         let tok = byte_tokenizer(&mut vocab_file);
-        // "abcde" → byte ids [a..e]; B=1, T=2 → first row = first 3 ids.
+        // "abcde" → BOS-prefixed stream [bos,a,b,c,d,e]; B=1, T=2 → first row = first 3 ids.
         let mut loader = loader_over(dir.path(), &tok, Split::Val, "abcde", 1, 2);
 
         let batch = loader.next_batch(&Device::Cpu).unwrap();
-        let (a, b, c) = (byte_id(b'a'), byte_id(b'b'), byte_id(b'c'));
-        assert_eq!(batch.inputs.to_vec2::<u32>().unwrap(), vec![vec![a, b]]);
+        let bos = tok.bos_id();
+        let (a, b) = (byte_id(b'a'), byte_id(b'b'));
+        assert_eq!(batch.inputs.to_vec2::<u32>().unwrap(), vec![vec![bos, a]]);
         assert_eq!(
             batch.targets.to_vec2::<i64>().unwrap(),
-            vec![vec![b as i64, c as i64]]
+            vec![vec![a as i64, b as i64]]
         );
     }
 
@@ -416,7 +425,7 @@ mod tests {
         let batch = loader.next_batch(&dev).unwrap();
 
         let cfg = GptConfig {
-            vocab_size: 256, // byte ids are 0..=255
+            vocab_size: tok.vocab_size(), // bytes + 9 specials; BOS now appears in the batch
             sequence_len: t,
             n_layer: 1,
             n_head: 1,
@@ -429,7 +438,7 @@ mod tests {
         let model = Gpt::new(cfg, vb).unwrap();
 
         let logits = model.forward(&batch.inputs).unwrap();
-        assert_eq!(logits.dims(), &[b, t, 256]);
+        assert_eq!(logits.dims(), &[b, t, tok.vocab_size()]);
         let loss = cross_entropy(&logits, &batch.targets, -1, Reduction::Mean)
             .unwrap()
             .to_scalar::<f32>()

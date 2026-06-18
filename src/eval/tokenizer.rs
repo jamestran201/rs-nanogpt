@@ -60,7 +60,7 @@ mod tests {
     fn eval_fixtures_returns_three_results_in_order() {
         let temp = tempfile::NamedTempFile::new().unwrap();
         BpeTokenizerTrainer::new("data", 10_000, usize::MAX)
-            .train(temp.path(), 256)
+            .train(temp.path(), 265)
             .unwrap();
         let tok = BpeTokenizer::from_file(temp.path()).unwrap();
         let results = eval_fixtures(&tok);
