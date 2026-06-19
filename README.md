@@ -8,8 +8,8 @@ Train a tokenizer from a directory of parquet files (each containing a `text` co
 cargo run --release -- train-tokenizer \
     --corpus data \
     --output vocab.txt \
-    --vocab-size 512 \
-    --max-chars 10000 \
+    --vocab-size 32768 \
+    --max-chars 2000000000 \
     --doc-cap 10000
 ```
 

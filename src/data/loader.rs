@@ -1,4 +1,3 @@
-use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 
 use candle_core::{Device, Tensor};
@@ -7,19 +6,11 @@ use crate::tokenizer::BpeTokenizer;
 
 use super::parquet::{ShardTextIter, Split, list_shards, shards_for_split};
 
-/// Greedy assembler over an injected, re-creatable document-token source.
-///
-/// `make_docs` produces a fresh iterator over the documents for one epoch;
-/// `BatchAssembler` calls it again whenever the current epoch runs out, yielding
-/// an effectively infinite token stream.
-///
-/// Caveat — flat packing, not yet BOS-aligned: documents arrive BOS-prefixed
-/// (see `encode_docs`), so each seam carries a learned "new document" signal,
-/// but they are still concatenated into one flat stream and chopped on fixed
-/// `T+1` boundaries. A row can begin mid-document; the only residual artifact is
-/// the spurious pair at each seam (an unrelated doc's last token → the next
-/// doc's BOS). Stage 2's BOS-aligned best-fit packing makes every row start on a
-/// BOS.
+/// Size of the packing pool when constructed via [`DataLoader::open`]. A larger
+/// pool gives the best-fit packer more candidates per gap, so less is cropped.
+/// Matches nanochat's default.
+const DEFAULT_BUFFER_SIZE: usize = 1000;
+
 pub(crate) struct BatchAssembler<F, I>
 where
     F: Fn() -> I,
@@ -27,13 +18,11 @@ where
 {
     make_docs: F,
     docs: I,
-    buf: VecDeque<u32>,
+    pool: Vec<Vec<u32>>,
+    buffer_size: usize,
     batch_rows: usize, // B
     row_len: usize,    // T + 1
-    /// Tokens pulled since the current epoch began; reset on restart. Lets us
-    /// detect a genuinely empty source (a full epoch yielding zero tokens)
-    /// instead of looping forever.
-    produced_this_epoch: usize,
+    docs_produced_this_pass: usize,
 }
 
 impl<F, I> BatchAssembler<F, I>
@@ -41,43 +30,94 @@ where
     F: Fn() -> I,
     I: Iterator<Item = Vec<u32>>,
 {
-    pub(crate) fn new(make_docs: F, batch_rows: usize, tokens_dim: usize) -> Self {
+    pub(crate) fn new(
+        make_docs: F,
+        batch_rows: usize,
+        tokens_dim: usize,
+        buffer_size: usize,
+    ) -> Self {
+        assert!(buffer_size > 0, "buffer_size must be positive");
         let docs = make_docs();
         Self {
             make_docs,
             docs,
-            buf: VecDeque::new(),
+            pool: Vec::new(),
+            buffer_size,
             batch_rows,
             row_len: tokens_dim + 1,
-            produced_this_epoch: 0,
+            docs_produced_this_pass: 0,
         }
     }
 
-    fn fill_to(&mut self, n: usize) {
-        while self.buf.len() < n {
+    /// Top the pool up to `buffer_size` whole docs, cycling to a fresh pass
+    /// (via `make_docs`) whenever the current iterator is exhausted.
+    fn refill_pool(&mut self) {
+        while self.pool.len() < self.buffer_size {
             match self.docs.next() {
                 Some(doc) => {
-                    self.produced_this_epoch += doc.len();
-                    self.buf.extend(doc);
+                    self.docs_produced_this_pass += 1;
+                    self.pool.push(doc);
                 }
                 None => {
                     assert!(
-                        self.produced_this_epoch > 0,
-                        "data source produced no tokens in a full epoch — empty corpus"
+                        self.docs_produced_this_pass > 0,
+                        "data source produced no documents in a full pass over the source — empty corpus"
                     );
                     self.docs = (self.make_docs)();
-                    self.produced_this_epoch = 0;
+                    self.docs_produced_this_pass = 0;
                 }
             }
         }
     }
 
-    /// Drain exactly `B * (T+1)` tokens — one batch's worth of rows.
-    /// Leftover tokens stay in `buf` for the next call.
+    /// Pack one row of exactly `row_len` (= T+1) tokens by best fit, appending it
+    /// to `out`: place the largest pooled doc that fits the remaining gap; if none
+    /// fits, crop the shortest doc to fill the gap exactly and drop its tail.
+    fn pack_row(&mut self, out: &mut Vec<u32>) {
+        let mut pos = 0;
+        while pos < self.row_len {
+            self.refill_pool();
+            let remaining = self.row_len - pos;
+
+            // Largest doc that fits entirely in the remaining gap, if any.
+            let best_fit_idx = self
+                .pool
+                .iter()
+                .enumerate()
+                .filter(|(_, doc)| doc.len() <= remaining)
+                .max_by_key(|(_, doc)| doc.len())
+                .map(|(idx, _)| idx);
+
+            match best_fit_idx {
+                Some(idx) => {
+                    let doc = self.pool.swap_remove(idx);
+                    out.extend_from_slice(&doc);
+                    pos += doc.len();
+                }
+                None => {
+                    // Nothing fits whole: crop the shortest doc to fill the gap exactly.
+                    let idx = self
+                        .pool
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, doc)| doc.len())
+                        .map(|(idx, _)| idx)
+                        .expect("pool non-empty after refill_pool");
+                    let doc = self.pool.swap_remove(idx);
+                    out.extend_from_slice(&doc[..remaining]);
+                    pos += remaining;
+                }
+            }
+        }
+    }
+
+    /// Build one batch's worth of rows: `B` rows of `T+1` tokens
     fn next_rows(&mut self) -> Vec<u32> {
-        let n = self.batch_rows * self.row_len;
-        self.fill_to(n);
-        self.buf.drain(..n).collect()
+        let mut rows = Vec::with_capacity(self.batch_rows * self.row_len);
+        for _ in 0..self.batch_rows {
+            self.pack_row(&mut rows);
+        }
+        rows
     }
 
     /// One batch as flat `inputs (B * T, u32)` and `targets (B * T, i64)` vectors, already next-token shifted
@@ -109,7 +149,7 @@ pub(crate) fn split_rows(rows: &[u32], batch_size: usize, tokens_dim: usize) -> 
     FlatBatch { inputs, targets }
 }
 
-/// One epoch's worth of token documents: stream the `text` column of `shards`
+/// One pass's worth of token documents: stream the `text` column of `shards`
 /// and tokenize each non-empty document. This is the source the `BatchAssembler` consumes.
 pub(crate) fn encode_docs<'a>(
     shards: Vec<PathBuf>,
@@ -127,10 +167,10 @@ pub(crate) fn encode_docs<'a>(
     })
 }
 
-/// One epoch's document-token iterator, type-erased so `DataLoader` can name it.
+/// One pass's document-token iterator, type-erased so `DataLoader` can name it.
 type DocIter<'a> = Box<dyn Iterator<Item = Vec<u32>> + 'a>;
-/// Factory that produces a fresh `DocIter` per epoch — the cycling source the
-/// `BatchAssembler` calls again whenever the current epoch is exhausted.
+/// Factory that produces a fresh `DocIter` per pass.
+/// `BatchAssembler` calls this again when the current pass is exhausted.
 type DocFactory<'a> = Box<dyn Fn() -> DocIter<'a> + 'a>;
 
 #[derive(Debug)]
@@ -153,12 +193,34 @@ impl<'a> DataLoader<'a> {
         batch_size: usize,
         tokens_dim: usize,
     ) -> std::io::Result<Self> {
+        Self::open_with_buffer_size(
+            dir,
+            split,
+            tokenizer,
+            batch_size,
+            tokens_dim,
+            DEFAULT_BUFFER_SIZE,
+        )
+    }
+
+    /// Like [`open`](Self::open) but with an explicit packing-pool size.
+    /// Production uses `open` (pool = [`DEFAULT_BUFFER_SIZE`]); tests pass a small
+    /// pool so they don't recreate the shard source many times to reach the
+    /// default.
+    pub fn open_with_buffer_size(
+        dir: &Path,
+        split: Split,
+        tokenizer: &'a BpeTokenizer,
+        batch_size: usize,
+        tokens_dim: usize,
+        buffer_size: usize,
+    ) -> std::io::Result<Self> {
         let all = list_shards(dir)?;
         let shards = shards_for_split(&all, split)?;
         let factory: DocFactory<'a> =
             Box::new(move || Box::new(encode_docs(shards.clone(), tokenizer)) as DocIter<'a>);
         Ok(Self {
-            assembler: BatchAssembler::new(factory, batch_size, tokens_dim),
+            assembler: BatchAssembler::new(factory, batch_size, tokens_dim, buffer_size),
             batch_size,
             tokens_dim,
         })
@@ -213,32 +275,37 @@ mod tests {
     }
 
     #[test]
-    fn single_long_doc_chunks_into_expected_rows() {
-        // B=2, T=2 → row_len=3, batch = 6 tokens.
-        // rows: [0,1,2] [3,4,5] → inputs [0,1 | 3,4], targets [1,2 | 4,5].
-        let mut p = BatchAssembler::new(fixed_docs(vec![(0u32..12).collect()]), 2, 2);
+    fn over_long_doc_is_cropped_to_row_length() {
+        // A doc longer than row_len (12 > 3) never fits whole, so each row is
+        // its first row_len tokens; the tail is dropped and the doc recycles.
+        // B=2, T=2 → row_len=3; buffer_size=1.
+        let mut p = BatchAssembler::new(fixed_docs(vec![(0u32..12).collect()]), 2, 2, 1);
         let FlatBatch { inputs, targets } = p.next_batch();
-        assert_eq!(inputs, vec![0, 1, 3, 4]);
-        assert_eq!(targets, vec![1, 2, 4, 5]);
+        assert_eq!(inputs, vec![0, 1, 0, 1]);
+        assert_eq!(targets, vec![1, 2, 1, 2]);
     }
 
     #[test]
-    fn short_docs_concatenate_across_row_boundary() {
-        // Four 2-token docs form the stream 0..8; the doc boundaries (at 2,4,6)
-        // fall inside/across the rows, proving documents are packed end-to-end.
-        let docs = vec![vec![0, 1], vec![2, 3], vec![4, 5], vec![6, 7]];
-        let mut p = BatchAssembler::new(fixed_docs(docs), 2, 2);
+    fn best_fit_places_largest_doc_that_fits_each_gap() {
+        // B=1, T=4 → row_len=5. Docs of distinct lengths 3, 2, 1 all in the pool.
+        // Gap 5 takes the len-3 doc; the remaining gap 2 takes the len-2 doc
+        // (not the len-1 doc) → row = [20,21,22, 10,11], filling exactly.
+        let docs = vec![vec![10, 11], vec![20, 21, 22], vec![30]];
+        let mut p = BatchAssembler::new(fixed_docs(docs), 1, 4, 3);
         let FlatBatch { inputs, targets } = p.next_batch();
-        assert_eq!(inputs, vec![0, 1, 3, 4]);
-        assert_eq!(targets, vec![1, 2, 4, 5]);
+        assert_eq!(inputs, vec![20, 21, 22, 10]);
+        assert_eq!(targets, vec![21, 22, 10, 11]);
     }
 
     #[test]
     fn targets_are_inputs_shifted_by_one_within_each_row() {
-        // B=2, T=3. Within a row, targets[i] must equal inputs[i+1].
+        // B=2, T=3. Within a row, targets[i] must equal inputs[i+1], and each
+        // side is exactly B*T long (no padding, no short-fill).
         let (b, t) = (2usize, 3usize);
-        let mut p = BatchAssembler::new(fixed_docs(vec![(0u32..100).collect()]), b, t);
+        let mut p = BatchAssembler::new(fixed_docs(vec![(0u32..100).collect()]), b, t, 1);
         let FlatBatch { inputs, targets } = p.next_batch();
+        assert_eq!(inputs.len(), b * t);
+        assert_eq!(targets.len(), b * t);
         for r in 0..b {
             for i in 0..t - 1 {
                 assert_eq!(
@@ -251,40 +318,51 @@ mod tests {
     }
 
     #[test]
-    fn pair_lengths_are_exactly_b_times_t() {
-        let (b, t) = (3usize, 4usize);
-        let mut p = BatchAssembler::new(fixed_docs(vec![(0u32..1000).collect()]), b, t);
-        let FlatBatch { inputs, targets } = p.next_batch();
-        assert_eq!(inputs.len(), b * t);
-        assert_eq!(targets.len(), b * t);
-    }
-
-    #[test]
-    fn leftover_tokens_carry_into_next_batch_without_loss() {
-        // B=1, T=2 → 3 tokens per batch. Two batches over a 9-token stream must
-        // reconstruct the stream prefix exactly — no token dropped or repeated.
-        let mut p = BatchAssembler::new(fixed_docs(vec![(0u32..9).collect()]), 1, 2);
-        let mut seen = p.next_rows();
-        seen.extend(p.next_rows());
-        assert_eq!(seen, vec![0, 1, 2, 3, 4, 5]);
-    }
-
-    #[test]
-    fn cycles_through_a_finite_source_for_multiple_epochs() {
-        // Source = 5 tokens/epoch; B=1, T=1 → 2 tokens/batch. Six batches need
-        // 12 tokens, forcing wraps. Expect the cyclic stream 0,1,2,3,4,0,1,...
-        let mut p = BatchAssembler::new(fixed_docs(vec![(0u32..5).collect()]), 1, 1);
-        let mut seen = Vec::new();
-        for _ in 0..6 {
-            seen.extend(p.next_rows());
+    fn every_packed_row_starts_on_a_doc_boundary() {
+        // Each doc starts with a sentinel BOS (99). Best fit only ever begins a
+        // row by placing (or cropping from the front of) a whole doc, so every
+        // row's first token is a BOS — including the len-6 doc that only crops.
+        const BOS: u32 = 99;
+        let docs = vec![vec![BOS, 1, 2], vec![BOS, 3], vec![BOS, 4, 5, 6, 7, 8]];
+        let (b, t) = (3usize, 3usize); // row_len=4
+        let mut p = BatchAssembler::new(fixed_docs(docs), b, t, 3);
+        let rows = p.next_rows();
+        let row_len = t + 1;
+        for r in 0..b {
+            assert_eq!(rows[r * row_len], BOS, "row {r} must start on a BOS");
         }
-        assert_eq!(seen, vec![0, 1, 2, 3, 4, 0, 1, 2, 3, 4, 0, 1]);
+    }
+
+    #[test]
+    fn packing_is_deterministic_for_a_fixed_source() {
+        let docs: Vec<Vec<u32>> = (0..20u32)
+            .map(|i| (0..(1 + i % 5)).map(|j| i * 10 + j).collect())
+            .collect();
+        let (b, t) = (2usize, 6usize);
+        let mut p1 = BatchAssembler::new(fixed_docs(docs.clone()), b, t, 6);
+        let mut p2 = BatchAssembler::new(fixed_docs(docs), b, t, 6);
+        for _ in 0..3 {
+            assert_eq!(p1.next_rows(), p2.next_rows());
+        }
+    }
+
+    #[test]
+    fn cycles_through_a_finite_source_across_many_batches() {
+        // A small finite source must keep yielding full batches indefinitely by
+        // recreating the pass; cropping/reordering makes the exact token stream
+        // implementation-defined, so we only assert it never hangs or short-fills.
+        let docs = vec![vec![0, 1], vec![2, 3, 4], vec![5]];
+        let (b, t) = (2usize, 3usize); // row_len=4
+        let mut p = BatchAssembler::new(fixed_docs(docs), b, t, 3);
+        for _ in 0..10 {
+            assert_eq!(p.next_rows().len(), b * (t + 1));
+        }
     }
 
     #[test]
     #[should_panic(expected = "empty corpus")]
     fn empty_source_panics_instead_of_hanging() {
-        let mut p = BatchAssembler::new(fixed_docs(vec![]), 1, 1);
+        let mut p = BatchAssembler::new(fixed_docs(vec![]), 1, 1, 1);
         let _ = p.next_batch();
     }
 
@@ -319,7 +397,7 @@ mod tests {
     #[test]
     fn encode_docs_factory_yields_identical_fresh_passes() {
         // The cycling primitive: calling the factory twice must replay the same
-        // documents, so the BatchAssembler can restart for a new epoch.
+        // documents, so the BatchAssembler can restart for a new pass.
         let dir = tempfile::tempdir().unwrap();
         let shard = dir.path().join("0.parquet");
         write_shard(&shard, vec![Some("hello"), Some("world")]);
@@ -351,23 +429,9 @@ mod tests {
         };
         write_shard(&dir.join("0.parquet"), vec![Some(train_text)]);
         write_shard(&dir.join("1.parquet"), vec![Some(val_text)]);
-        DataLoader::open(dir, split, tok, b, t).unwrap()
-    }
-
-    #[test]
-    fn next_batch_has_expected_shapes_and_dtypes() {
-        use candle_core::{DType, Device};
-
-        let dir = tempfile::tempdir().unwrap();
-        let mut vocab_file = tempfile::NamedTempFile::new().unwrap();
-        let tok = byte_tokenizer(&mut vocab_file);
-        let mut loader = loader_over(dir.path(), &tok, Split::Val, "abcdefghij", 2, 3);
-
-        let batch = loader.next_batch(&Device::Cpu).unwrap();
-        assert_eq!(batch.inputs.dims(), &[2, 3]);
-        assert_eq!(batch.targets.dims(), &[2, 3]);
-        assert_eq!(batch.inputs.dtype(), DType::U32);
-        assert_eq!(batch.targets.dtype(), DType::I64);
+        // Small pool: the per-split shard holds a single doc, so a large pool
+        // would recreate the source many times to fill.
+        DataLoader::open_with_buffer_size(dir, split, tok, b, t, 4).unwrap()
     }
 
     #[test]
@@ -388,22 +452,6 @@ mod tests {
             batch.targets.to_vec2::<i64>().unwrap(),
             vec![vec![a as i64, b as i64]]
         );
-    }
-
-    #[test]
-    fn next_batch_cycles_past_end_of_corpus() {
-        use candle_core::Device;
-
-        let dir = tempfile::tempdir().unwrap();
-        let mut vocab_file = tempfile::NamedTempFile::new().unwrap();
-        let tok = byte_tokenizer(&mut vocab_file);
-        // 4-token val shard, 2 tokens/batch → 5 batches need 10 tokens (>1 epoch).
-        let mut loader = loader_over(dir.path(), &tok, Split::Val, "abcd", 1, 1);
-
-        for _ in 0..5 {
-            let batch = loader.next_batch(&Device::Cpu).unwrap();
-            assert_eq!(batch.inputs.dims(), &[1, 1]);
-        }
     }
 
     #[test]
