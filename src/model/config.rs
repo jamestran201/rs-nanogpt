@@ -48,6 +48,9 @@ impl GptConfig {
         if self.n_head == 0 {
             bail!("n_head must be non-zero");
         }
+        if self.sequence_len == 0 {
+            bail!("sequence_len must be non-zero");
+        }
         if !self.n_embd.is_multiple_of(self.n_head) {
             bail!(
                 "n_embd ({}) must be divisible by n_head ({}) so head_dim is an integer",
@@ -93,6 +96,13 @@ mod tests {
     fn rejects_zero_heads() {
         let mut cfg = GptConfig::mac_smoke();
         cfg.n_head = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_zero_sequence_len() {
+        let mut cfg = GptConfig::mac_smoke();
+        cfg.sequence_len = 0;
         assert!(cfg.validate().is_err());
     }
 }
