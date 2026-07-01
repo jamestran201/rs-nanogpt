@@ -64,7 +64,9 @@ mod tests {
         let (b, t, h, dh) = (2usize, 3, 2, 4);
         let x = Tensor::randn(0.0f32, 3.0, (b, t, h, dh), &dev)?;
         // Flatten the leading dims so every row is one head_dim slice.
-        let flat = rms_norm(&x, EPS)?.reshape((b * t * h, dh))?.to_vec2::<f32>()?;
+        let flat = rms_norm(&x, EPS)?
+            .reshape((b * t * h, dh))?
+            .to_vec2::<f32>()?;
         for slice in &flat {
             assert!((rms(slice) - 1.0).abs() < 1e-3, "slice rms {}", rms(slice));
         }

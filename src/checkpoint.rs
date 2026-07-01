@@ -86,10 +86,16 @@ fn parse_meta(contents: &str) -> Result<CheckpointMeta> {
         let mut parts = line.split_whitespace();
         let key = parts.next().unwrap();
         let Some(value) = parts.next() else {
-            bail!("checkpoint meta line {}: expected `key value`, got {raw:?}", i + 1);
+            bail!(
+                "checkpoint meta line {}: expected `key value`, got {raw:?}",
+                i + 1
+            );
         };
         if parts.next().is_some() {
-            bail!("checkpoint meta line {}: expected exactly `key value`, got {raw:?}", i + 1);
+            bail!(
+                "checkpoint meta line {}: expected exactly `key value`, got {raw:?}",
+                i + 1
+            );
         }
         match key {
             "vocab_size" => vocab_size = Some(parse_field(key, value)?),
@@ -126,9 +132,11 @@ where
     T: std::str::FromStr,
     T::Err: std::fmt::Display,
 {
-    value
-        .parse::<T>()
-        .map_err(|e| Error::msg(format!("checkpoint meta: bad value for `{key}`: {value:?} ({e})")))
+    value.parse::<T>().map_err(|e| {
+        Error::msg(format!(
+            "checkpoint meta: bad value for `{key}`: {value:?} ({e})"
+        ))
+    })
 }
 
 fn require<T>(opt: Option<T>, key: &str) -> Result<T> {
@@ -159,7 +167,10 @@ mod tests {
         assert_eq!(x.n_layer, y.n_layer);
         assert_eq!(x.n_head, y.n_head);
         assert_eq!(x.n_embd, y.n_embd);
-        assert_eq!(x.rope_base, y.rope_base, "rope_base must round-trip exactly");
+        assert_eq!(
+            x.rope_base, y.rope_base,
+            "rope_base must round-trip exactly"
+        );
         assert_eq!(x.norm_eps, y.norm_eps, "norm_eps must round-trip exactly");
         assert_eq!(a.step, b.step);
         assert_eq!(a.val_bpb, b.val_bpb);
@@ -224,7 +235,10 @@ mod tests {
         let idx = Tensor::new(&[[1u32, 2, 3, 4], [5, 6, 7, 8]], &dev)?;
         let la = model_a.forward(&idx)?.flatten_all()?.to_vec1::<f32>()?;
         let lb = model_b.forward(&idx)?.flatten_all()?.to_vec1::<f32>()?;
-        assert_eq!(la, lb, "loaded model must reproduce the saved model's logits");
+        assert_eq!(
+            la, lb,
+            "loaded model must reproduce the saved model's logits"
+        );
 
         // Control: an independently initialized model has different weights, so
         // its logits differ — confirming the match above is the load, not that

@@ -17,7 +17,15 @@ impl Linear {
     /// deliberately tiny `std` so the initial logits are near-uniform and the
     /// loss starts at ≈ ln(vocab).
     pub fn normal(in_dim: usize, out_dim: usize, std: f64, vb: VarBuilder) -> Result<Self> {
-        Self::with_init(in_dim, out_dim, Init::Randn { mean: 0.0, stdev: std }, vb)
+        Self::with_init(
+            in_dim,
+            out_dim,
+            Init::Randn {
+                mean: 0.0,
+                stdev: std,
+            },
+            vb,
+        )
     }
 
     /// Zero init — used for the residual output projections (`c_proj`,

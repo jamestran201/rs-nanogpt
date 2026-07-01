@@ -103,7 +103,10 @@ mod tests {
         let mut vm = VarMap::new();
         let mlp = Mlp::new(&cfg, builder(&vm, &dev))?;
         // Inspect the hidden activation directly (pre c_proj).
-        vm.set_one("c_fc.weight", Tensor::randn(0.0f32, 1.0, (4 * cfg.n_embd, cfg.n_embd), &dev)?)?;
+        vm.set_one(
+            "c_fc.weight",
+            Tensor::randn(0.0f32, 1.0, (4 * cfg.n_embd, cfg.n_embd), &dev)?,
+        )?;
         let x = Tensor::randn(0.0f32, 2.0, (1, 6, cfg.n_embd), &dev)?;
         let h = mlp.c_fc.forward(&x)?.relu()?.sqr()?;
         let h = h.flatten_all()?.to_vec1::<f32>()?;

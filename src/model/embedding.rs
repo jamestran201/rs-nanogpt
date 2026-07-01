@@ -90,7 +90,10 @@ mod tests {
         let w = emb.weight();
         let mean = w.mean_all()?.to_scalar::<f32>()?;
         let std = (w.sqr()?.mean_all()?.to_scalar::<f32>()? - mean * mean).sqrt();
-        assert!((std - 0.8).abs() < 0.1, "empirical std was {std}, expected ~0.8");
+        assert!(
+            (std - 0.8).abs() < 0.1,
+            "empirical std was {std}, expected ~0.8"
+        );
         Ok(())
     }
 

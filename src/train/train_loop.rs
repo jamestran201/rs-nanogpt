@@ -22,12 +22,7 @@ pub struct TrainConfig {
     pub log_every: usize,
 }
 
-/// Observability resources + cadences for the training loop. Kept separate from
-/// [`TrainConfig`] (which is pure optimization config — every field there
-/// changes the trained weights); nothing here affects the weights. A cadence of
-/// `0` disables that hook.
 pub struct EvalContext<'a> {
-    // resources
     pub val_batches: &'a [Batch],
     pub tokenizer: &'a BpeTokenizer,
     pub token_bytes: &'a [u32],
@@ -39,9 +34,6 @@ pub struct EvalContext<'a> {
     pub sample_temperature: f64,
 }
 
-/// Fixed probes sampled on the sampling cadence. The empty prompt first is
-/// BOS-only (unconditional generation — the smoke-run pass criterion); the rest
-/// are simple factual/completion probes ported from nanochat.
 const SAMPLE_PROMPTS: &[&str] = &[
     "",
     "The capital of France is",
@@ -52,16 +44,11 @@ const SAMPLE_PROMPTS: &[&str] = &[
 /// Whether a hook on cadence `every` fires at `step` of a `0..=num_iters` loop.
 /// `every == 0` disables. `skip_first` suppresses step 0 (sampling; untrained
 /// output is noise). The final step (`step == num_iters`) always fires.
-fn fires(step: usize, num_iters: usize, every: usize, skip_first: bool) -> bool {
+fn cadence_fires(step: usize, num_iters: usize, every: usize, skip_first: bool) -> bool {
     if every == 0 {
         return false;
     }
-    let last = step == num_iters;
-    if skip_first {
-        last || (step > 0 && step.is_multiple_of(every))
-    } else {
-        last || step.is_multiple_of(every)
-    }
+    step == num_iters || ((!skip_first || step > 0) && step.is_multiple_of(every))
 }
 
 fn micro_backward(
@@ -103,13 +90,14 @@ pub fn train(
     let vars = varmap.all_vars();
     let mut min_val_bpb = f64::INFINITY;
 
-    // `0..=num_iters`: the extra final iteration runs the hooks (so the global-min
-    // bpb is captured even if it lands on the last step) then breaks before the
-    // optimizer body — the run still performs exactly `num_iters` optimizer steps.
     for step in 0..=cfg.num_iters {
+        println!("train step {step}");
+
         let last = step == cfg.num_iters;
 
-        if fires(step, cfg.num_iters, eval.eval_every, false) {
+        if cadence_fires(step, cfg.num_iters, eval.eval_every, false) {
+            println!("computing validation metrics");
+
             let m = evaluate(model, eval.val_batches, eval.token_bytes)?;
             println!(
                 "step {step:>6}  val_loss {:.4}  bpb {:.4}",
@@ -129,7 +117,9 @@ pub fn train(
             }
         }
 
-        if fires(step, cfg.num_iters, eval.sample_every, true) {
+        if cadence_fires(step, cfg.num_iters, eval.sample_every, true) {
+            println!("running qualitative validations");
+
             for p in SAMPLE_PROMPTS {
                 let s = generate(
                     model,
@@ -148,7 +138,8 @@ pub fn train(
             break;
         }
 
-        let logging = step % cfg.log_every == 0;
+        println!("running forward/backward passes");
+        let logging = step.is_multiple_of(cfg.log_every);
         let mut accum: Option<GradStore> = None;
         let mut ce_sum = 0.0f32;
         for _ in 0..cfg.grad_accum {
@@ -180,6 +171,8 @@ pub fn train(
                 ce_sum / cfg.grad_accum as f32
             );
         }
+
+        println!("---");
     }
     Ok(())
 }
@@ -239,9 +232,8 @@ mod tests {
 
         // One step off the zero-init residual projections: at strict init the
         // params behind the zeroed c_proj (c_q/c_k/c_v/c_fc) get exactly zero
-        // gradient and candle stores no grad for them. After a step c_proj is
-        // nonzero, the residual path is live, and every param has a real grad —
-        // so the contract is tested on all params, not just a subset.
+        // gradient and candle stores no grad for them; after a step c_proj is
+        // nonzero and the residual path is live.
         {
             let lrs = GroupLrs {
                 embedding: 0.01,
@@ -361,26 +353,26 @@ mod tests {
     }
 
     #[test]
-    fn fires_cadence_predicate() {
+    fn cadence_fires_predicate() {
         let n = 10;
         // eval-style (skip_first = false): fires at step 0, multiples of `every`,
         // and the final step.
-        assert!(fires(0, n, 2, false));
-        assert!(fires(2, n, 2, false));
-        assert!(!fires(3, n, 2, false));
-        assert!(fires(n, n, 2, false)); // last is a multiple here
-        assert!(fires(n, n, 3, false)); // last fires even when it isn't a multiple
+        assert!(cadence_fires(0, n, 2, false));
+        assert!(cadence_fires(2, n, 2, false));
+        assert!(!cadence_fires(3, n, 2, false));
+        assert!(cadence_fires(n, n, 2, false)); // last is a multiple here
+        assert!(cadence_fires(n, n, 3, false)); // last fires even when it isn't a multiple
 
         // sampling-style (skip_first = true): step 0 suppressed, everything else
         // identical.
-        assert!(!fires(0, n, 2, true));
-        assert!(fires(2, n, 2, true));
-        assert!(fires(n, n, 2, true));
+        assert!(!cadence_fires(0, n, 2, true));
+        assert!(cadence_fires(2, n, 2, true));
+        assert!(cadence_fires(n, n, 2, true));
 
         // every == 0 disables the cadence entirely, including the final step.
-        assert!(!fires(0, n, 0, false));
-        assert!(!fires(n, n, 0, false));
-        assert!(!fires(n, n, 0, true));
+        assert!(!cadence_fires(0, n, 0, false));
+        assert!(!cadence_fires(n, n, 0, false));
+        assert!(!cadence_fires(n, n, 0, true));
     }
 
     /// Capstone: a full tiny `train()` run must leave a loadable best checkpoint
@@ -388,33 +380,15 @@ mod tests {
     #[test]
     fn train_saves_loadable_best_checkpoint_matching_reported_bpb() -> Result<()> {
         use crate::data::Split;
-        use crate::test_support::{byte_tokenizer, write_shard};
+        use crate::test_support::{byte_tokenizer, tiny_gpt, two_shard_corpus};
 
         let dev = Device::Cpu;
-        let corpus = tempfile::tempdir().unwrap();
-        // Two shards so a Val split exists; the val shard (sorted last) holds text.
-        write_shard(&corpus.path().join("0.parquet"), vec![Some("filler text here")]);
-        write_shard(
-            &corpus.path().join("1.parquet"),
-            vec![Some("the quick brown fox jumps over the lazy dog")],
-        );
-
-        let mut vocab_file = tempfile::NamedTempFile::new().unwrap();
-        let tok = byte_tokenizer(&mut vocab_file);
+        let corpus = two_shard_corpus();
+        let tok = byte_tokenizer();
         let token_bytes = tok.token_byte_lengths();
 
         let (b, t) = (2usize, 8usize);
-        let cfg = GptConfig {
-            vocab_size: tok.vocab_size(),
-            sequence_len: t,
-            n_layer: 1,
-            n_head: 1,
-            n_embd: 8,
-            rope_base: 100_000.0,
-            norm_eps: 1e-6,
-        };
-        let vm = VarMap::new();
-        let model = Gpt::new(cfg, VarBuilder::from_varmap(&vm, DType::F32, &dev))?;
+        let (vm, model) = tiny_gpt(tok.vocab_size(), t);
 
         // Snapshot a fixed val set once; a separate train loader drives the steps.
         let mut val_loader =

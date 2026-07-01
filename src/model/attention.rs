@@ -164,7 +164,10 @@ mod tests {
         let a = y.i((0, pos_i))?.to_vec1::<f32>()?;
         let b = y2.i((0, pos_i))?.to_vec1::<f32>()?;
         for (va, vb) in a.iter().zip(&b) {
-            assert!((va - vb).abs() < 1e-5, "position {pos_i} changed: {va} vs {vb}");
+            assert!(
+                (va - vb).abs() < 1e-5,
+                "position {pos_i} changed: {va} vs {vb}"
+            );
         }
         Ok(())
     }

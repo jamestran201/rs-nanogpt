@@ -106,7 +106,12 @@ mod tests {
         let mut want = vec!["lm_head.weight".to_string(), "wte.weight".to_string()];
         for i in 0..n_layer {
             for name in [
-                "attn.c_k", "attn.c_proj", "attn.c_q", "attn.c_v", "mlp.c_fc", "mlp.c_proj",
+                "attn.c_k",
+                "attn.c_proj",
+                "attn.c_q",
+                "attn.c_v",
+                "mlp.c_fc",
+                "mlp.c_proj",
             ] {
                 want.push(format!("blocks.{i}.{name}.weight"));
             }

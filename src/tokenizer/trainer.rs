@@ -78,11 +78,8 @@ impl BpeTokenizerTrainer {
             .into_iter()
             .map(|(pretoken, count)| {
                 let n = pretoken.len();
-                let tokens: Vec<TokenId> = pretoken
-                    .as_bytes()
-                    .iter()
-                    .map(|b| *b as TokenId)
-                    .collect();
+                let tokens: Vec<TokenId> =
+                    pretoken.as_bytes().iter().map(|b| *b as TokenId).collect();
                 let next: Vec<Option<usize>> = (0..n)
                     .map(|i| if i + 1 < n { Some(i + 1) } else { None })
                     .collect();

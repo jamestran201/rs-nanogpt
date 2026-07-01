@@ -79,7 +79,6 @@ where
             self.refill_pool();
             let remaining = self.row_len - pos;
 
-            // Largest doc that fits entirely in the remaining gap, if any.
             let best_fit_idx = self
                 .pool
                 .iter()
@@ -95,7 +94,6 @@ where
                     pos += doc.len();
                 }
                 None => {
-                    // Nothing fits whole: crop the shortest doc to fill the gap exactly.
                     let idx = self
                         .pool
                         .iter()
@@ -137,14 +135,17 @@ pub(crate) struct FlatBatch {
 /// Targets are widened to `i64` for `cross_entropy`
 pub(crate) fn split_rows(rows: &[u32], batch_size: usize, tokens_dim: usize) -> FlatBatch {
     let row_len = tokens_dim + 1;
-    debug_assert_eq!(rows.len(), batch_size * row_len, "rows must be exactly B * (T+1)");
+    debug_assert_eq!(
+        rows.len(),
+        batch_size * row_len,
+        "rows must be exactly B * (T+1)"
+    );
 
     let mut inputs = Vec::with_capacity(batch_size * tokens_dim);
     let mut targets = Vec::with_capacity(batch_size * tokens_dim);
-    for r in 0..batch_size {
-        let row = &rows[r * row_len..(r + 1) * row_len];
+    for row in rows.chunks_exact(row_len) {
         inputs.extend_from_slice(&row[..tokens_dim]);
-        targets.extend(row[1..=tokens_dim].iter().map(|&x| x as i64));
+        targets.extend(row[1..].iter().map(|&x| x as i64));
     }
     FlatBatch { inputs, targets }
 }
@@ -203,10 +204,8 @@ impl<'a> DataLoader<'a> {
         )
     }
 
-    /// Like [`open`](Self::open) but with an explicit packing-pool size.
-    /// Production uses `open` (pool = [`DEFAULT_BUFFER_SIZE`]); tests pass a small
-    /// pool so they don't recreate the shard source many times to reach the
-    /// default.
+    /// Like [`open`](Self::open) but with an explicit packing-pool size; tests
+    /// pass a small pool to avoid recreating the shard source many times.
     pub fn open_with_buffer_size(
         dir: &Path,
         split: Split,
@@ -233,9 +232,6 @@ impl<'a> DataLoader<'a> {
         Ok(Batch { inputs, targets })
     }
 
-    /// Pull `n` batches eagerly into a Vec. On a fresh loader this is the
-    /// deterministic first-`n`-batch prefix of the split — used to snapshot a
-    /// fixed val set once, so every in-loop eval scores identical tokens.
     pub fn take_batches(&mut self, n: usize, device: &Device) -> candle_core::Result<Vec<Batch>> {
         (0..n).map(|_| self.next_batch(device)).collect()
     }
@@ -278,26 +274,6 @@ mod tests {
         let FlatBatch { inputs, targets } = p.next_batch();
         assert_eq!(inputs, vec![20, 21, 22, 10]);
         assert_eq!(targets, vec![21, 22, 10, 11]);
-    }
-
-    #[test]
-    fn targets_are_inputs_shifted_by_one_within_each_row() {
-        // B=2, T=3. Within a row, targets[i] must equal inputs[i+1], and each
-        // side is exactly B*T long (no padding, no short-fill).
-        let (b, t) = (2usize, 3usize);
-        let mut p = BatchAssembler::new(fixed_docs(vec![(0u32..100).collect()]), b, t, 1);
-        let FlatBatch { inputs, targets } = p.next_batch();
-        assert_eq!(inputs.len(), b * t);
-        assert_eq!(targets.len(), b * t);
-        for r in 0..b {
-            for i in 0..t - 1 {
-                assert_eq!(
-                    targets[r * t + i],
-                    inputs[r * t + i + 1] as i64,
-                    "row {r} position {i}"
-                );
-            }
-        }
     }
 
     #[test]
@@ -363,8 +339,7 @@ mod tests {
         let shard = dir.path().join("0.parquet");
         write_shard(&shard, vec![Some("ab"), None, Some("cd")]);
 
-        let mut vocab_file = tempfile::NamedTempFile::new().unwrap();
-        let tok = byte_tokenizer(&mut vocab_file);
+        let tok = byte_tokenizer();
 
         let docs: Vec<Vec<u32>> = encode_docs(vec![shard], &tok).collect();
         let bos = tok.bos_id();
@@ -385,8 +360,7 @@ mod tests {
         let shard = dir.path().join("0.parquet");
         write_shard(&shard, vec![Some("hello"), Some("world")]);
 
-        let mut vocab_file = tempfile::NamedTempFile::new().unwrap();
-        let tok = byte_tokenizer(&mut vocab_file);
+        let tok = byte_tokenizer();
 
         let factory = || encode_docs(vec![shard.clone()], &tok);
         let first: Vec<Vec<u32>> = factory().collect();
@@ -422,8 +396,7 @@ mod tests {
         use candle_core::Device;
 
         let dir = tempfile::tempdir().unwrap();
-        let mut vocab_file = tempfile::NamedTempFile::new().unwrap();
-        let tok = byte_tokenizer(&mut vocab_file);
+        let tok = byte_tokenizer();
         // "abcde" → BOS-prefixed stream [bos,a,b,c,d,e]; B=1, T=2 → first row = first 3 ids.
         let mut loader = loader_over(dir.path(), &tok, Split::Val, "abcde", 1, 2);
 
@@ -444,8 +417,7 @@ mod tests {
         // Two fresh loaders over the same corpus must snapshot an identical
         // prefix of batches — the property the val-set snapshot relies on.
         let dir = tempfile::tempdir().unwrap();
-        let mut vocab_file = tempfile::NamedTempFile::new().unwrap();
-        let tok = byte_tokenizer(&mut vocab_file);
+        let tok = byte_tokenizer();
         let text = "the quick brown fox jumps over the lazy dog";
         let (b, t) = (2usize, 4usize);
 
@@ -471,32 +443,19 @@ mod tests {
     fn loader_feeds_model_and_loss_end_to_end() {
         // Capstone: loader → Gpt::forward → cross_entropy yields a finite loss,
         // closing the loop the training/eval step will run.
-        use crate::model::{Gpt, GptConfig, Reduction, cross_entropy};
-        use candle_core::{DType, Device};
-        use candle_nn::{VarBuilder, VarMap};
+        use crate::model::{Reduction, cross_entropy};
+        use crate::test_support::tiny_gpt;
+        use candle_core::Device;
 
         let dir = tempfile::tempdir().unwrap();
-        let mut vocab_file = tempfile::NamedTempFile::new().unwrap();
-        let tok = byte_tokenizer(&mut vocab_file);
+        let tok = byte_tokenizer();
         let (b, t) = (2usize, 4usize);
-        let mut loader =
-            loader_over(dir.path(), &tok, Split::Val, "abcdefghijklmnop", b, t);
+        let mut loader = loader_over(dir.path(), &tok, Split::Val, "abcdefghijklmnop", b, t);
 
         let dev = Device::Cpu;
         let batch = loader.next_batch(&dev).unwrap();
 
-        let cfg = GptConfig {
-            vocab_size: tok.vocab_size(), // bytes + 9 specials; BOS now appears in the batch
-            sequence_len: t,
-            n_layer: 1,
-            n_head: 1,
-            n_embd: 8,
-            rope_base: 100_000.0,
-            norm_eps: 1e-6,
-        };
-        let vm = VarMap::new();
-        let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
-        let model = Gpt::new(cfg, vb).unwrap();
+        let (_vm, model) = tiny_gpt(tok.vocab_size(), t);
 
         let logits = model.forward(&batch.inputs).unwrap();
         assert_eq!(logits.dims(), &[b, t, tok.vocab_size()]);

@@ -151,7 +151,7 @@ struct PretrainArgs {
     #[arg(long, default_value_t = 20)]
     eval_steps: usize,
     /// Sample from the model every N steps (0 disables).
-    #[arg(long, default_value_t = 2000)]
+    #[arg(long, default_value_t = 0)]
     sample_every: usize,
     /// Tokens to generate per sample.
     #[arg(long, default_value_t = 64)]
@@ -168,8 +168,7 @@ fn validate_pretrain_args(args: &PretrainArgs) -> Result<(), Box<dyn std::error:
     if args.device_batch == 0 {
         return Err("--device-batch must be >= 1".into());
     }
-    // sequence_len is also a GptConfig invariant (re-checked in GptConfig::validate);
-    // it's validated here too so the micro-batch size below is nonzero.
+    // Also a GptConfig invariant; checked here so `micro` below is nonzero.
     if args.sequence_len == 0 {
         return Err("--sequence-len must be >= 1".into());
     }
@@ -212,7 +211,6 @@ fn validate_pretrain_args(args: &PretrainArgs) -> Result<(), Box<dyn std::error:
         .into());
     }
 
-    // Observability cadences. A disabled cadence (0) skips its param check.
     if args.eval_every > 0 && args.eval_steps == 0 {
         return Err("--eval-steps must be >= 1 when --eval-every > 0".into());
     }
@@ -271,8 +269,6 @@ fn run_pretrain(args: PretrainArgs) -> Result<(), Box<dyn std::error::Error>> {
         config.sequence_len,
     )?;
 
-    // Snapshot a fixed val set once (deterministic first-N-batch prefix of the
-    // Val split) so every in-loop eval scores identical tokens.
     let mut val_loader = DataLoader::open(
         &args.data,
         Split::Val,
@@ -322,7 +318,6 @@ fn print_config_summary(config: &GptConfig) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     /// A known-good set of args; tests mutate one field to probe a single rule.
     /// `data`/`vocab` are never touched by `validate_pretrain_args`, so dummy paths are fine.
@@ -355,6 +350,13 @@ mod tests {
         }
     }
 
+    /// Mutating one field of `valid_args` must make validation fail.
+    fn rejects(mutate: impl FnOnce(&mut PretrainArgs)) {
+        let mut a = valid_args();
+        mutate(&mut a);
+        assert!(validate_pretrain_args(&a).is_err());
+    }
+
     #[test]
     fn accepts_valid_args() {
         assert!(validate_pretrain_args(&valid_args()).is_ok());
@@ -369,86 +371,68 @@ mod tests {
 
     #[test]
     fn rejects_zero_device_batch() {
-        let mut a = valid_args();
-        a.device_batch = 0;
-        assert!(validate_pretrain_args(&a).is_err());
+        rejects(|a| a.device_batch = 0);
     }
 
     #[test]
     fn rejects_zero_sequence_len() {
-        let mut a = valid_args();
-        a.sequence_len = 0;
-        assert!(validate_pretrain_args(&a).is_err());
+        rejects(|a| a.sequence_len = 0);
     }
 
     #[test]
     fn rejects_zero_num_iters() {
-        let mut a = valid_args();
-        a.num_iters = 0;
-        assert!(validate_pretrain_args(&a).is_err());
+        rejects(|a| a.num_iters = 0);
     }
 
     #[test]
     fn rejects_zero_log_every() {
-        let mut a = valid_args();
-        a.log_every = 0;
-        assert!(validate_pretrain_args(&a).is_err());
+        rejects(|a| a.log_every = 0);
     }
 
     #[test]
     fn rejects_out_of_range_warmdown_ratio() {
-        let mut a = valid_args();
-        a.warmdown_ratio = 1.5;
-        assert!(validate_pretrain_args(&a).is_err());
-        a.warmdown_ratio = -0.1;
-        assert!(validate_pretrain_args(&a).is_err());
+        rejects(|a| a.warmdown_ratio = 1.5);
+        rejects(|a| a.warmdown_ratio = -0.1);
     }
 
     #[test]
     fn rejects_out_of_range_final_lr_frac() {
-        let mut a = valid_args();
-        a.final_lr_frac = 2.0;
-        assert!(validate_pretrain_args(&a).is_err());
+        rejects(|a| a.final_lr_frac = 2.0);
     }
 
     #[test]
     fn rejects_total_batch_not_multiple_of_micro() {
-        let mut a = valid_args();
-        a.total_batch = 16384 + 1;
-        assert!(validate_pretrain_args(&a).is_err());
+        rejects(|a| a.total_batch = 16384 + 1);
     }
 
     #[test]
-    fn rejects_total_batch_smaller_than_micro() {
-        let mut a = valid_args();
-        a.total_batch = 16384 / 2; // grad_accum would be 0
-        assert!(validate_pretrain_args(&a).is_err());
+    fn rejects_zero_total_batch() {
+        // Zero is a multiple of micro, so it reaches the grad_accum == 0 check.
+        rejects(|a| a.total_batch = 0);
     }
 
     #[test]
     fn rejects_zero_eval_steps_when_eval_enabled() {
+        rejects(|a| a.eval_steps = 0);
+        // ...but zero eval_steps is fine when eval is disabled entirely.
         let mut a = valid_args();
         a.eval_steps = 0;
-        assert!(validate_pretrain_args(&a).is_err());
-        // ...but zero eval_steps is fine when eval is disabled entirely.
         a.eval_every = 0;
         assert!(validate_pretrain_args(&a).is_ok());
     }
 
     #[test]
     fn rejects_zero_sample_tokens_when_sampling_enabled() {
+        rejects(|a| a.sample_tokens = 0);
+        // ...but zero sample_tokens is fine when sampling is disabled.
         let mut a = valid_args();
         a.sample_tokens = 0;
-        assert!(validate_pretrain_args(&a).is_err());
-        // ...but zero sample_tokens is fine when sampling is disabled.
         a.sample_every = 0;
         assert!(validate_pretrain_args(&a).is_ok());
     }
 
     #[test]
     fn rejects_negative_sample_temperature() {
-        let mut a = valid_args();
-        a.sample_temperature = -0.1;
-        assert!(validate_pretrain_args(&a).is_err());
+        rejects(|a| a.sample_temperature = -0.1);
     }
 }

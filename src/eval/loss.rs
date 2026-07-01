@@ -1,3 +1,5 @@
+use std::f64::consts::LN_2;
+
 use candle_core::{Result, Tensor};
 
 use crate::data::Batch;
@@ -46,16 +48,12 @@ impl BpbAccumulator {
         let bpb = if self.bytes == 0 {
             f64::INFINITY
         } else {
-            self.nats_bytes / (std::f64::consts::LN_2 * self.bytes as f64)
+            self.nats_bytes / (LN_2 * self.bytes as f64)
         };
         EvalMetrics { val_loss, bpb }
     }
 }
 
-/// Score `batches` and return the aggregate val loss + bpb. No no-grad guard is
-/// needed: candle only builds the autograd graph when `backward()` is called, so
-/// a bare `forward` is already gradient-free. Device is read from the batch
-/// tensors, so the caller places the snapshot once.
 pub fn evaluate(model: &Gpt, batches: &[Batch], token_bytes: &[u32]) -> Result<EvalMetrics> {
     let mut acc = BpbAccumulator::default();
     for batch in batches {
@@ -69,18 +67,13 @@ pub fn evaluate(model: &Gpt, batches: &[Batch], token_bytes: &[u32]) -> Result<E
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::f64::consts::LN_2;
 
     use candle_core::Device;
 
     use crate::data::DataLoader;
-    use crate::test_support::{byte_tokenizer, write_shard};
+    use crate::test_support::{byte_tokenizer, tiny_gpt, two_shard_corpus};
 
-    fn t2(data: &[f32], b: usize, t: usize) -> Tensor {
-        Tensor::from_vec(data.to_vec(), (b, t), &Device::Cpu).unwrap()
-    }
-
-    fn targets(data: &[i64], b: usize, t: usize) -> Tensor {
+    fn t2<D: candle_core::WithDType>(data: &[D], b: usize, t: usize) -> Tensor {
         Tensor::from_vec(data.to_vec(), (b, t), &Device::Cpu).unwrap()
     }
 
@@ -88,8 +81,8 @@ mod tests {
     fn masks_specials_from_bpb_and_ignored_from_both() {
         // Distinct per-position losses pin down exactly which positions each
         // metric summed.   p0 normal   p1 normal   p2 special(0B)   p3 ignored(-1)
-        let loss = t2(&[1.0, 2.0, 4.0, 8.0], 1, 4);
-        let tgt = targets(&[0, 1, 2, -1], 1, 4);
+        let loss = t2(&[1.0f32, 2.0, 4.0, 8.0], 1, 4);
+        let tgt = t2(&[0i64, 1, 2, -1], 1, 4);
         let token_bytes = vec![1u32, 3, 0, 5]; // id2 is a special (0 bytes)
 
         let mut acc = BpbAccumulator::default();
@@ -97,7 +90,11 @@ mod tests {
         let m = acc.metrics();
 
         // val loss drops only p3 (-1); the special p2 still counts → (1+2+4)/3.
-        assert!((m.val_loss - (1.0 + 2.0 + 4.0) / 3.0).abs() < 1e-6, "{}", m.val_loss);
+        assert!(
+            (m.val_loss - (1.0 + 2.0 + 4.0) / 3.0).abs() < 1e-6,
+            "{}",
+            m.val_loss
+        );
         // bpb drops p3 (ignored) and p2 (0 bytes): nats 1+2 over bytes 1+3.
         let want = (1.0 + 2.0) / (LN_2 * (1.0 + 3.0));
         assert!((m.bpb - want).abs() < 1e-6, "{}", m.bpb);
@@ -107,8 +104,8 @@ mod tests {
     fn no_scored_bytes_yields_infinite_bpb() {
         // Every target is a special (0 bytes): val loss is finite (positions are
         // not ignored) but bpb has no bytes to normalize by → infinite.
-        let loss = t2(&[1.0, 2.0], 1, 2);
-        let tgt = targets(&[0, 0], 1, 2);
+        let loss = t2(&[1.0f32, 2.0], 1, 2);
+        let tgt = t2(&[0i64, 0], 1, 2);
         let token_bytes = vec![0u32]; // id 0 is a special
 
         let mut acc = BpbAccumulator::default();
@@ -127,12 +124,28 @@ mod tests {
         // Two batches must compose into the same sums as one combined batch.
         let token_bytes = vec![1u32, 2, 1];
         let mut split = BpbAccumulator::default();
-        split.add(&t2(&[1.0, 2.0], 1, 2), &targets(&[0, 1], 1, 2), &token_bytes).unwrap();
-        split.add(&t2(&[3.0, 4.0], 1, 2), &targets(&[2, 0], 1, 2), &token_bytes).unwrap();
+        split
+            .add(
+                &t2(&[1.0f32, 2.0], 1, 2),
+                &t2(&[0i64, 1], 1, 2),
+                &token_bytes,
+            )
+            .unwrap();
+        split
+            .add(
+                &t2(&[3.0f32, 4.0], 1, 2),
+                &t2(&[2i64, 0], 1, 2),
+                &token_bytes,
+            )
+            .unwrap();
 
         let mut combined = BpbAccumulator::default();
         combined
-            .add(&t2(&[1.0, 2.0, 3.0, 4.0], 1, 4), &targets(&[0, 1, 2, 0], 1, 4), &token_bytes)
+            .add(
+                &t2(&[1.0f32, 2.0, 3.0, 4.0], 1, 4),
+                &t2(&[0i64, 1, 2, 0], 1, 4),
+                &token_bytes,
+            )
             .unwrap();
 
         let (a, b) = (split.metrics(), combined.metrics());
@@ -146,38 +159,16 @@ mod tests {
     #[test]
     fn evaluate_untrained_model_is_near_ln_vocab() -> Result<()> {
         use crate::data::Split;
-        use crate::model::GptConfig;
-        use candle_core::DType;
-        use candle_nn::{VarBuilder, VarMap};
 
-        let dir = tempfile::tempdir().unwrap();
-        // Two shards so a train/val split exists; the val shard holds real text.
-        write_shard(&dir.path().join("0.parquet"), vec![Some("filler text here")]);
-        write_shard(
-            &dir.path().join("1.parquet"),
-            vec![Some("the quick brown fox jumps over the lazy dog")],
-        );
-
-        let mut vocab_file = tempfile::NamedTempFile::new().unwrap();
-        let tok = byte_tokenizer(&mut vocab_file);
+        let dir = two_shard_corpus();
+        let tok = byte_tokenizer();
         let token_bytes = tok.token_byte_lengths();
 
         let dev = Device::Cpu;
         let (b, t) = (2usize, 8usize);
         let mut loader =
             DataLoader::open_with_buffer_size(dir.path(), Split::Val, &tok, b, t, 4).unwrap();
-
-        let cfg = GptConfig {
-            vocab_size: tok.vocab_size(),
-            sequence_len: t,
-            n_layer: 1,
-            n_head: 1,
-            n_embd: 8,
-            rope_base: 100_000.0,
-            norm_eps: 1e-6,
-        };
-        let vm = VarMap::new();
-        let model = Gpt::new(cfg, VarBuilder::from_varmap(&vm, DType::F32, &dev))?;
+        let (_vm, model) = tiny_gpt(tok.vocab_size(), t);
 
         let batches = loader.take_batches(2, &dev)?;
         let m = evaluate(&model, &batches, &token_bytes)?;

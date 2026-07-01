@@ -80,32 +80,13 @@ fn sample(logits: &[f32], temperature: f64, rng: &mut ChaCha8Rng) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::GptConfig;
-    use crate::test_support::byte_tokenizer;
-    use candle_core::DType;
-    use candle_nn::{VarBuilder, VarMap};
-
-    fn tiny_model(tok: &BpeTokenizer, seq_len: usize, dev: &Device) -> (Gpt, VarMap) {
-        let cfg = GptConfig {
-            vocab_size: tok.vocab_size(),
-            sequence_len: seq_len,
-            n_layer: 1,
-            n_head: 1,
-            n_embd: 8,
-            rope_base: 100_000.0,
-            norm_eps: 1e-6,
-        };
-        let vm = VarMap::new();
-        let model = Gpt::new(cfg, VarBuilder::from_varmap(&vm, DType::F32, dev)).unwrap();
-        (model, vm)
-    }
+    use crate::test_support::{byte_tokenizer, tiny_gpt};
 
     #[test]
     fn greedy_is_deterministic_and_seed_independent() {
         let dev = Device::Cpu;
-        let mut vf = tempfile::NamedTempFile::new().unwrap();
-        let tok = byte_tokenizer(&mut vf);
-        let (model, _vm) = tiny_model(&tok, 64, &dev);
+        let tok = byte_tokenizer();
+        let (_vm, model) = tiny_gpt(tok.vocab_size(), 64);
 
         // Greedy is fully determined by the weights, so the seed cannot change it.
         let a = generate(&model, &tok, "hello", 12, 0.0, 42, &dev).unwrap();
@@ -121,9 +102,8 @@ mod tests {
     #[test]
     fn temperature_sampling_is_reproducible_per_seed() {
         let dev = Device::Cpu;
-        let mut vf = tempfile::NamedTempFile::new().unwrap();
-        let tok = byte_tokenizer(&mut vf);
-        let (model, _vm) = tiny_model(&tok, 64, &dev);
+        let tok = byte_tokenizer();
+        let (_vm, model) = tiny_gpt(tok.vocab_size(), 64);
 
         let a = generate(&model, &tok, "hi", 16, 0.8, 123, &dev).unwrap();
         let b = generate(&model, &tok, "hi", 16, 0.8, 123, &dev).unwrap();
@@ -135,9 +115,8 @@ mod tests {
         // seq_len is 8 but we generate well past it: the context must be cropped
         // to the last seq_len tokens (RoPE/mask are sized to seq_len), not error.
         let dev = Device::Cpu;
-        let mut vf = tempfile::NamedTempFile::new().unwrap();
-        let tok = byte_tokenizer(&mut vf);
-        let (model, _vm) = tiny_model(&tok, 8, &dev);
+        let tok = byte_tokenizer();
+        let (_vm, model) = tiny_gpt(tok.vocab_size(), 8);
 
         let out = generate(&model, &tok, "context", 30, 1.0, 5, &dev).unwrap();
         assert!(out.starts_with("<|bos|>context"), "got {out:?}");

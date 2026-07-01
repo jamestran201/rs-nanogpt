@@ -75,7 +75,10 @@ mod tests {
         let row = Tensor::from_vec(v.to_vec(), (1, 1, 1, head_dim), dev).unwrap();
         let x = row.broadcast_as((1, 1, seq, head_dim)).unwrap();
         let y = rope.apply(&x).unwrap();
-        y.reshape((seq, head_dim)).unwrap().to_vec2::<f32>().unwrap()
+        y.reshape((seq, head_dim))
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap()
     }
 
     fn dot(a: &[f32], b: &[f32]) -> f32 {

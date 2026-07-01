@@ -183,7 +183,12 @@ impl BpeTokenizer {
             let idx = (id - self.first_special_id) as usize;
             SPECIAL_TOKENS
                 .get(idx)
-                .unwrap_or_else(|| panic!("token id {id} is out of range (vocab_size {})", self.vocab_size()))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "token id {id} is out of range (vocab_size {})",
+                        self.vocab_size()
+                    )
+                })
                 .as_bytes()
         }
     }
@@ -378,7 +383,12 @@ mod tests {
         // The special-token block at the top of the vocab contributes 0.
         let first_special = tok.bos_id() as usize;
         for (offset, len) in lens[first_special..].iter().enumerate() {
-            assert_eq!(*len, 0, "special token {} should be 0 bytes", first_special + offset);
+            assert_eq!(
+                *len,
+                0,
+                "special token {} should be 0 bytes",
+                first_special + offset
+            );
         }
     }
 

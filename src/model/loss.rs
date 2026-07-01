@@ -36,10 +36,7 @@ pub fn cross_entropy(
     let safe = valid.where_cond(&targets1d, &zeros)?; // (N,), all >= 0
 
     // -log p for every row: (N,1) -> (N,).
-    let negative_log_likelihood = logp
-        .gather(&safe.unsqueeze(1)?, 1)?
-        .squeeze(1)?
-        .neg()?;
+    let negative_log_likelihood = logp.gather(&safe.unsqueeze(1)?, 1)?.squeeze(1)?.neg()?;
 
     let validf = valid.to_dtype(DType::F32)?;
     let negative_log_likelihood = (negative_log_likelihood * &validf)?;
@@ -106,11 +103,8 @@ mod tests {
         let logits2d = Tensor::randn(0.0f32, 1.0, (n, v), &dev)?;
         let ids: Vec<u32> = vec![3, 0, 10, 7, 1];
 
-        let lib = candle_nn::loss::cross_entropy(
-            &logits2d,
-            &Tensor::new(ids.clone(), &dev)?,
-        )?
-        .to_scalar::<f32>()?;
+        let lib = candle_nn::loss::cross_entropy(&logits2d, &Tensor::new(ids.clone(), &dev)?)?
+            .to_scalar::<f32>()?;
 
         let logits3d = logits2d.reshape((1, n, v))?;
         let targets = Tensor::new(ids.iter().map(|&x| x as i64).collect::<Vec<_>>(), &dev)?
