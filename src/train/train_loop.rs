@@ -1,10 +1,15 @@
+use std::path::Path;
+
 use candle_core::backprop::GradStore;
 use candle_core::{Device, Result, Tensor, Var};
 use candle_nn::VarMap;
 
 use super::{GroupLrs, GroupedAdamW, lr_mult};
-use crate::data::DataLoader;
+use crate::checkpoint::{self, CheckpointMeta};
+use crate::data::{Batch, DataLoader};
+use crate::eval::{evaluate, generate};
 use crate::model::{Gpt, Reduction, cross_entropy};
+use crate::tokenizer::BpeTokenizer;
 
 #[derive(Debug, Clone)]
 pub struct TrainConfig {
@@ -15,6 +20,48 @@ pub struct TrainConfig {
     pub warmdown_ratio: f64,
     pub final_lr_frac: f64,
     pub log_every: usize,
+}
+
+/// Observability resources + cadences for the training loop. Kept separate from
+/// [`TrainConfig`] (which is pure optimization config — every field there
+/// changes the trained weights); nothing here affects the weights. A cadence of
+/// `0` disables that hook.
+pub struct EvalContext<'a> {
+    // resources
+    pub val_batches: &'a [Batch],
+    pub tokenizer: &'a BpeTokenizer,
+    pub token_bytes: &'a [u32],
+    pub ckpt_root: &'a Path, // best model saved at ckpt_root/best/
+    // cadences + sampling params; 0 disables the cadence
+    pub eval_every: usize,
+    pub sample_every: usize,
+    pub sample_tokens: usize,
+    pub sample_temperature: f64,
+}
+
+/// Fixed probes sampled on the sampling cadence. The empty prompt first is
+/// BOS-only (unconditional generation — the smoke-run pass criterion); the rest
+/// are simple factual/completion probes ported from nanochat.
+const SAMPLE_PROMPTS: &[&str] = &[
+    "",
+    "The capital of France is",
+    "The opposite of hot is",
+    "My favorite color is",
+];
+
+/// Whether a hook on cadence `every` fires at `step` of a `0..=num_iters` loop.
+/// `every == 0` disables. `skip_first` suppresses step 0 (sampling; untrained
+/// output is noise). The final step (`step == num_iters`) always fires.
+fn fires(step: usize, num_iters: usize, every: usize, skip_first: bool) -> bool {
+    if every == 0 {
+        return false;
+    }
+    let last = step == num_iters;
+    if skip_first {
+        last || (step > 0 && step.is_multiple_of(every))
+    } else {
+        last || step.is_multiple_of(every)
+    }
 }
 
 fn micro_backward(
@@ -49,12 +96,59 @@ pub fn train(
     varmap: &VarMap,
     loader: &mut DataLoader,
     cfg: &TrainConfig,
+    eval: &EvalContext,
     device: &Device,
 ) -> Result<()> {
     let mut opt = GroupedAdamW::new(varmap, cfg.lrs, model.config().n_embd)?;
     let vars = varmap.all_vars();
-    for step in 0..cfg.num_iters {
-        let logging = step % cfg.log_every == 0 || step + 1 == cfg.num_iters;
+    let mut min_val_bpb = f64::INFINITY;
+
+    // `0..=num_iters`: the extra final iteration runs the hooks (so the global-min
+    // bpb is captured even if it lands on the last step) then breaks before the
+    // optimizer body — the run still performs exactly `num_iters` optimizer steps.
+    for step in 0..=cfg.num_iters {
+        let last = step == cfg.num_iters;
+
+        if fires(step, cfg.num_iters, eval.eval_every, false) {
+            let m = evaluate(model, eval.val_batches, eval.token_bytes)?;
+            println!(
+                "step {step:>6}  val_loss {:.4}  bpb {:.4}",
+                m.val_loss, m.bpb
+            );
+            if m.bpb < min_val_bpb {
+                min_val_bpb = m.bpb;
+                checkpoint::save(
+                    &eval.ckpt_root.join("best"),
+                    varmap,
+                    &CheckpointMeta {
+                        config: *model.config(),
+                        step,
+                        val_bpb: m.bpb,
+                    },
+                )?;
+            }
+        }
+
+        if fires(step, cfg.num_iters, eval.sample_every, true) {
+            for p in SAMPLE_PROMPTS {
+                let s = generate(
+                    model,
+                    eval.tokenizer,
+                    p,
+                    eval.sample_tokens,
+                    eval.sample_temperature,
+                    step as u64,
+                    device,
+                )?;
+                println!("sample: {s:?}");
+            }
+        }
+
+        if last {
+            break;
+        }
+
+        let logging = step % cfg.log_every == 0;
         let mut accum: Option<GradStore> = None;
         let mut ce_sum = 0.0f32;
         for _ in 0..cfg.grad_accum {
@@ -263,6 +357,108 @@ mod tests {
             opt.step(&grads)?;
         }
         assert!(last < first, "loss did not decrease: {first} -> {last}");
+        Ok(())
+    }
+
+    #[test]
+    fn fires_cadence_predicate() {
+        let n = 10;
+        // eval-style (skip_first = false): fires at step 0, multiples of `every`,
+        // and the final step.
+        assert!(fires(0, n, 2, false));
+        assert!(fires(2, n, 2, false));
+        assert!(!fires(3, n, 2, false));
+        assert!(fires(n, n, 2, false)); // last is a multiple here
+        assert!(fires(n, n, 3, false)); // last fires even when it isn't a multiple
+
+        // sampling-style (skip_first = true): step 0 suppressed, everything else
+        // identical.
+        assert!(!fires(0, n, 2, true));
+        assert!(fires(2, n, 2, true));
+        assert!(fires(n, n, 2, true));
+
+        // every == 0 disables the cadence entirely, including the final step.
+        assert!(!fires(0, n, 0, false));
+        assert!(!fires(n, n, 0, false));
+        assert!(!fires(n, n, 0, true));
+    }
+
+    /// Capstone: a full tiny `train()` run must leave a loadable best checkpoint
+    /// whose stored bpb the reloaded model reproduces exactly on the same val set.
+    #[test]
+    fn train_saves_loadable_best_checkpoint_matching_reported_bpb() -> Result<()> {
+        use crate::data::Split;
+        use crate::test_support::{byte_tokenizer, write_shard};
+
+        let dev = Device::Cpu;
+        let corpus = tempfile::tempdir().unwrap();
+        // Two shards so a Val split exists; the val shard (sorted last) holds text.
+        write_shard(&corpus.path().join("0.parquet"), vec![Some("filler text here")]);
+        write_shard(
+            &corpus.path().join("1.parquet"),
+            vec![Some("the quick brown fox jumps over the lazy dog")],
+        );
+
+        let mut vocab_file = tempfile::NamedTempFile::new().unwrap();
+        let tok = byte_tokenizer(&mut vocab_file);
+        let token_bytes = tok.token_byte_lengths();
+
+        let (b, t) = (2usize, 8usize);
+        let cfg = GptConfig {
+            vocab_size: tok.vocab_size(),
+            sequence_len: t,
+            n_layer: 1,
+            n_head: 1,
+            n_embd: 8,
+            rope_base: 100_000.0,
+            norm_eps: 1e-6,
+        };
+        let vm = VarMap::new();
+        let model = Gpt::new(cfg, VarBuilder::from_varmap(&vm, DType::F32, &dev))?;
+
+        // Snapshot a fixed val set once; a separate train loader drives the steps.
+        let mut val_loader =
+            DataLoader::open_with_buffer_size(corpus.path(), Split::Val, &tok, b, t, 4).unwrap();
+        let val_batches = val_loader.take_batches(2, &dev)?;
+        let mut train_loader =
+            DataLoader::open_with_buffer_size(corpus.path(), Split::Train, &tok, b, t, 4).unwrap();
+
+        let out = tempfile::tempdir().unwrap();
+        let tcfg = TrainConfig {
+            num_iters: 4,
+            grad_accum: 1,
+            lrs: GroupLrs {
+                embedding: 0.02,
+                unembedding: 0.004,
+                matrix: 0.01,
+            },
+            warmup_steps: 1,
+            warmdown_ratio: 0.5,
+            final_lr_frac: 0.05,
+            log_every: 1_000_000, // effectively silence the per-step loss log
+        };
+        let eval = EvalContext {
+            val_batches: &val_batches,
+            tokenizer: &tok,
+            token_bytes: &token_bytes,
+            ckpt_root: out.path(),
+            eval_every: 2,
+            sample_every: 0, // sampling off: output is noise on a 4-step run
+            sample_tokens: 8,
+            sample_temperature: 0.0,
+        };
+
+        train(&model, &vm, &mut train_loader, &tcfg, &eval, &dev)?;
+
+        // The best checkpoint reloads, and re-scoring the *same* val batches on the
+        // loaded weights reproduces the stored bpb bit-for-bit (identical f32
+        // forward + f64 accumulation over an exact safetensors round-trip).
+        let (loaded, _vm, meta) = checkpoint::load(&out.path().join("best"), &dev)?;
+        let rescored = evaluate(&loaded, &val_batches, &token_bytes)?;
+        assert_eq!(
+            rescored.bpb, meta.val_bpb,
+            "reloaded model must reproduce the saved bpb exactly"
+        );
         Ok(())
     }
 }

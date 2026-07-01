@@ -12,8 +12,8 @@ use rs_nanogpt::model::{
 };
 use rs_nanogpt::tokenizer::{BpeTokenizer, BpeTokenizerTrainer};
 use rs_nanogpt::train::{
-    DEFAULT_FINAL_LR_FRAC, DEFAULT_WARMDOWN_RATIO, DEFAULT_WARMUP_STEPS, GroupLrs, TrainConfig,
-    train,
+    DEFAULT_FINAL_LR_FRAC, DEFAULT_WARMDOWN_RATIO, DEFAULT_WARMUP_STEPS, EvalContext, GroupLrs,
+    TrainConfig, train,
 };
 
 #[derive(Parser)]
@@ -144,6 +144,24 @@ struct PretrainArgs {
     /// Log loss every N steps.
     #[arg(long, default_value_t = 10)]
     log_every: usize,
+    /// Compute val loss/bpb every N steps (0 disables eval and checkpointing).
+    #[arg(long, default_value_t = 250)]
+    eval_every: usize,
+    /// Number of val batches to snapshot for eval.
+    #[arg(long, default_value_t = 20)]
+    eval_steps: usize,
+    /// Sample from the model every N steps (0 disables).
+    #[arg(long, default_value_t = 2000)]
+    sample_every: usize,
+    /// Tokens to generate per sample.
+    #[arg(long, default_value_t = 64)]
+    sample_tokens: usize,
+    /// Sampling temperature; 0 = greedy.
+    #[arg(long, default_value_t = 0.0)]
+    sample_temperature: f64,
+    /// Output dir; best checkpoint saved to <out>/best/.
+    #[arg(long, default_value = "out")]
+    out: PathBuf,
 }
 
 fn validate_pretrain_args(args: &PretrainArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -193,6 +211,21 @@ fn validate_pretrain_args(args: &PretrainArgs) -> Result<(), Box<dyn std::error:
         )
         .into());
     }
+
+    // Observability cadences. A disabled cadence (0) skips its param check.
+    if args.eval_every > 0 && args.eval_steps == 0 {
+        return Err("--eval-steps must be >= 1 when --eval-every > 0".into());
+    }
+    if args.sample_every > 0 && args.sample_tokens == 0 {
+        return Err("--sample-tokens must be >= 1 when --sample-every > 0".into());
+    }
+    if args.sample_temperature < 0.0 {
+        return Err(format!(
+            "--sample-temperature must be >= 0, got {}",
+            args.sample_temperature
+        )
+        .into());
+    }
     Ok(())
 }
 
@@ -228,6 +261,8 @@ fn run_pretrain(args: PretrainArgs) -> Result<(), Box<dyn std::error::Error>> {
     config.validate()?;
     print_config_summary(&config);
 
+    let device = default_device()?;
+
     let mut loader = DataLoader::open(
         &args.data,
         Split::Train,
@@ -236,7 +271,18 @@ fn run_pretrain(args: PretrainArgs) -> Result<(), Box<dyn std::error::Error>> {
         config.sequence_len,
     )?;
 
-    let device = default_device()?;
+    // Snapshot a fixed val set once (deterministic first-N-batch prefix of the
+    // Val split) so every in-loop eval scores identical tokens.
+    let mut val_loader = DataLoader::open(
+        &args.data,
+        Split::Val,
+        &tokenizer,
+        args.device_batch,
+        config.sequence_len,
+    )?;
+    let val_batches = val_loader.take_batches(args.eval_steps, &device)?;
+    let token_bytes = tokenizer.token_byte_lengths();
+
     let varmap = VarMap::new();
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
     let model = Gpt::new(config, vb)?;
@@ -247,7 +293,17 @@ fn run_pretrain(args: PretrainArgs) -> Result<(), Box<dyn std::error::Error>> {
         "\ntraining: {} iters, total_batch {} tokens, device_batch {}, grad_accum {}",
         args.num_iters, args.total_batch, args.device_batch, grad_accum
     );
-    train(&model, &varmap, &mut loader, &train_cfg, &device)?;
+    let eval = EvalContext {
+        val_batches: &val_batches,
+        tokenizer: &tokenizer,
+        token_bytes: &token_bytes,
+        ckpt_root: &args.out,
+        eval_every: args.eval_every,
+        sample_every: args.sample_every,
+        sample_tokens: args.sample_tokens,
+        sample_temperature: args.sample_temperature,
+    };
+    train(&model, &varmap, &mut loader, &train_cfg, &eval, &device)?;
     Ok(())
 }
 
@@ -290,6 +346,12 @@ mod tests {
             warmdown_ratio: 0.65,
             final_lr_frac: 0.05,
             log_every: 10,
+            eval_every: 250,
+            eval_steps: 20,
+            sample_every: 2000,
+            sample_tokens: 64,
+            sample_temperature: 0.0,
+            out: PathBuf::from("unused"),
         }
     }
 
@@ -360,6 +422,33 @@ mod tests {
     fn rejects_total_batch_smaller_than_micro() {
         let mut a = valid_args();
         a.total_batch = 16384 / 2; // grad_accum would be 0
+        assert!(validate_pretrain_args(&a).is_err());
+    }
+
+    #[test]
+    fn rejects_zero_eval_steps_when_eval_enabled() {
+        let mut a = valid_args();
+        a.eval_steps = 0;
+        assert!(validate_pretrain_args(&a).is_err());
+        // ...but zero eval_steps is fine when eval is disabled entirely.
+        a.eval_every = 0;
+        assert!(validate_pretrain_args(&a).is_ok());
+    }
+
+    #[test]
+    fn rejects_zero_sample_tokens_when_sampling_enabled() {
+        let mut a = valid_args();
+        a.sample_tokens = 0;
+        assert!(validate_pretrain_args(&a).is_err());
+        // ...but zero sample_tokens is fine when sampling is disabled.
+        a.sample_every = 0;
+        assert!(validate_pretrain_args(&a).is_ok());
+    }
+
+    #[test]
+    fn rejects_negative_sample_temperature() {
+        let mut a = valid_args();
+        a.sample_temperature = -0.1;
         assert!(validate_pretrain_args(&a).is_err());
     }
 }
