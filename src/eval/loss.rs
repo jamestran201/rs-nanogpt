@@ -1,6 +1,6 @@
-use candle_core::{Device, Result, Tensor};
+use candle_core::{Result, Tensor};
 
-use crate::data::DataLoader;
+use crate::data::Batch;
 use crate::model::{Gpt, Reduction, cross_entropy};
 
 pub struct EvalMetrics {
@@ -52,16 +52,13 @@ impl BpbAccumulator {
     }
 }
 
-pub fn evaluate(
-    model: &Gpt,
-    loader: &mut DataLoader,
-    steps: usize,
-    token_bytes: &[u32],
-    device: &Device,
-) -> Result<EvalMetrics> {
+/// Score `batches` and return the aggregate val loss + bpb. No no-grad guard is
+/// needed: candle only builds the autograd graph when `backward()` is called, so
+/// a bare `forward` is already gradient-free. Device is read from the batch
+/// tensors, so the caller places the snapshot once.
+pub fn evaluate(model: &Gpt, batches: &[Batch], token_bytes: &[u32]) -> Result<EvalMetrics> {
     let mut acc = BpbAccumulator::default();
-    for _ in 0..steps {
-        let batch = loader.next_batch(device)?;
+    for batch in batches {
         let logits = model.forward(&batch.inputs)?;
         let loss2d = cross_entropy(&logits, &batch.targets, -1, Reduction::None)?;
         acc.add(&loss2d, &batch.targets, token_bytes)?;
@@ -74,6 +71,9 @@ mod tests {
     use super::*;
     use std::f64::consts::LN_2;
 
+    use candle_core::Device;
+
+    use crate::data::DataLoader;
     use crate::test_support::{byte_tokenizer, write_shard};
 
     fn t2(data: &[f32], b: usize, t: usize) -> Tensor {
@@ -179,7 +179,8 @@ mod tests {
         let vm = VarMap::new();
         let model = Gpt::new(cfg, VarBuilder::from_varmap(&vm, DType::F32, &dev))?;
 
-        let m = evaluate(&model, &mut loader, 2, &token_bytes, &dev)?;
+        let batches = loader.take_batches(2, &dev)?;
+        let m = evaluate(&model, &batches, &token_bytes)?;
 
         let ln_vocab = (tok.vocab_size() as f64).ln();
         assert!(

@@ -232,6 +232,13 @@ impl<'a> DataLoader<'a> {
         let targets = Tensor::from_vec(targets, (self.batch_size, self.tokens_dim), device)?;
         Ok(Batch { inputs, targets })
     }
+
+    /// Pull `n` batches eagerly into a Vec. On a fresh loader this is the
+    /// deterministic first-`n`-batch prefix of the split — used to snapshot a
+    /// fixed val set once, so every in-loop eval scores identical tokens.
+    pub fn take_batches(&mut self, n: usize, device: &Device) -> candle_core::Result<Vec<Batch>> {
+        (0..n).map(|_| self.next_batch(device)).collect()
+    }
 }
 
 #[cfg(test)]
@@ -428,6 +435,36 @@ mod tests {
             batch.targets.to_vec2::<i64>().unwrap(),
             vec![vec![a as i64, b as i64]]
         );
+    }
+
+    #[test]
+    fn take_batches_is_deterministic_across_fresh_loaders() {
+        use candle_core::Device;
+
+        // Two fresh loaders over the same corpus must snapshot an identical
+        // prefix of batches — the property the val-set snapshot relies on.
+        let dir = tempfile::tempdir().unwrap();
+        let mut vocab_file = tempfile::NamedTempFile::new().unwrap();
+        let tok = byte_tokenizer(&mut vocab_file);
+        let text = "the quick brown fox jumps over the lazy dog";
+        let (b, t) = (2usize, 4usize);
+
+        let mut l1 = loader_over(dir.path(), &tok, Split::Val, text, b, t);
+        let a = l1.take_batches(3, &Device::Cpu).unwrap();
+        let mut l2 = loader_over(dir.path(), &tok, Split::Val, text, b, t);
+        let c = l2.take_batches(3, &Device::Cpu).unwrap();
+
+        assert_eq!(a.len(), 3);
+        for (x, y) in a.iter().zip(&c) {
+            assert_eq!(
+                x.inputs.to_vec2::<u32>().unwrap(),
+                y.inputs.to_vec2::<u32>().unwrap()
+            );
+            assert_eq!(
+                x.targets.to_vec2::<i64>().unwrap(),
+                y.targets.to_vec2::<i64>().unwrap()
+            );
+        }
     }
 
     #[test]
