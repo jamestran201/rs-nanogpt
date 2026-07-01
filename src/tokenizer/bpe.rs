@@ -161,6 +161,18 @@ impl BpeTokenizer {
         256 + self.vocab.merged.len() + NUM_SPECIAL_TOKENS
     }
 
+    pub fn token_byte_lengths(&self) -> Vec<u32> {
+        (0..self.vocab_size() as TokenId)
+            .map(|id| {
+                if id < self.first_special_id {
+                    self.bytes_of(id).len() as u32
+                } else {
+                    0
+                }
+            })
+            .collect()
+    }
+
     /// Bytes for a token id, dispatching across bytes/merges (delegated to
     /// `Vocab`) and the special-token block. A special id renders as its literal
     /// string (e.g. `<|bos|>`), matching tiktoken's decode behavior.
@@ -176,13 +188,23 @@ impl BpeTokenizer {
         }
     }
 
-    pub fn decode(&self, ids: &[TokenId]) -> String {
+    fn decode_bytes(&self, ids: &[TokenId]) -> Vec<u8> {
         let total: usize = ids.iter().map(|&id| self.bytes_of(id).len()).sum();
         let mut bytes = Vec::with_capacity(total);
         for &id in ids {
             bytes.extend_from_slice(self.bytes_of(id));
         }
-        String::from_utf8(bytes).expect("decoded token bytes should be valid UTF-8")
+        bytes
+    }
+
+    pub fn decode(&self, ids: &[TokenId]) -> String {
+        String::from_utf8(self.decode_bytes(ids))
+            .expect("decoded token bytes should be valid UTF-8")
+    }
+
+    /// Like [`decode`](Self::decode) but replaces invalid UTF-8 with U+FFFD instead of panicking.
+    pub fn decode_lossy(&self, ids: &[TokenId]) -> String {
+        String::from_utf8_lossy(&self.decode_bytes(ids)).into_owned()
     }
 
     pub fn encode(&self, text: &str) -> Vec<TokenId> {
@@ -338,6 +360,29 @@ mod tests {
     }
 
     #[test]
+    fn token_byte_lengths_zero_for_specials_and_byte_len_otherwise() {
+        let vocab_file = train_tiny_vocab(300);
+        let tok = BpeTokenizer::from_file(vocab_file.path()).unwrap();
+        let lens = tok.token_byte_lengths();
+
+        // One entry per token id.
+        assert_eq!(lens.len(), tok.vocab_size());
+        // The 256 single-byte tokens are exactly one byte each.
+        for (id, len) in lens.iter().enumerate().take(256) {
+            assert_eq!(*len, 1, "byte token {id} should be 1 byte");
+        }
+        // Each learned merge matches the byte length of its stored bytes.
+        for (i, bytes) in tok.vocab.merged.iter().enumerate() {
+            assert_eq!(lens[256 + i], bytes.len() as u32);
+        }
+        // The special-token block at the top of the vocab contributes 0.
+        let first_special = tok.bos_id() as usize;
+        for (offset, len) in lens[first_special..].iter().enumerate() {
+            assert_eq!(*len, 0, "special token {} should be 0 bytes", first_special + offset);
+        }
+    }
+
+    #[test]
     fn from_file_byte_only_vocab() {
         let vocab_file = train_tiny_vocab(265); // 256 bytes + 0 merges + 9 specials
         let tok = BpeTokenizer::from_file(vocab_file.path()).unwrap();
@@ -483,6 +528,15 @@ mod tests {
         let tok = BpeTokenizer::from_file(vocab_file.path()).unwrap();
         let ids: Vec<TokenId> = b"hello".iter().map(|&b| b as TokenId).collect();
         assert_eq!(tok.decode(&ids), "hello");
+    }
+
+    #[test]
+    fn decode_lossy_replaces_invalid_utf8_without_panicking() {
+        let vocab_file = train_tiny_vocab(265); // byte-only vocab
+        let tok = BpeTokenizer::from_file(vocab_file.path()).unwrap();
+        // A lone UTF-8 continuation byte (0x80) is invalid on its own; `decode`
+        // would panic, but `decode_lossy` yields the replacement character.
+        assert_eq!(tok.decode_lossy(&[0x80]), "\u{FFFD}");
     }
 
     #[test]

@@ -8,7 +8,7 @@ pub const DEFAULT_N_EMBD: usize = 384;
 pub const DEFAULT_ROPE_BASE: f32 = 100_000.0;
 pub const DEFAULT_NORM_EPS: f32 = 1e-6;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct GptConfig {
     pub vocab_size: usize,
     /// Maximum context length (tokens per training example).

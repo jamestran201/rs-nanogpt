@@ -237,37 +237,13 @@ impl<'a> DataLoader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
     use std::path::Path;
+
+    use crate::test_support::{byte_tokenizer, write_shard};
 
     /// A re-creatable source over a fixed document list: each call clones the docs into a fresh iterator
     fn fixed_docs(docs: Vec<Vec<u32>>) -> impl Fn() -> std::vec::IntoIter<Vec<u32>> {
         move || docs.clone().into_iter()
-    }
-
-    /// A byte-level tokenizer: a 256-entry vocab where each token is a single byte, so `encode` maps byte `b` to id `b`.
-    fn byte_tokenizer(vocab_file: &mut tempfile::NamedTempFile) -> BpeTokenizer {
-        use base64::Engine;
-        use base64::engine::general_purpose::STANDARD;
-        for b in 0u32..256 {
-            writeln!(vocab_file, "{} {}", STANDARD.encode([b as u8]), b).unwrap();
-        }
-        vocab_file.flush().unwrap();
-        BpeTokenizer::from_file(vocab_file.path()).unwrap()
-    }
-
-    fn write_shard(path: &Path, texts: Vec<Option<&str>>) {
-        use std::sync::Arc;
-
-        use arrow_array::{ArrayRef, RecordBatch, StringArray};
-        use parquet::arrow::ArrowWriter;
-
-        let arr: ArrayRef = Arc::new(StringArray::from(texts));
-        let batch = RecordBatch::try_from_iter([("text", arr)]).unwrap();
-        let file = std::fs::File::create(path).unwrap();
-        let mut writer = ArrowWriter::try_new(file, batch.schema(), None).unwrap();
-        writer.write(&batch).unwrap();
-        writer.close().unwrap();
     }
 
     fn byte_id(b: u8) -> u32 {
