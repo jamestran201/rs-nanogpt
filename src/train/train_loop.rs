@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::time::Instant;
 
 use candle_core::backprop::GradStore;
 use candle_core::{Device, Result, Tensor, Var};
@@ -51,6 +52,20 @@ fn cadence_fires(step: usize, num_iters: usize, every: usize, skip_first: bool) 
     step == num_iters || ((!skip_first || step > 0) && step.is_multiple_of(every))
 }
 
+/// Seconds as `HH:MM:SS`, saturating (no days field — training runs are hours).
+fn fmt_hms(secs: f64) -> String {
+    let s = secs.max(0.0) as u64;
+    format!("{:02}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
+}
+
+/// Abort the run if the logged loss is non-finite (NaN/Inf ⇒ divergence).
+fn check_finite(loss: f32, step: usize) -> Result<()> {
+    if !loss.is_finite() {
+        candle_core::bail!("loss became non-finite ({loss}) at step {step}; aborting run");
+    }
+    Ok(())
+}
+
 fn micro_backward(
     model: &Gpt,
     inputs: &Tensor,
@@ -90,14 +105,15 @@ pub fn train(
     let vars = varmap.all_vars();
     let mut min_val_bpb = f64::INFINITY;
 
-    for step in 0..=cfg.num_iters {
-        println!("train step {step}");
+    let t_start = Instant::now();
+    let mut win_start = Instant::now(); // start of the current log window
+    let mut win_step = 0usize; // step at win_start
+    let mut tokens_per_step = 0usize; // set from the first micro-batch
 
+    for step in 0..=cfg.num_iters {
         let last = step == cfg.num_iters;
 
         if cadence_fires(step, cfg.num_iters, eval.eval_every, false) {
-            println!("computing validation metrics");
-
             let m = evaluate(model, eval.val_batches, eval.token_bytes)?;
             println!(
                 "step {step:>6}  val_loss {:.4}  bpb {:.4}",
@@ -118,8 +134,6 @@ pub fn train(
         }
 
         if cadence_fires(step, cfg.num_iters, eval.sample_every, true) {
-            println!("running qualitative validations");
-
             for p in SAMPLE_PROMPTS {
                 let s = generate(
                     model,
@@ -138,12 +152,15 @@ pub fn train(
             break;
         }
 
-        println!("running forward/backward passes");
         let logging = step.is_multiple_of(cfg.log_every);
         let mut accum: Option<GradStore> = None;
         let mut ce_sum = 0.0f32;
         for _ in 0..cfg.grad_accum {
             let batch = loader.next_batch(device)?;
+            if tokens_per_step == 0 {
+                // B*T*grad_accum; fixed across the run, so derive it once.
+                tokens_per_step = cfg.grad_accum * batch.inputs.dim(0)? * batch.inputs.dim(1)?;
+            }
             let (grads, ce) = micro_backward(model, &batch.inputs, &batch.targets, cfg.grad_accum)?;
             if logging {
                 ce_sum += ce.to_scalar::<f32>()?;
@@ -165,14 +182,33 @@ pub fn train(
         opt.step(&grads)?;
         if logging {
             // Mean micro-batch CE (the per-token loss), independent of grad_accum.
-            println!(
-                "step {step:>6}/{}  loss {:.4}  lr_mult {m:.4}",
-                cfg.num_iters,
-                ce_sum / cfg.grad_accum as f32
-            );
-        }
+            let mean_ce = ce_sum / cfg.grad_accum as f32;
+            check_finite(mean_ce, step)?;
 
-        println!("---");
+            device.synchronize()?; // drain queued GPU work so the timing is real
+            let now = Instant::now();
+            let lrs = opt.current_lrs();
+            let dsteps = step - win_step; // 0 only at the step-0 log
+            let elapsed = fmt_hms(now.duration_since(t_start).as_secs_f64());
+
+            if dsteps > 0 {
+                let win_s = now.duration_since(win_start).as_secs_f64();
+                let ms_per_step = 1000.0 * win_s / dsteps as f64;
+                let tok_s = (dsteps * tokens_per_step) as f64 / win_s;
+                let eta = fmt_hms(ms_per_step / 1000.0 * (cfg.num_iters - step) as f64);
+                println!(
+                    "step {step:>6}/{} | loss {mean_ce:.4} \
+                     | lr m={:.2e} e={:.2e} u={:.2e} \
+                     | {tok_s:.0} tok/s | {ms_per_step:.0} ms/step | t+{elapsed} | eta {eta}",
+                    cfg.num_iters, lrs.matrix, lrs.embedding, lrs.unembedding,
+                );
+            } else {
+                // step-0 window has no elapsed steps yet: baseline loss only.
+                println!("step {step:>6}/{} | loss {mean_ce:.4} | t+{elapsed}", cfg.num_iters);
+            }
+            win_start = now;
+            win_step = step;
+        }
     }
     Ok(())
 }
@@ -373,6 +409,22 @@ mod tests {
         assert!(!cadence_fires(0, n, 0, false));
         assert!(!cadence_fires(n, n, 0, false));
         assert!(!cadence_fires(n, n, 0, true));
+    }
+
+    #[test]
+    fn fmt_hms_formats_and_saturates() {
+        assert_eq!(fmt_hms(0.0), "00:00:00");
+        assert_eq!(fmt_hms(3723.0), "01:02:03"); // 1h 2m 3s
+        assert_eq!(fmt_hms(59.9), "00:00:59"); // truncates, not rounds
+        assert_eq!(fmt_hms(-5.0), "00:00:00"); // saturates at zero
+    }
+
+    #[test]
+    fn check_finite_rejects_nan_and_inf() {
+        assert!(check_finite(1.5, 0).is_ok());
+        assert!(check_finite(f32::NAN, 3).is_err());
+        assert!(check_finite(f32::INFINITY, 3).is_err());
+        assert!(check_finite(f32::NEG_INFINITY, 3).is_err());
     }
 
     /// Capstone: a full tiny `train()` run must leave a loadable best checkpoint

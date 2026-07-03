@@ -124,6 +124,16 @@ impl GroupedAdamW {
             .set_learning_rate(self.base_lrs.unembedding * m);
         self.matrix.set_learning_rate(self.base_lrs.matrix * m);
     }
+
+    /// The per-group learning rates currently in effect (base × muP scale × the
+    /// last `set_lr_mult` multiplier). For logging the real schedule value.
+    pub fn current_lrs(&self) -> GroupLrs {
+        GroupLrs {
+            embedding: self.embedding.learning_rate(),
+            unembedding: self.unembedding.learning_rate(),
+            matrix: self.matrix.learning_rate(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -293,6 +303,12 @@ mod tests {
         assert!((opt.embedding.learning_rate() - 0.2 * scale * m).abs() < 1e-12);
         assert!((opt.unembedding.learning_rate() - 0.004 * scale * m).abs() < 1e-12);
         assert!((opt.matrix.learning_rate() - 0.02 * scale * m).abs() < 1e-12);
+
+        // current_lrs() must report those same in-effect values.
+        let cur = opt.current_lrs();
+        assert!((cur.embedding - 0.2 * scale * m).abs() < 1e-12);
+        assert!((cur.unembedding - 0.004 * scale * m).abs() < 1e-12);
+        assert!((cur.matrix - 0.02 * scale * m).abs() < 1e-12);
         Ok(())
     }
 }

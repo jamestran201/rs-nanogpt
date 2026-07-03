@@ -283,7 +283,7 @@ fn run_pretrain(args: PretrainArgs) -> Result<(), Box<dyn std::error::Error>> {
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
     let model = Gpt::new(config, vb)?;
     let n_params: usize = varmap.all_vars().iter().map(|v| v.elem_count()).sum();
-    println!("\nmodel built on {device:?}: {n_params} parameters");
+    println!("\nmodel built on {device:?} | dtype F32 | {n_params} parameters");
 
     println!(
         "\ntraining: {} iters, total_batch {} tokens, device_batch {}, grad_accum {}",
