@@ -1,11 +1,13 @@
 use std::path::PathBuf;
 use std::process;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use candle_core::DType;
 use candle_nn::{VarBuilder, VarMap};
 use clap::{Parser, Subcommand};
 use rs_nanogpt::data::{DataLoader, Split};
 use rs_nanogpt::eval::tokenizer as tokenizer_eval;
+use rs_nanogpt::metrics::{MetricsLogger, RunMeta, write_run_json};
 use rs_nanogpt::model::{
     DEFAULT_N_EMBD, DEFAULT_N_HEAD, DEFAULT_N_LAYER, DEFAULT_NORM_EPS, DEFAULT_ROPE_BASE,
     DEFAULT_SEQUENCE_LEN, Gpt, GptConfig, default_device,
@@ -283,17 +285,53 @@ fn run_pretrain(args: PretrainArgs) -> Result<(), Box<dyn std::error::Error>> {
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
     let model = Gpt::new(config, vb)?;
     let n_params: usize = varmap.all_vars().iter().map(|v| v.elem_count()).sum();
-    println!("\nmodel built on {device:?}: {n_params} parameters");
+    println!("\nmodel built on {device:?} | dtype F32 | {n_params} parameters");
 
     println!(
         "\ntraining: {} iters, total_batch {} tokens, device_batch {}, grad_accum {}",
         args.num_iters, args.total_batch, args.device_batch, grad_accum
     );
+    let started_at_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let run_meta = RunMeta {
+        device: format!("{device:?}"),
+        dtype: "f32",
+        started_at_unix,
+        n_params,
+        vocab_size: config.vocab_size,
+        sequence_len: config.sequence_len,
+        n_layer: config.n_layer,
+        n_head: config.n_head,
+        n_embd: config.n_embd,
+        rope_base: config.rope_base,
+        norm_eps: config.norm_eps,
+        num_iters: args.num_iters,
+        device_batch: args.device_batch,
+        total_batch: args.total_batch,
+        grad_accum,
+        tokens_per_step: args.total_batch, // == grad_accum * device_batch * seq_len
+        embedding_lr: args.embedding_lr,
+        unembedding_lr: args.unembedding_lr,
+        matrix_lr: args.matrix_lr,
+        warmup_steps: args.warmup_steps,
+        warmdown_ratio: args.warmdown_ratio,
+        final_lr_frac: args.final_lr_frac,
+        log_every: args.log_every,
+        eval_every: args.eval_every,
+        eval_steps: args.eval_steps,
+        sample_every: args.sample_every,
+    };
+    write_run_json(&args.out.join("run.json"), &run_meta)?;
+    let metrics = MetricsLogger::create(&args.out.join("metrics.jsonl"))?;
+
     let eval = EvalContext {
         val_batches: &val_batches,
         tokenizer: &tokenizer,
         token_bytes: &token_bytes,
         ckpt_root: &args.out,
+        metrics: &metrics,
         eval_every: args.eval_every,
         sample_every: args.sample_every,
         sample_tokens: args.sample_tokens,

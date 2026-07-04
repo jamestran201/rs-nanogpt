@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::time::Instant;
 
 use candle_core::backprop::GradStore;
 use candle_core::{Device, Result, Tensor, Var};
@@ -8,6 +9,7 @@ use super::{GroupLrs, GroupedAdamW, lr_mult};
 use crate::checkpoint::{self, CheckpointMeta};
 use crate::data::{Batch, DataLoader};
 use crate::eval::{evaluate, generate};
+use crate::metrics::{MetricRecord, MetricsLogger, Throughput};
 use crate::model::{Gpt, Reduction, cross_entropy};
 use crate::tokenizer::BpeTokenizer;
 
@@ -27,6 +29,7 @@ pub struct EvalContext<'a> {
     pub tokenizer: &'a BpeTokenizer,
     pub token_bytes: &'a [u32],
     pub ckpt_root: &'a Path, // best model saved at ckpt_root/best/
+    pub metrics: &'a MetricsLogger, // append-only JSONL telemetry sink
     // cadences + sampling params; 0 disables the cadence
     pub eval_every: usize,
     pub sample_every: usize,
@@ -49,6 +52,43 @@ fn cadence_fires(step: usize, num_iters: usize, every: usize, skip_first: bool) 
         return false;
     }
     step == num_iters || ((!skip_first || step > 0) && step.is_multiple_of(every))
+}
+
+/// Seconds as `HH:MM:SS`
+fn fmt_hms(secs: f64) -> String {
+    let s = secs.max(0.0) as u64;
+    format!("{:02}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
+}
+
+/// Abort the run if the logged loss is non-finite (NaN/Inf ⇒ divergence).
+fn check_finite(loss: f32, step: usize) -> Result<()> {
+    if !loss.is_finite() {
+        candle_core::bail!("loss became non-finite ({loss}) at step {step}; aborting run");
+    }
+    Ok(())
+}
+
+/// Global L2 norm ‖g‖₂ of the accumulated per-step gradient. Sums each grad's
+/// squared elements on-device and reads one scalar (one sync), so gate it behind
+/// `logging` like the loss. The pre-Adam gradient magnitude is the standard
+/// instability early-warning — it spikes before the loss goes NaN.
+fn grad_global_norm(grads: &GradStore, vars: &[Var]) -> Result<f64> {
+    let mut sumsq: Option<Tensor> = None;
+    for v in vars {
+        let t = v.as_tensor();
+        if let Some(g) = grads.get(t) {
+            let s = g.sqr()?.sum_all()?; // scalar tensor
+            sumsq = Some(match sumsq {
+                Some(a) => a.add(&s)?,
+                None => s,
+            });
+        }
+    }
+    match sumsq {
+        Some(t) => Ok((t.to_scalar::<f32>()? as f64).sqrt()),
+        // Strict-init step: zeroed residual projections store no grad.
+        None => Ok(0.0),
+    }
 }
 
 fn micro_backward(
@@ -90,19 +130,26 @@ pub fn train(
     let vars = varmap.all_vars();
     let mut min_val_bpb = f64::INFINITY;
 
-    for step in 0..=cfg.num_iters {
-        println!("train step {step}");
+    let t_start = Instant::now();
+    let mut window_start_time = Instant::now(); // start of the current log window
+    let mut window_start_step = 0usize; // step at window_start_time
+    let mut tokens_per_step = 0usize; // set from the first micro-batch
 
+    for step in 0..=cfg.num_iters {
         let last = step == cfg.num_iters;
 
         if cadence_fires(step, cfg.num_iters, eval.eval_every, false) {
-            println!("computing validation metrics");
-
             let m = evaluate(model, eval.val_batches, eval.token_bytes)?;
             println!(
                 "step {step:>6}  val_loss {:.4}  bpb {:.4}",
                 m.val_loss, m.bpb
             );
+            eval.metrics.log(&MetricRecord::eval(
+                step,
+                t_start.elapsed().as_secs_f64(),
+                m.val_loss,
+                m.bpb,
+            ));
             if m.bpb < min_val_bpb {
                 min_val_bpb = m.bpb;
                 checkpoint::save(
@@ -118,8 +165,6 @@ pub fn train(
         }
 
         if cadence_fires(step, cfg.num_iters, eval.sample_every, true) {
-            println!("running qualitative validations");
-
             for p in SAMPLE_PROMPTS {
                 let s = generate(
                     model,
@@ -138,12 +183,15 @@ pub fn train(
             break;
         }
 
-        println!("running forward/backward passes");
         let logging = step.is_multiple_of(cfg.log_every);
         let mut accum: Option<GradStore> = None;
         let mut ce_sum = 0.0f32;
         for _ in 0..cfg.grad_accum {
             let batch = loader.next_batch(device)?;
+            if tokens_per_step == 0 {
+                // B*T*grad_accum; fixed across the run, so derive it once.
+                tokens_per_step = cfg.grad_accum * batch.inputs.dim(0)? * batch.inputs.dim(1)?;
+            }
             let (grads, ce) = micro_backward(model, &batch.inputs, &batch.targets, cfg.grad_accum)?;
             if logging {
                 ce_sum += ce.to_scalar::<f32>()?;
@@ -165,14 +213,48 @@ pub fn train(
         opt.step(&grads)?;
         if logging {
             // Mean micro-batch CE (the per-token loss), independent of grad_accum.
-            println!(
-                "step {step:>6}/{}  loss {:.4}  lr_mult {m:.4}",
-                cfg.num_iters,
-                ce_sum / cfg.grad_accum as f32
-            );
-        }
+            let mean_ce = ce_sum / cfg.grad_accum as f32;
+            check_finite(mean_ce, step)?;
 
-        println!("---");
+            device.synchronize()?; // drain queued GPU work so the timing is real
+            let now = Instant::now();
+            let lrs = opt.current_lrs();
+            let gnorm = grad_global_norm(&grads, &vars)?;
+            let steps_in_window = step - window_start_step; // 0 only at the step-0 log
+            let elapsed_s = now.duration_since(t_start).as_secs_f64();
+            let elapsed = fmt_hms(elapsed_s);
+
+            let rate = if steps_in_window > 0 {
+                let window_secs = now.duration_since(window_start_time).as_secs_f64();
+                let ms_per_step = 1000.0 * window_secs / steps_in_window as f64;
+                let tok_s = (steps_in_window * tokens_per_step) as f64 / window_secs;
+                let eta = fmt_hms(ms_per_step / 1000.0 * (cfg.num_iters - step) as f64);
+                println!(
+                    "step {step:>6}/{} | loss {mean_ce:.4} | gnorm {gnorm:.3} \
+                     | lr m={:.2e} e={:.2e} u={:.2e} \
+                     | {tok_s:.0} tok/s | {ms_per_step:.0} ms/step | t+{elapsed} | eta {eta}",
+                    cfg.num_iters, lrs.matrix, lrs.embedding, lrs.unembedding,
+                );
+                Some(Throughput {
+                    tok_per_s: tok_s,
+                    ms_per_step,
+                })
+            } else {
+                // step-0 window has no elapsed steps yet: baseline loss only.
+                println!(
+                    "step {step:>6}/{} | loss {mean_ce:.4} | gnorm {gnorm:.3} | t+{elapsed}",
+                    cfg.num_iters
+                );
+                None
+            };
+
+            eval.metrics.log(&MetricRecord::train(
+                step, elapsed_s, mean_ce, gnorm, lrs, rate,
+            ));
+
+            window_start_time = now;
+            window_start_step = step;
+        }
     }
     Ok(())
 }
@@ -375,6 +457,83 @@ mod tests {
         assert!(!cadence_fires(n, n, 0, true));
     }
 
+    #[test]
+    fn fmt_hms_formats_and_saturates() {
+        assert_eq!(fmt_hms(0.0), "00:00:00");
+        assert_eq!(fmt_hms(3723.0), "01:02:03"); // 1h 2m 3s
+        assert_eq!(fmt_hms(59.9), "00:00:59"); // truncates, not rounds
+        assert_eq!(fmt_hms(-5.0), "00:00:00"); // saturates at zero
+    }
+
+    #[test]
+    fn check_finite_rejects_nan_and_inf() {
+        assert!(check_finite(1.5, 0).is_ok());
+        assert!(check_finite(f32::NAN, 3).is_err());
+        assert!(check_finite(f32::INFINITY, 3).is_err());
+        assert!(check_finite(f32::NEG_INFINITY, 3).is_err());
+    }
+
+    #[test]
+    fn grad_global_norm_matches_reference() -> Result<()> {
+        let dev = Device::Cpu;
+        let vm = VarMap::new();
+        let cfg = tiny_cfg();
+        let n_embd = cfg.n_embd;
+        let model = Gpt::new(cfg, VarBuilder::from_varmap(&vm, DType::F32, &dev))?;
+        let vars = vm.all_vars();
+
+        let inputs = Tensor::new(&[[1u32, 2, 3, 4], [5, 6, 7, 8]], &dev)?;
+        let targets = Tensor::new(&[[2i64, 3, 4, 5], [6, 7, 8, 9]], &dev)?;
+
+        // One step first so the zero-init residual projections carry grad;
+        // otherwise several params store no gradient at strict init.
+        {
+            let lrs = GroupLrs {
+                embedding: 0.01,
+                unembedding: 0.01,
+                matrix: 0.01,
+            };
+            let mut warm = GroupedAdamW::new(&vm, lrs, n_embd)?;
+            let (g, _) = micro_backward(&model, &inputs, &targets, 1)?;
+            warm.set_lr_mult(1.0);
+            warm.step(&g)?;
+        }
+
+        let (grads, _) = micro_backward(&model, &inputs, &targets, 1)?;
+
+        // Independent f64 reference: sum of squares over every stored grad.
+        let mut ref_sumsq = 0.0f64;
+        for v in &vars {
+            if let Some(g) = grads.get(v.as_tensor()) {
+                for x in g.flatten_all()?.to_vec1::<f32>()? {
+                    ref_sumsq += (x as f64) * (x as f64);
+                }
+            }
+        }
+        let reference = ref_sumsq.sqrt();
+        let got = grad_global_norm(&grads, &vars)?;
+        assert!(reference > 0.0, "expected a nonzero gradient norm");
+        assert!(
+            (got - reference).abs() <= 1e-5 * (1.0 + reference),
+            "grad_global_norm {got} vs reference {reference}"
+        );
+        Ok(())
+    }
+
+    /// No vars to match against ⇒ nothing summed ⇒ norm is 0.0 (the empty path a
+    /// strict-init step exercises when no residual grads are stored).
+    #[test]
+    fn grad_global_norm_no_matching_vars_is_zero() -> Result<()> {
+        let dev = Device::Cpu;
+        let vm = VarMap::new();
+        let model = Gpt::new(tiny_cfg(), VarBuilder::from_varmap(&vm, DType::F32, &dev))?;
+        let inputs = Tensor::new(&[[1u32, 2, 3, 4]], &dev)?;
+        let targets = Tensor::new(&[[2i64, 3, 4, 5]], &dev)?;
+        let (grads, _) = micro_backward(&model, &inputs, &targets, 1)?;
+        assert_eq!(grad_global_norm(&grads, &[])?, 0.0);
+        Ok(())
+    }
+
     /// Capstone: a full tiny `train()` run must leave a loadable best checkpoint
     /// whose stored bpb the reloaded model reproduces exactly on the same val set.
     #[test]
@@ -411,11 +570,13 @@ mod tests {
             final_lr_frac: 0.05,
             log_every: 1_000_000, // effectively silence the per-step loss log
         };
+        let metrics = MetricsLogger::create(&out.path().join("metrics.jsonl")).unwrap();
         let eval = EvalContext {
             val_batches: &val_batches,
             tokenizer: &tok,
             token_bytes: &token_bytes,
             ckpt_root: out.path(),
+            metrics: &metrics,
             eval_every: 2,
             sample_every: 0, // sampling off: output is noise on a 4-step run
             sample_tokens: 8,
@@ -423,6 +584,15 @@ mod tests {
         };
 
         train(&model, &vm, &mut train_loader, &tcfg, &eval, &dev)?;
+
+        // Telemetry landed: at least the step-0 train record plus eval records.
+        let metrics_len = std::fs::metadata(out.path().join("metrics.jsonl"))
+            .unwrap()
+            .len();
+        assert!(
+            metrics_len > 0,
+            "metrics.jsonl should be non-empty after train()"
+        );
 
         // The best checkpoint reloads, and re-scoring the *same* val batches on the
         // loaded weights reproduces the stored bpb bit-for-bit (identical f32
