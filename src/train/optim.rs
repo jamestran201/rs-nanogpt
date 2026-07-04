@@ -125,8 +125,6 @@ impl GroupedAdamW {
         self.matrix.set_learning_rate(self.base_lrs.matrix * m);
     }
 
-    /// The per-group learning rates currently in effect (base × muP scale × the
-    /// last `set_lr_mult` multiplier). For logging the real schedule value.
     pub fn current_lrs(&self) -> GroupLrs {
         GroupLrs {
             embedding: self.embedding.learning_rate(),

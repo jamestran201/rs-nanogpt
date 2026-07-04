@@ -9,7 +9,7 @@ use super::{GroupLrs, GroupedAdamW, lr_mult};
 use crate::checkpoint::{self, CheckpointMeta};
 use crate::data::{Batch, DataLoader};
 use crate::eval::{evaluate, generate};
-use crate::metrics::{MetricRecord, MetricsLogger};
+use crate::metrics::{MetricRecord, MetricsLogger, Throughput};
 use crate::model::{Gpt, Reduction, cross_entropy};
 use crate::tokenizer::BpeTokenizer;
 
@@ -54,7 +54,7 @@ fn cadence_fires(step: usize, num_iters: usize, every: usize, skip_first: bool) 
     step == num_iters || ((!skip_first || step > 0) && step.is_multiple_of(every))
 }
 
-/// Seconds as `HH:MM:SS`, saturating (no days field — training runs are hours).
+/// Seconds as `HH:MM:SS`
 fn fmt_hms(secs: f64) -> String {
     let s = secs.max(0.0) as u64;
     format!("{:02}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
@@ -131,8 +131,8 @@ pub fn train(
     let mut min_val_bpb = f64::INFINITY;
 
     let t_start = Instant::now();
-    let mut win_start = Instant::now(); // start of the current log window
-    let mut win_step = 0usize; // step at win_start
+    let mut window_start_time = Instant::now(); // start of the current log window
+    let mut window_start_step = 0usize; // step at window_start_time
     let mut tokens_per_step = 0usize; // set from the first micro-batch
 
     for step in 0..=cfg.num_iters {
@@ -220,14 +220,14 @@ pub fn train(
             let now = Instant::now();
             let lrs = opt.current_lrs();
             let gnorm = grad_global_norm(&grads, &vars)?;
-            let dsteps = step - win_step; // 0 only at the step-0 log
+            let steps_in_window = step - window_start_step; // 0 only at the step-0 log
             let elapsed_s = now.duration_since(t_start).as_secs_f64();
             let elapsed = fmt_hms(elapsed_s);
 
-            let (tok_s, ms_per_step) = if dsteps > 0 {
-                let win_s = now.duration_since(win_start).as_secs_f64();
-                let ms_per_step = 1000.0 * win_s / dsteps as f64;
-                let tok_s = (dsteps * tokens_per_step) as f64 / win_s;
+            let rate = if steps_in_window > 0 {
+                let window_secs = now.duration_since(window_start_time).as_secs_f64();
+                let ms_per_step = 1000.0 * window_secs / steps_in_window as f64;
+                let tok_s = (steps_in_window * tokens_per_step) as f64 / window_secs;
                 let eta = fmt_hms(ms_per_step / 1000.0 * (cfg.num_iters - step) as f64);
                 println!(
                     "step {step:>6}/{} | loss {mean_ce:.4} | gnorm {gnorm:.3} \
@@ -235,30 +235,25 @@ pub fn train(
                      | {tok_s:.0} tok/s | {ms_per_step:.0} ms/step | t+{elapsed} | eta {eta}",
                     cfg.num_iters, lrs.matrix, lrs.embedding, lrs.unembedding,
                 );
-                (Some(tok_s), Some(ms_per_step))
+                Some(Throughput {
+                    tok_per_s: tok_s,
+                    ms_per_step,
+                })
             } else {
                 // step-0 window has no elapsed steps yet: baseline loss only.
                 println!(
                     "step {step:>6}/{} | loss {mean_ce:.4} | gnorm {gnorm:.3} | t+{elapsed}",
                     cfg.num_iters
                 );
-                (None, None)
+                None
             };
 
             eval.metrics.log(&MetricRecord::train(
-                step,
-                elapsed_s,
-                mean_ce,
-                gnorm,
-                lrs.matrix,
-                lrs.embedding,
-                lrs.unembedding,
-                tok_s,
-                ms_per_step,
+                step, elapsed_s, mean_ce, gnorm, lrs, rate,
             ));
 
-            win_start = now;
-            win_step = step;
+            window_start_time = now;
+            window_start_step = step;
         }
     }
     Ok(())

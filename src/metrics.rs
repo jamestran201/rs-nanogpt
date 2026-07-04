@@ -1,8 +1,3 @@
-//! Machine-readable training telemetry: a one-shot run manifest (`run.json`) and
-//! an appendable JSONL metrics stream (`metrics.jsonl`). Both serialize through
-//! `serde`, and the stream is a best-effort sink — observability must never take
-//! down a GPU run. See `writeups/observability-plan.md` (Phase B).
-
 use std::cell::{Cell, RefCell};
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -10,10 +5,8 @@ use std::path::Path;
 
 use serde::Serialize;
 
-/// One-shot run manifest, written once at startup to `out/run.json`. Captures
-/// what's needed to attribute and reproduce a run after the fact: the device and
-/// dtype it ran on, when it started, and every model/optimization hyperparameter.
-/// (Git-commit provenance is intentionally out of scope for now.)
+use crate::train::GroupLrs;
+
 #[derive(Debug, Serialize)]
 pub struct RunMeta {
     pub device: String,
@@ -47,7 +40,6 @@ pub struct RunMeta {
     pub sample_every: usize,
 }
 
-/// Write `meta` as pretty JSON to `path`, creating parent dirs as needed.
 pub fn write_run_json(path: &Path, meta: &RunMeta) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -56,10 +48,6 @@ pub fn write_run_json(path: &Path, meta: &RunMeta) -> std::io::Result<()> {
     std::fs::write(path, bytes)
 }
 
-/// One line of the JSONL metrics stream. A single struct serves both event kinds
-/// (`"train"` and `"eval"`); optional fields are omitted from the line when `None`
-/// so each record stays lean. Phase C extends this with `ema_loss`/`mfu`/loader
-/// counters.
 #[derive(Debug, Serialize)]
 pub struct MetricRecord {
     pub step: usize,
@@ -85,20 +73,20 @@ pub struct MetricRecord {
     pub bpb: Option<f64>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct Throughput {
+    pub tok_per_s: f64,
+    pub ms_per_step: f64,
+}
+
 impl MetricRecord {
-    /// A per-step training record. `tok_per_s`/`ms_per_step` are `None` for the
-    /// step-0 log, which has no elapsed window yet.
-    #[allow(clippy::too_many_arguments)]
     pub fn train(
         step: usize,
         elapsed_s: f64,
         train_loss: f32,
         grad_norm: f64,
-        lr_matrix: f64,
-        lr_embedding: f64,
-        lr_unembedding: f64,
-        tok_per_s: Option<f64>,
-        ms_per_step: Option<f64>,
+        lrs: GroupLrs,
+        rate: Option<Throughput>,
     ) -> Self {
         Self {
             step,
@@ -106,17 +94,16 @@ impl MetricRecord {
             elapsed_s,
             train_loss: Some(train_loss),
             grad_norm: Some(grad_norm),
-            lr_matrix: Some(lr_matrix),
-            lr_embedding: Some(lr_embedding),
-            lr_unembedding: Some(lr_unembedding),
-            tok_per_s,
-            ms_per_step,
+            lr_matrix: Some(lrs.matrix),
+            lr_embedding: Some(lrs.embedding),
+            lr_unembedding: Some(lrs.unembedding),
+            tok_per_s: rate.map(|r| r.tok_per_s),
+            ms_per_step: rate.map(|r| r.ms_per_step),
             val_loss: None,
             bpb: None,
         }
     }
 
-    /// A validation record emitted at the eval cadence.
     pub fn eval(step: usize, elapsed_s: f64, val_loss: f64, bpb: f64) -> Self {
         Self {
             step,
@@ -145,8 +132,6 @@ pub struct MetricsLogger {
 }
 
 impl MetricsLogger {
-    /// Create (truncating) the metrics file at `path`, making parent dirs as
-    /// needed. Each run starts a fresh stream — mirrors `best/` being overwritten.
     pub fn create(path: &Path) -> std::io::Result<Self> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
@@ -157,8 +142,6 @@ impl MetricsLogger {
         })
     }
 
-    /// Append one record as a JSON line. Best-effort: warns once on the first
-    /// failure, then stays quiet; never returns an error to the caller.
     pub fn log(&self, rec: &MetricRecord) {
         if let Err(e) = self.try_log(rec)
             && !self.warned.replace(true)
@@ -194,11 +177,15 @@ mod tests {
                 1.5,
                 3.25,
                 0.42,
-                1e-3,
-                2e-3,
-                3e-4,
-                Some(1000.0),
-                Some(20.0),
+                GroupLrs {
+                    embedding: 2e-3,
+                    unembedding: 3e-4,
+                    matrix: 1e-3,
+                },
+                Some(Throughput {
+                    tok_per_s: 1000.0,
+                    ms_per_step: 20.0,
+                }),
             ));
             logger.log(&MetricRecord::eval(20, 2.0, 3.1, 1.4));
         } // drop flushes the BufWriter
@@ -231,7 +218,18 @@ mod tests {
 
     #[test]
     fn train_record_omits_rate_fields_when_none() {
-        let rec = MetricRecord::train(0, 0.1, 9.0, 0.0, 1e-3, 2e-3, 3e-4, None, None);
+        let rec = MetricRecord::train(
+            0,
+            0.1,
+            9.0,
+            0.0,
+            GroupLrs {
+                embedding: 2e-3,
+                unembedding: 3e-4,
+                matrix: 1e-3,
+            },
+            None,
+        );
         let v: Value = serde_json::to_value(&rec).unwrap();
         assert!(v.get("tok_per_s").is_none());
         assert!(v.get("ms_per_step").is_none());
