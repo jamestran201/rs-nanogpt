@@ -28,7 +28,7 @@ pub struct EvalContext<'a> {
     pub val_batches: &'a [Batch],
     pub tokenizer: &'a BpeTokenizer,
     pub token_bytes: &'a [u32],
-    pub ckpt_root: &'a Path, // best model saved at ckpt_root/best/
+    pub ckpt_root: &'a Path,        // best model saved at ckpt_root/best/
     pub metrics: &'a MetricsLogger, // append-only JSONL telemetry sink
     // cadences + sampling params; 0 disables the cadence
     pub eval_every: usize,

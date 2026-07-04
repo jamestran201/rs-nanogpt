@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use candle_core::DType;
 use candle_nn::{VarBuilder, VarMap};
 use clap::{Parser, Subcommand};
-use rs_nanogpt::data::{DataLoader, Split};
+use rs_nanogpt::data::{BASE_URL, DataLoader, MAX_SHARD, Split, download_shards};
 use rs_nanogpt::eval::tokenizer as tokenizer_eval;
 use rs_nanogpt::metrics::{MetricsLogger, RunMeta, write_run_json};
 use rs_nanogpt::model::{
@@ -55,6 +55,8 @@ enum Command {
     },
     /// Pretrain a GPT model.
     Pretrain(PretrainArgs),
+    /// Download pretraining dataset shards into a local directory.
+    DownloadData(DownloadArgs),
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -81,6 +83,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Pretrain(args) => {
             if let Err(err) = run_pretrain(args) {
                 eprintln!("pretrain failed: {err}");
+                process::exit(1);
+            }
+        }
+        Command::DownloadData(args) => {
+            if let Err(err) = run_download(args) {
+                eprintln!("download failed: {err}");
                 process::exit(1);
             }
         }
@@ -353,6 +361,88 @@ fn print_config_summary(config: &GptConfig) {
     println!("  norm_eps     {}", config.norm_eps);
 }
 
+#[derive(clap::Args)]
+struct DownloadArgs {
+    /// Directory shards are written to (created if missing).
+    #[arg(long, default_value = "data")]
+    out: PathBuf,
+    /// First shard index to download.
+    #[arg(long, default_value_t = 0)]
+    start: usize,
+    /// Number of shards to download in total, starting at --start.
+    #[arg(long)]
+    num: usize,
+    /// Number of parallel downloads.
+    #[arg(long, default_value_t = 4)]
+    workers: usize,
+    /// Validation shard to also fetch. It pins the val split (sorts last, so the
+    /// loader holds it out and keeps the whole --start/--num range as train).
+    /// Pass "none" to download only the range.
+    #[arg(long, default_value = "6542")]
+    val_shard: String,
+    /// Base URL the shards are fetched from.
+    #[arg(long, default_value = BASE_URL)]
+    base_url: String,
+}
+
+fn parse_val_shard(spec: &str) -> Result<Option<usize>, String> {
+    let s = spec.trim();
+    if s.eq_ignore_ascii_case("none") || s.eq_ignore_ascii_case("skip") {
+        return Ok(None);
+    }
+    let v: usize = s
+        .parse()
+        .map_err(|_| format!("--val-shard must be a shard index or \"none\", got {spec:?}"))?;
+    if v > MAX_SHARD {
+        return Err(format!(
+            "--val-shard {v} exceeds the last shard index ({MAX_SHARD})"
+        ));
+    }
+    Ok(Some(v))
+}
+
+fn validate_download_args(
+    args: &DownloadArgs,
+) -> Result<Option<usize>, Box<dyn std::error::Error>> {
+    if args.num == 0 {
+        return Err("--num must be >= 1".into());
+    }
+    if args.workers == 0 {
+        return Err("--workers must be >= 1".into());
+    }
+    // Last index in the contiguous range; saturating guards against usize
+    // overflow on an absurd --num before the range check can reject it.
+    let last = args.start.saturating_add(args.num - 1);
+    if last > MAX_SHARD {
+        return Err(format!(
+            "shard range ends at {last}, past the last shard index ({MAX_SHARD}); reduce --start/--num"
+        )
+        .into());
+    }
+    let val_shard = parse_val_shard(&args.val_shard)?;
+    Ok(val_shard)
+}
+
+fn run_download(args: DownloadArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let val_shard = validate_download_args(&args)?;
+    let summary = download_shards(
+        &args.out,
+        args.start,
+        args.num,
+        val_shard,
+        args.workers,
+        &args.base_url,
+    )?;
+    if summary.failed > 0 {
+        return Err(format!(
+            "{} of {} shard(s) failed to download",
+            summary.failed, summary.requested
+        )
+        .into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -472,5 +562,74 @@ mod tests {
     #[test]
     fn rejects_negative_sample_temperature() {
         rejects(|a| a.sample_temperature = -0.1);
+    }
+
+    /// A known-good set of download args; tests mutate one field to probe a rule.
+    fn valid_download_args() -> DownloadArgs {
+        DownloadArgs {
+            out: PathBuf::from("data"),
+            start: 0,
+            num: 170,
+            workers: 4,
+            val_shard: "6542".to_string(),
+            base_url: BASE_URL.to_string(),
+        }
+    }
+
+    #[test]
+    fn accepts_valid_download_args() {
+        assert_eq!(
+            validate_download_args(&valid_download_args()).unwrap(),
+            Some(6542)
+        );
+    }
+
+    #[test]
+    fn download_val_shard_none_parses_to_none() {
+        let mut a = valid_download_args();
+        a.val_shard = "none".to_string();
+        assert_eq!(validate_download_args(&a).unwrap(), None);
+    }
+
+    #[test]
+    fn rejects_zero_num() {
+        let mut a = valid_download_args();
+        a.num = 0;
+        assert!(validate_download_args(&a).is_err());
+    }
+
+    #[test]
+    fn rejects_zero_download_workers() {
+        let mut a = valid_download_args();
+        a.workers = 0;
+        assert!(validate_download_args(&a).is_err());
+    }
+
+    #[test]
+    fn rejects_range_past_last_shard() {
+        // start at the last shard with num 2 => range ends one past the dataset.
+        let mut a = valid_download_args();
+        a.start = MAX_SHARD;
+        a.num = 2;
+        assert!(validate_download_args(&a).is_err());
+        // ...but exactly the last shard alone is fine.
+        let mut b = valid_download_args();
+        b.start = MAX_SHARD;
+        b.num = 1;
+        assert!(validate_download_args(&b).is_ok());
+    }
+
+    #[test]
+    fn rejects_val_shard_past_last() {
+        let mut a = valid_download_args();
+        a.val_shard = (MAX_SHARD + 1).to_string();
+        assert!(validate_download_args(&a).is_err());
+    }
+
+    #[test]
+    fn rejects_unparseable_val_shard() {
+        let mut a = valid_download_args();
+        a.val_shard = "abc".to_string();
+        assert!(validate_download_args(&a).is_err());
     }
 }
