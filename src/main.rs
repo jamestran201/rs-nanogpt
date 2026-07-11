@@ -1,4 +1,5 @@
-use std::path::PathBuf;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::process;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -7,7 +8,7 @@ use candle_nn::{VarBuilder, VarMap};
 use clap::{Parser, Subcommand};
 use rs_nanogpt::data::{BASE_URL, DataLoader, MAX_SHARD, Split, download_shards};
 use rs_nanogpt::eval::tokenizer as tokenizer_eval;
-use rs_nanogpt::metrics::{MetricsLogger, RunMeta, write_run_json};
+use rs_nanogpt::metrics::{MetricsLogger, RunMeta, run_timestamp, write_run_json};
 use rs_nanogpt::model::{
     DEFAULT_N_EMBD, DEFAULT_N_HEAD, DEFAULT_N_LAYER, DEFAULT_NORM_EPS, DEFAULT_ROPE_BASE,
     DEFAULT_SEQUENCE_LEN, Gpt, GptConfig, default_device,
@@ -169,7 +170,8 @@ struct PretrainArgs {
     /// Sampling temperature; 0 = greedy.
     #[arg(long, default_value_t = 0.0)]
     sample_temperature: f64,
-    /// Output dir; best checkpoint saved to <out>/best/.
+    /// Runs root; each run writes to <out>/<UTC-timestamp>/ (run.json,
+    /// metrics.jsonl, best/), so runs never overwrite each other.
     #[arg(long, default_value = "out")]
     out: PathBuf,
 }
@@ -235,6 +237,25 @@ fn validate_pretrain_args(args: &PretrainArgs) -> Result<(), Box<dyn std::error:
         .into());
     }
     Ok(())
+}
+
+/// Create and return a fresh run directory `root/<id>`, appending `-2`, `-3`, …
+/// if that name is taken. Creation *is* the reservation: `create_dir` fails with
+/// `AlreadyExists` on a name another run already claimed, so two runs started in
+/// the same second can't end up sharing a directory (a check-then-create would
+/// race).
+fn unique_run_dir(root: &Path, id: &str) -> io::Result<PathBuf> {
+    std::fs::create_dir_all(root)?;
+    let names = std::iter::once(String::new()).chain((2u32..).map(|n| format!("-{n}")));
+    for suffix in names {
+        let candidate = root.join(format!("{id}{suffix}"));
+        match std::fs::create_dir(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!("u32 run-dir suffixes exhausted")
 }
 
 fn run_pretrain(args: PretrainArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -303,6 +324,12 @@ fn run_pretrain(args: PretrainArgs) -> Result<(), Box<dyn std::error::Error>> {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+
+    // Each run gets its own <out>/<UTC-timestamp>/ dir so runs never clobber
+    // each other; run.json, metrics.jsonl, and best/ all land inside it.
+    let run_dir = unique_run_dir(&args.out, &run_timestamp(started_at_unix))?;
+    println!("run dir: {}", run_dir.display());
+
     let run_meta = RunMeta {
         device: format!("{device:?}"),
         dtype: "f32",
@@ -331,14 +358,14 @@ fn run_pretrain(args: PretrainArgs) -> Result<(), Box<dyn std::error::Error>> {
         eval_steps: args.eval_steps,
         sample_every: args.sample_every,
     };
-    write_run_json(&args.out.join("run.json"), &run_meta)?;
-    let metrics = MetricsLogger::create(&args.out.join("metrics.jsonl"))?;
+    write_run_json(&run_dir.join("run.json"), &run_meta)?;
+    let metrics = MetricsLogger::create(&run_dir.join("metrics.jsonl"))?;
 
     let eval = EvalContext {
         val_batches: &val_batches,
         tokenizer: &tokenizer,
         token_bytes: &token_bytes,
-        ckpt_root: &args.out,
+        ckpt_root: &run_dir,
         metrics: &metrics,
         eval_every: args.eval_every,
         sample_every: args.sample_every,
@@ -446,6 +473,30 @@ fn run_download(args: DownloadArgs) -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// First call claims `root/<id>`; each subsequent call with the same id walks
+    /// to the next `-N` suffix, and every returned path is a real, distinct dir.
+    #[test]
+    fn unique_run_dir_walks_suffixes_on_collision() {
+        let root = tempfile::tempdir().unwrap();
+        let a = unique_run_dir(root.path(), "run").unwrap();
+        let b = unique_run_dir(root.path(), "run").unwrap();
+        let c = unique_run_dir(root.path(), "run").unwrap();
+        assert_eq!(a, root.path().join("run"));
+        assert_eq!(b, root.path().join("run-2"));
+        assert_eq!(c, root.path().join("run-3"));
+        assert!(a.is_dir() && b.is_dir() && c.is_dir());
+    }
+
+    /// The root is created on demand, so a not-yet-existing `--out` just works.
+    #[test]
+    fn unique_run_dir_creates_missing_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("does/not/exist/yet");
+        let dir = unique_run_dir(&root, "2026-07-11_14-30-05").unwrap();
+        assert_eq!(dir, root.join("2026-07-11_14-30-05"));
+        assert!(dir.is_dir());
+    }
 
     /// A known-good set of args; tests mutate one field to probe a single rule.
     /// `data`/`vocab` are never touched by `validate_pretrain_args`, so dummy paths are fine.
