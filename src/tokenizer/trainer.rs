@@ -265,6 +265,7 @@ impl BpeTokenizerTrainer {
     }
 
     pub fn train(&self, output_path: impl AsRef<Path>, vocab_size: usize) -> io::Result<()> {
+        let output_path = output_path.as_ref();
         let min_vocab_size = 256 + NUM_SPECIAL_TOKENS;
         if vocab_size < min_vocab_size {
             return Err(io::Error::new(
@@ -272,6 +273,19 @@ impl BpeTokenizerTrainer {
                 format!(
                     "vocab_size must be at least {min_vocab_size} \
                      (256 bytes + {NUM_SPECIAL_TOKENS} reserved special tokens), got {vocab_size}"
+                ),
+            ));
+        }
+        // Fail before the (expensive) training run if the output is a directory,
+        // rather than after learning every merge only for the final write to fail.
+        // A non-existent path is fine (created on write); an existing file is
+        // overwritten, as before.
+        if output_path.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::IsADirectory,
+                format!(
+                    "output path {} is a directory, expected a file",
+                    output_path.display()
                 ),
             ));
         }
@@ -285,7 +299,7 @@ impl BpeTokenizerTrainer {
 
         eprintln!("trained {} merges (target: {})", merges.len(), num_merges);
 
-        Self::write_vocab(output_path.as_ref(), &merges)?;
+        Self::write_vocab(output_path, &merges)?;
         Ok(())
     }
 
@@ -1029,6 +1043,17 @@ mod tests {
             .train(temp.path(), 264)
             .expect_err("should error for vocab_size < 265");
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn train_rejects_directory_output_path() {
+        // Pointing --output at a directory must fail up front, before training.
+        let dir = tempfile::tempdir().unwrap();
+        let trainer = BpeTokenizerTrainer::new("data", 10000, usize::MAX);
+        let err = trainer
+            .train(dir.path(), 300)
+            .expect_err("should fail when output path is a directory");
+        assert_eq!(err.kind(), io::ErrorKind::IsADirectory);
     }
 
     #[test]
