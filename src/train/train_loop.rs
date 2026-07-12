@@ -45,13 +45,11 @@ const SAMPLE_PROMPTS: &[&str] = &[
 ];
 
 /// Whether a hook on cadence `every` fires at `step` of a `0..=num_iters` loop.
-/// `every == 0` disables. `skip_first` suppresses step 0 (sampling; untrained
-/// output is noise). The final step (`step == num_iters`) always fires.
-fn cadence_fires(step: usize, num_iters: usize, every: usize, skip_first: bool) -> bool {
+fn cadence_fires(step: usize, num_iters: usize, every: usize) -> bool {
     if every == 0 {
         return false;
     }
-    step == num_iters || ((!skip_first || step > 0) && step.is_multiple_of(every))
+    step == num_iters || (step > 0 && step.is_multiple_of(every))
 }
 
 /// Seconds as `HH:MM:SS`
@@ -138,7 +136,7 @@ pub fn train(
     for step in 0..=cfg.num_iters {
         let last = step == cfg.num_iters;
 
-        if cadence_fires(step, cfg.num_iters, eval.eval_every, false) {
+        if cadence_fires(step, cfg.num_iters, eval.eval_every) {
             let m = evaluate(model, eval.val_batches, eval.token_bytes)?;
             println!(
                 "step {step:>6}  val_loss {:.4}  bpb {:.4}",
@@ -164,7 +162,7 @@ pub fn train(
             }
         }
 
-        if cadence_fires(step, cfg.num_iters, eval.sample_every, true) {
+        if cadence_fires(step, cfg.num_iters, eval.sample_every) {
             for p in SAMPLE_PROMPTS {
                 let s = generate(
                     model,
@@ -437,24 +435,17 @@ mod tests {
     #[test]
     fn cadence_fires_predicate() {
         let n = 10;
-        // eval-style (skip_first = false): fires at step 0, multiples of `every`,
-        // and the final step.
-        assert!(cadence_fires(0, n, 2, false));
-        assert!(cadence_fires(2, n, 2, false));
-        assert!(!cadence_fires(3, n, 2, false));
-        assert!(cadence_fires(n, n, 2, false)); // last is a multiple here
-        assert!(cadence_fires(n, n, 3, false)); // last fires even when it isn't a multiple
-
-        // sampling-style (skip_first = true): step 0 suppressed, everything else
-        // identical.
-        assert!(!cadence_fires(0, n, 2, true));
-        assert!(cadence_fires(2, n, 2, true));
-        assert!(cadence_fires(n, n, 2, true));
+        // Step 0 is always suppressed (untrained model); multiples of `every`
+        // fire, and the final step always fires.
+        assert!(!cadence_fires(0, n, 2));
+        assert!(cadence_fires(2, n, 2));
+        assert!(!cadence_fires(3, n, 2));
+        assert!(cadence_fires(n, n, 2)); // last is a multiple here
+        assert!(cadence_fires(n, n, 3)); // last fires even when it isn't a multiple
 
         // every == 0 disables the cadence entirely, including the final step.
-        assert!(!cadence_fires(0, n, 0, false));
-        assert!(!cadence_fires(n, n, 0, false));
-        assert!(!cadence_fires(n, n, 0, true));
+        assert!(!cadence_fires(0, n, 0));
+        assert!(!cadence_fires(n, n, 0));
     }
 
     #[test]
