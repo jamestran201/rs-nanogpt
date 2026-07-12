@@ -1,6 +1,11 @@
 ARG ?= default-value
 
-.PHONY: build-cpu build-cuda build-metal covhtml covlcov lint bench memprofile
+.PHONY: bootstrap build-cpu build-cuda build-metal covhtml covlcov lint bench memprofile
+
+# Provision a fresh Lambda Labs GPU box: system deps, Rust, and CUDA env vars.
+# Idempotent; run `source ~/.bashrc` afterward to pick up the CUDA env.
+bootstrap:
+	./scripts/bootstrap.sh
 
 # Release binary for CPU (default backend). Works everywhere; slow for real runs.
 build-cpu:
