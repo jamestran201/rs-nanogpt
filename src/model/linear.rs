@@ -4,7 +4,9 @@ use candle_nn::{Init, Module, VarBuilder};
 /// The weight has shape `(out_dim, in_dim)` to match candle's (and PyTorch's)
 /// convention of storing `wᵀ`.
 pub struct Linear {
-    inner: candle_nn::Linear,
+    /// The fp32 master weight (a `Var`-backed tensor registered in the
+    /// `VarMap`); `forward` casts it to the activation dtype per call.
+    weight: Tensor,
 }
 
 impl Linear {
@@ -38,17 +40,16 @@ impl Linear {
 
     fn with_init(in_dim: usize, out_dim: usize, init: Init, vb: VarBuilder) -> Result<Self> {
         let weight = vb.get_with_hints((out_dim, in_dim), "weight", init)?;
-        Ok(Self {
-            inner: candle_nn::Linear::new(weight, None),
-        })
+        Ok(Self { weight })
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        self.inner.forward(x)
+        let weight = self.weight.to_dtype(x.dtype())?;
+        candle_nn::Linear::new(weight, None).forward(x)
     }
 
     pub fn weight(&self) -> &Tensor {
-        self.inner.weight()
+        &self.weight
     }
 }
 
@@ -83,6 +84,45 @@ mod tests {
         let data = vm.data().lock().unwrap();
         assert!(data.contains_key("weight"));
         assert!(!data.keys().any(|k| k.contains("bias")));
+        Ok(())
+    }
+
+    #[test]
+    fn forward_follows_input_dtype() -> Result<()> {
+        // Mixed precision: the fp32 master is cast to the activation dtype per
+        // call. f16 stands in for the CUDA bf16 path (the CPU backend has an
+        // f16 matmul but no bf16 one).
+        let dev = Device::Cpu;
+        let vm = VarMap::new();
+        let lin = Linear::uniform(4, 7, 0.5, builder(&vm, &dev))?;
+        let x = Tensor::randn(0.0f32, 1.0, (2, 3, 4), &dev)?.to_dtype(DType::F16)?;
+        let y = lin.forward(&x)?;
+        assert_eq!(y.dtype(), DType::F16);
+        assert_eq!(y.dims(), &[2, 3, 7]);
+        // The master itself must stay fp32.
+        assert_eq!(lin.weight().dtype(), DType::F32);
+        Ok(())
+    }
+
+    #[test]
+    fn low_precision_forward_routes_fp32_grads_to_master() -> Result<()> {
+        // The mixed-precision contract: computing in a low-precision dtype
+        // must still deposit an fp32 gradient on the fp32 master Var (backprop
+        // casts the grad back up at the in-graph ToDType node).
+        let dev = Device::Cpu;
+        let vm = VarMap::new();
+        let lin = Linear::uniform(4, 3, 0.5, builder(&vm, &dev))?;
+        let x = Tensor::randn(0.0f32, 1.0, (2, 4), &dev)?.to_dtype(DType::F16)?;
+        let loss = lin.forward(&x)?.to_dtype(DType::F32)?.sqr()?.sum_all()?;
+        let grads = loss.backward()?;
+
+        let data = vm.data().lock().unwrap();
+        let master = data.get("weight").expect("weight registered");
+        let g = grads
+            .get(master.as_tensor())
+            .expect("master Var must receive a gradient");
+        assert_eq!(g.dtype(), DType::F32);
+        assert_eq!(g.dims(), master.dims());
         Ok(())
     }
 

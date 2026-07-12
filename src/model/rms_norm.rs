@@ -1,9 +1,10 @@
-use candle_core::{D, Result, Tensor};
+use candle_core::{D, DType, Result, Tensor};
 
 pub fn rms_norm(x: &Tensor, eps: f32) -> Result<Tensor> {
-    let mean_sq = x.sqr()?.mean_keepdim(D::Minus1)?;
+    // The mean-of-squares reduction runs in fp32 even for bf16 activations —
+    let mean_sq = x.to_dtype(DType::F32)?.sqr()?.mean_keepdim(D::Minus1)?;
     let denom = mean_sq.affine(1.0, eps as f64)?.sqrt()?;
-    x.broadcast_div(&denom)
+    x.broadcast_div(&denom.to_dtype(x.dtype())?)
 }
 
 #[cfg(test)]
@@ -45,6 +46,21 @@ mod tests {
         let x = Tensor::randn(0.0f32, 5.0, (32,), &dev)?;
         let y = rms_norm(&x, EPS)?.to_vec1::<f32>()?;
         assert!((rms(&y) - 1.0).abs() < 1e-3, "output rms was {}", rms(&y));
+        Ok(())
+    }
+
+    #[test]
+    fn bf16_input_keeps_dtype_with_unit_rms() -> Result<()> {
+        // The real CUDA compute dtype is testable here on CPU because rms_norm
+        // is built from unary/reduce ops (no matmul): the reduction upcasts to
+        // fp32, and the output must come back in the input's dtype.
+        let dev = Device::Cpu;
+        let x = Tensor::randn(0.0f32, 5.0, (32,), &dev)?.to_dtype(DType::BF16)?;
+        let y = rms_norm(&x, EPS)?;
+        assert_eq!(y.dtype(), DType::BF16);
+        let y = y.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+        // bf16's ~0.4% per-element rounding: loose tolerance vs the f32 tests.
+        assert!((rms(&y) - 1.0).abs() < 0.02, "output rms was {}", rms(&y));
         Ok(())
     }
 

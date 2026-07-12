@@ -1,8 +1,9 @@
-use candle_core::{Result, Tensor};
+use candle_core::{DType, Result, Tensor};
 use candle_nn::VarBuilder;
 
 use super::block::Block;
 use super::config::GptConfig;
+use super::device::compute_dtype;
 use super::embedding::TokenEmbedding;
 use super::linear::Linear;
 use super::rms_norm::rms_norm;
@@ -14,6 +15,10 @@ pub struct Gpt {
     blocks: Vec<Block>,
     lm_head: Linear,
     config: GptConfig,
+    /// Activation dtype, derived from the device (bf16 on CUDA, else fp32).
+    /// Applied once at the embedding boundary; every downstream module
+    /// follows its input's dtype.
+    compute_dtype: DType,
 }
 
 impl Gpt {
@@ -35,12 +40,13 @@ impl Gpt {
             blocks,
             lm_head,
             config: cfg,
+            compute_dtype: compute_dtype(vb.device()),
         })
     }
 
     /// Map token ids `idx: (B, T)` to logits `(B, T, vocab_size)`.
     pub fn forward(&self, idx: &Tensor) -> Result<Tensor> {
-        let mut x = self.wte.forward(idx)?;
+        let mut x = self.wte.forward(idx)?.to_dtype(self.compute_dtype)?;
         for block in &self.blocks {
             x = block.forward(&x)?;
         }
@@ -86,6 +92,21 @@ mod tests {
 
         let idx = Tensor::new(&[[1u32, 2, 3], [4, 5, 6]], &dev)?; // (B=2, T=3)
         assert_eq!(model.forward(&idx)?.dims(), &[2, 3, vocab]);
+        Ok(())
+    }
+
+    #[test]
+    fn cpu_forward_stays_f32() -> Result<()> {
+        // Device-gated compute dtype: on CPU the boundary cast and every
+        // downstream weight cast are same-dtype no-ops, so the whole fp32 test
+        // suite exercises an unchanged graph.
+        let dev = Device::Cpu;
+        let vm = VarMap::new();
+        let model = Gpt::new(tiny_cfg(), builder(&vm, &dev))?;
+        assert_eq!(model.compute_dtype, DType::F32);
+
+        let idx = Tensor::new(&[[1u32, 2, 3]], &dev)?;
+        assert_eq!(model.forward(&idx)?.dtype(), DType::F32);
         Ok(())
     }
 

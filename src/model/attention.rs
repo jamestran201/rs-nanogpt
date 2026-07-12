@@ -19,7 +19,8 @@ pub struct CausalSelfAttention {
     c_proj: Linear,
     rope: Rope,
     /// Additive causal mask of shape `(seq_len, seq_len)`: 0 on/below the
-    /// diagonal, `-inf` above. Narrowed to `(T, T)` per call.
+    /// diagonal, `-inf` above. Stored fp32; narrowed to `(T, T)` and cast to
+    /// the scores' dtype per call.
     causal_mask: Tensor,
     n_head: usize,
     head_dim: usize,
@@ -37,7 +38,7 @@ impl CausalSelfAttention {
         let c_proj = Linear::zeros(c, c, vb.pp("c_proj"))?;
 
         let rope = Rope::from_config(cfg, device)?;
-        let causal_mask = build_causal_mask(cfg.sequence_len, vb.dtype(), device)?;
+        let causal_mask = build_causal_mask(cfg.sequence_len, device)?;
 
         Ok(Self {
             c_q,
@@ -75,8 +76,10 @@ impl CausalSelfAttention {
             .matmul(&k.transpose(2, 3)?.contiguous()?)?
             .affine(scale, 0.0)?;
 
-        // Causal mask (-inf above the diagonal) then softmax over keys.
-        let mask = self.causal_mask.i((..t, ..t))?;
+        // Causal mask (-inf above the diagonal) then softmax over keys. The
+        // mask is stored fp32 and follows the scores' dtype (no-op on fp32;
+        // -inf is representable in bf16).
+        let mask = self.causal_mask.i((..t, ..t))?.to_dtype(scores.dtype())?;
         let att = softmax_last_dim(&scores.broadcast_add(&mask)?)?;
 
         // Mix values, re-assemble heads, project back: (B,T,C).
@@ -86,10 +89,10 @@ impl CausalSelfAttention {
     }
 }
 
-fn build_causal_mask(n: usize, dtype: DType, device: &Device) -> Result<Tensor> {
+fn build_causal_mask(n: usize, device: &Device) -> Result<Tensor> {
     let keep = Tensor::tril2(n, DType::U8, device)?;
-    let zeros = Tensor::zeros((n, n), dtype, device)?;
-    let neg_inf = Tensor::full(f32::NEG_INFINITY, (n, n), device)?.to_dtype(dtype)?;
+    let zeros = Tensor::zeros((n, n), DType::F32, device)?;
+    let neg_inf = Tensor::full(f32::NEG_INFINITY, (n, n), device)?;
     keep.where_cond(&zeros, &neg_inf)
 }
 
@@ -123,6 +126,22 @@ mod tests {
         let attn = CausalSelfAttention::new(&cfg, builder(&vm, &dev), &dev)?;
         let x = Tensor::randn(0.0f32, 1.0, (2, 5, cfg.n_embd), &dev)?;
         assert_eq!(attn.forward(&x)?.dims(), &[2, 5, cfg.n_embd]);
+        Ok(())
+    }
+
+    #[test]
+    fn forward_follows_input_dtype() -> Result<()> {
+        // End-to-end low-precision pass through projections, RoPE, QK-norm,
+        // mask, and softmax. f16 stands in for the CUDA bf16 path (the CPU
+        // backend has an f16 matmul but no bf16 one).
+        let dev = Device::Cpu;
+        let vm = VarMap::new();
+        let cfg = tiny_cfg();
+        let attn = CausalSelfAttention::new(&cfg, builder(&vm, &dev), &dev)?;
+        let x = Tensor::randn(0.0f32, 1.0, (2, 5, cfg.n_embd), &dev)?.to_dtype(DType::F16)?;
+        let y = attn.forward(&x)?;
+        assert_eq!(y.dtype(), DType::F16);
+        assert_eq!(y.dims(), &[2, 5, cfg.n_embd]);
         Ok(())
     }
 

@@ -1,4 +1,4 @@
-use candle_core::{Device, IndexOp, Result, Tensor};
+use candle_core::{DType, Device, IndexOp, Result, Tensor};
 use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
@@ -33,7 +33,12 @@ pub fn generate(
         let ctx = &ids[start..];
         let input = Tensor::from_vec(ctx.to_vec(), (1, ctx.len()), device)?;
         let logits = model.forward(&input)?;
-        let last = logits.i((0, ctx.len() - 1))?.to_vec1::<f32>()?;
+        // Upcast before the host read: `to_vec1::<f32>` requires an exact
+        // dtype match and errors on the bf16 logits a CUDA forward produces.
+        let last = logits
+            .i((0, ctx.len() - 1))?
+            .to_dtype(DType::F32)?
+            .to_vec1::<f32>()?;
 
         let next = if temperature <= 0.0 {
             argmax(&last)

@@ -23,7 +23,10 @@ pub fn cross_entropy(
 
     // Flatten to the rank-2 form cross-entropy operates on: one independent
     // next-token classification per (batch, position). (B,T,V) -> (B*T, V).
-    let logits2d = logits.reshape((b * t, v))?;
+    // The fp32 upcast (a no-op for fp32 logits) is required under bf16
+    // compute: the softmax over the vocab is the most precision-sensitive op,
+    // and it keeps the returned loss f32 for host-side reads.
+    let logits2d = logits.reshape((b * t, v))?.to_dtype(DType::F32)?;
     let targets1d = targets.reshape(b * t)?;
 
     // Per-row log-probabilities over the vocab.
@@ -77,6 +80,22 @@ mod tests {
         let logits = Tensor::zeros((b, t, v), DType::F32, &dev)?;
         let targets = targets_i64(&[&[0, 1, 2], &[3, 4, 5]], &dev)?;
         let loss = cross_entropy(&logits, &targets, -1, Reduction::Mean)?.to_scalar::<f32>()?;
+        assert!((loss - ln(v)).abs() < 1e-5, "got {loss}, want {}", ln(v));
+        Ok(())
+    }
+
+    #[test]
+    fn bf16_logits_upcast_to_f32_loss() -> Result<()> {
+        // Under bf16 compute the model hands over bf16 logits; the loss must
+        // be computed and returned in f32 (uniform logits still give ln(V)
+        // exactly — zeros are exact in bf16).
+        let dev = Device::Cpu;
+        let (b, t, v) = (2, 3, 7);
+        let logits = Tensor::zeros((b, t, v), DType::BF16, &dev)?;
+        let targets = targets_i64(&[&[0, 1, 2], &[3, 4, 5]], &dev)?;
+        let loss = cross_entropy(&logits, &targets, -1, Reduction::Mean)?;
+        assert_eq!(loss.dtype(), DType::F32);
+        let loss = loss.to_scalar::<f32>()?;
         assert!((loss - ln(v)).abs() < 1e-5, "got {loss}, want {}", ln(v));
         Ok(())
     }
