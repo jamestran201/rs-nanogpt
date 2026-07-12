@@ -48,32 +48,6 @@ pub fn write_run_json(path: &Path, meta: &RunMeta) -> std::io::Result<()> {
     std::fs::write(path, bytes)
 }
 
-/// Format a Unix timestamp (seconds) as `YYYY-MM-DD_HH-MM-SS` in UTC — used to
-/// name a per-run output directory. Filesystem-safe (no colons) and lexically
-/// sortable, so run folders sort chronologically. UTC keeps it independent of
-/// the box's timezone; the calendar split is Howard Hinnant's civil-from-days
-/// algorithm, so it needs no timezone crate.
-pub fn run_timestamp(unix_secs: u64) -> String {
-    let secs = unix_secs as i64;
-    let days = secs.div_euclid(86_400);
-    let sod = secs.rem_euclid(86_400);
-    let (hh, mm, ss) = (sod / 3600, (sod % 3600) / 60, sod % 60);
-
-    // civil_from_days: days since 1970-01-01 -> (year, month, day) in UTC.
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097; // day-of-era, [0, 146096]
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // day-of-year (Mar-based), [0, 365]
-    let mp = (5 * doy + 2) / 153; // month, Mar=0 .. Feb=11
-    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
-    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
-    let year = if m <= 2 { y + 1 } else { y };
-
-    format!("{year:04}-{m:02}-{d:02}_{hh:02}-{mm:02}-{ss:02}")
-}
-
 #[derive(Debug, Serialize)]
 pub struct MetricRecord {
     pub step: usize,
@@ -262,24 +236,6 @@ mod tests {
         // required fields are still present even when the rate fields are absent.
         assert!(v.get("train_loss").is_some());
         assert_eq!(v["kind"], "train");
-    }
-
-    #[test]
-    fn run_timestamp_formats_utc() {
-        // Epoch and a known second: 1_700_000_000 == 2023-11-14 22:13:20 UTC.
-        assert_eq!(run_timestamp(0), "1970-01-01_00-00-00");
-        assert_eq!(run_timestamp(1_700_000_000), "2023-11-14_22-13-20");
-        // Leap day boundary: 2024-02-29 is a valid date the algorithm must land on.
-        assert_eq!(run_timestamp(1_709_208_000), "2024-02-29_12-00-00");
-    }
-
-    #[test]
-    fn run_timestamp_is_sortable_and_filesystem_safe() {
-        let earlier = run_timestamp(1_700_000_000);
-        let later = run_timestamp(1_700_003_600); // +1h
-        assert!(earlier < later, "timestamps must sort chronologically");
-        assert!(!earlier.contains(':'), "no colons (Windows-unsafe / awkward)");
-        assert!(!earlier.contains('/'), "no path separators");
     }
 
     #[test]

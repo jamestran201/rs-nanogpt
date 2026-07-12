@@ -276,10 +276,7 @@ impl BpeTokenizerTrainer {
                 ),
             ));
         }
-        // Fail before the (expensive) training run if the output is a directory,
-        // rather than after learning every merge only for the final write to fail.
-        // A non-existent path is fine (created on write); an existing file is
-        // overwritten, as before.
+
         if output_path.is_dir() {
             return Err(io::Error::new(
                 io::ErrorKind::IsADirectory,
@@ -289,6 +286,7 @@ impl BpeTokenizerTrainer {
                 ),
             ));
         }
+
         // Reserve the top `NUM_SPECIAL_TOKENS` ids for the special-token block,
         // so the trained merges leave room for them below `vocab_size`.
         let num_merges = vocab_size - 256 - NUM_SPECIAL_TOKENS;

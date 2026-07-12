@@ -8,7 +8,7 @@ use candle_nn::{VarBuilder, VarMap};
 use clap::{Parser, Subcommand};
 use rs_nanogpt::data::{BASE_URL, DataLoader, MAX_SHARD, Split, download_shards};
 use rs_nanogpt::eval::tokenizer as tokenizer_eval;
-use rs_nanogpt::metrics::{MetricsLogger, RunMeta, run_timestamp, write_run_json};
+use rs_nanogpt::metrics::{MetricsLogger, RunMeta, write_run_json};
 use rs_nanogpt::model::{
     DEFAULT_N_EMBD, DEFAULT_N_HEAD, DEFAULT_N_LAYER, DEFAULT_NORM_EPS, DEFAULT_ROPE_BASE,
     DEFAULT_SEQUENCE_LEN, Gpt, GptConfig, default_device,
@@ -170,7 +170,7 @@ struct PretrainArgs {
     /// Sampling temperature; 0 = greedy.
     #[arg(long, default_value_t = 0.0)]
     sample_temperature: f64,
-    /// Runs root; each run writes to <out>/<UTC-timestamp>/ (run.json,
+    /// Runs root; each run writes to <out>/<unix-timestamp>/ (run.json,
     /// metrics.jsonl, best/), so runs never overwrite each other.
     #[arg(long, default_value = "out")]
     out: PathBuf,
@@ -239,11 +239,6 @@ fn validate_pretrain_args(args: &PretrainArgs) -> Result<(), Box<dyn std::error:
     Ok(())
 }
 
-/// Create and return a fresh run directory `root/<id>`, appending `-2`, `-3`, …
-/// if that name is taken. Creation *is* the reservation: `create_dir` fails with
-/// `AlreadyExists` on a name another run already claimed, so two runs started in
-/// the same second can't end up sharing a directory (a check-then-create would
-/// race).
 fn unique_run_dir(root: &Path, id: &str) -> io::Result<PathBuf> {
     std::fs::create_dir_all(root)?;
     let names = std::iter::once(String::new()).chain((2u32..).map(|n| format!("-{n}")));
@@ -325,9 +320,7 @@ fn run_pretrain(args: PretrainArgs) -> Result<(), Box<dyn std::error::Error>> {
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    // Each run gets its own <out>/<UTC-timestamp>/ dir so runs never clobber
-    // each other; run.json, metrics.jsonl, and best/ all land inside it.
-    let run_dir = unique_run_dir(&args.out, &run_timestamp(started_at_unix))?;
+    let run_dir = unique_run_dir(&args.out, &started_at_unix.to_string())?;
     println!("run dir: {}", run_dir.display());
 
     let run_meta = RunMeta {
@@ -493,8 +486,8 @@ mod tests {
     fn unique_run_dir_creates_missing_root() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("does/not/exist/yet");
-        let dir = unique_run_dir(&root, "2026-07-11_14-30-05").unwrap();
-        assert_eq!(dir, root.join("2026-07-11_14-30-05"));
+        let dir = unique_run_dir(&root, "1752192000").unwrap();
+        assert_eq!(dir, root.join("1752192000"));
         assert!(dir.is_dir());
     }
 
