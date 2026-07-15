@@ -1,12 +1,14 @@
 use candle_core::{DType, Result, Tensor};
 use candle_nn::VarBuilder;
 
+use super::attention::build_causal_mask;
 use super::block::Block;
 use super::config::GptConfig;
 use super::device::compute_dtype;
 use super::embedding::TokenEmbedding;
 use super::linear::Linear;
 use super::rms_norm::rms_norm;
+use super::rope::Rope;
 
 /// The GPT model: token embedding → `n_layer` pre-norm transformer blocks →
 /// final RMSNorm → untied `lm_head` unembedding, producing logits `(B,T,vocab)`.
@@ -26,9 +28,16 @@ impl Gpt {
         let device = vb.device().clone();
         let wte = TokenEmbedding::new(&cfg, vb.pp("wte"))?;
 
+        // One set of RoPE tables and one causal mask, shared by every block:
+        // the clones each block takes are handles onto the same device
+        // buffers. Building these per layer would duplicate O(seq_len²)
+        // memory for the mask alone — ~400 MB at 24 layers / T=2048.
+        let rope = Rope::from_config(&cfg, &device)?;
+        let causal_mask = build_causal_mask(cfg.sequence_len, &device)?;
+
         let blocks_vb = vb.pp("blocks");
         let blocks = (0..cfg.n_layer)
-            .map(|i| Block::new(&cfg, blocks_vb.pp(i), &device))
+            .map(|i| Block::new(&cfg, blocks_vb.pp(i), &rope, &causal_mask))
             .collect::<Result<Vec<_>>>()?;
 
         // Untied unembedding: a separate matrix from `wte`, tiny-init so the

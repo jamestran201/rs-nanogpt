@@ -11,7 +11,7 @@ use rs_nanogpt::eval::tokenizer as tokenizer_eval;
 use rs_nanogpt::metrics::{MetricsLogger, RunMeta, write_run_json};
 use rs_nanogpt::model::{
     DEFAULT_N_EMBD, DEFAULT_N_HEAD, DEFAULT_N_LAYER, DEFAULT_NORM_EPS, DEFAULT_ROPE_BASE,
-    DEFAULT_SEQUENCE_LEN, Gpt, GptConfig, default_device,
+    DEFAULT_SEQUENCE_LEN, Gpt, GptConfig, compute_dtype, default_device,
 };
 use rs_nanogpt::tokenizer::{BpeTokenizer, BpeTokenizerTrainer};
 use rs_nanogpt::train::{
@@ -261,6 +261,10 @@ fn run_pretrain(args: PretrainArgs) -> Result<(), Box<dyn std::error::Error>> {
     let train_cfg = TrainConfig {
         num_iters: args.num_iters,
         grad_accum,
+        // total_batch = grad_accum · device_batch · sequence_len, validated above.
+        tokens_per_step: args.total_batch,
+        // The pretraining packer scores every token — no ignore_index targets.
+        targets_may_be_ignored: false,
         lrs: GroupLrs {
             embedding: args.embedding_lr,
             unembedding: args.unembedding_lr,
@@ -309,7 +313,10 @@ fn run_pretrain(args: PretrainArgs) -> Result<(), Box<dyn std::error::Error>> {
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
     let model = Gpt::new(config, vb)?;
     let n_params: usize = varmap.all_vars().iter().map(|v| v.elem_count()).sum();
-    println!("\nmodel built on {device:?} | dtype F32 | {n_params} parameters");
+    println!(
+        "\nmodel built on {device:?} | compute dtype {:?} (fp32 masters) | {n_params} parameters",
+        compute_dtype(&device)
+    );
 
     println!(
         "\ntraining: {} iters, total_batch {} tokens, device_batch {}, grad_accum {}",

@@ -1,10 +1,11 @@
-use candle_core::{Device, Result, Tensor};
+use candle_core::{Result, Tensor};
 use candle_nn::VarBuilder;
 
 use super::attention::CausalSelfAttention;
 use super::config::GptConfig;
 use super::mlp::Mlp;
 use super::rms_norm::rms_norm;
+use super::rope::Rope;
 
 /// One pre-norm transformer block: attention sub-layer then MLP sub-layer, each
 /// wrapped in a residual connection.
@@ -25,8 +26,15 @@ pub struct Block {
 }
 
 impl Block {
-    pub fn new(cfg: &GptConfig, vb: VarBuilder, device: &Device) -> Result<Self> {
-        let attn = CausalSelfAttention::new(cfg, vb.pp("attn"), device)?;
+    /// `rope`/`causal_mask` are shared from `Gpt::new`; the clones taken here
+    /// are cheap handles.
+    pub fn new(
+        cfg: &GptConfig,
+        vb: VarBuilder,
+        rope: &Rope,
+        causal_mask: &Tensor,
+    ) -> Result<Self> {
+        let attn = CausalSelfAttention::new(cfg, vb.pp("attn"), rope, causal_mask)?;
         let mlp = Mlp::new(cfg, vb.pp("mlp"))?;
         Ok(Self {
             attn,
@@ -45,7 +53,8 @@ impl Block {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::DType;
+    use crate::test_support::new_block;
+    use candle_core::Device;
     use candle_nn::VarMap;
 
     fn tiny_cfg() -> GptConfig {
@@ -60,16 +69,12 @@ mod tests {
         }
     }
 
-    fn builder(vm: &VarMap, dev: &Device) -> VarBuilder<'static> {
-        VarBuilder::from_varmap(vm, DType::F32, dev)
-    }
-
     #[test]
     fn forward_preserves_b_t_c() -> Result<()> {
         let dev = Device::Cpu;
         let vm = VarMap::new();
         let cfg = tiny_cfg();
-        let block = Block::new(&cfg, builder(&vm, &dev), &dev)?;
+        let block = new_block(&cfg, &vm, &dev)?;
         let x = Tensor::randn(0.0f32, 1.0, (2, 5, cfg.n_embd), &dev)?;
         assert_eq!(block.forward(&x)?.dims(), &[2, 5, cfg.n_embd]);
         Ok(())
@@ -82,7 +87,7 @@ mod tests {
         let dev = Device::Cpu;
         let vm = VarMap::new();
         let cfg = tiny_cfg();
-        let block = Block::new(&cfg, builder(&vm, &dev), &dev)?;
+        let block = new_block(&cfg, &vm, &dev)?;
         let x = Tensor::randn(0.0f32, 2.0, (1, 6, cfg.n_embd), &dev)?;
         let got = block.forward(&x)?.flatten_all()?.to_vec1::<f32>()?;
         let want = x.flatten_all()?.to_vec1::<f32>()?;
@@ -98,7 +103,7 @@ mod tests {
         let dev = Device::Cpu;
         let vm = VarMap::new();
         let cfg = tiny_cfg();
-        let _block = Block::new(&cfg, builder(&vm, &dev), &dev)?;
+        let _block = new_block(&cfg, &vm, &dev)?;
 
         let data = vm.data().lock().unwrap();
         let mut keys: Vec<String> = data.keys().cloned().collect();

@@ -102,7 +102,7 @@ Key flags:
 | `--data` | Directory of `.parquet` shards. The last shard (sorted by name) is the validation split; the rest are training data. |
 | `--vocab` | Tiktoken-format vocabulary from `train-tokenizer`. Sets both the tokenizer and the model's vocab size. |
 | `--num-iters` | Number of optimizer steps (training horizon). Default: 5000. |
-| `--device-batch` | Rows per forward pass (B). Memory-limited; reduce if you run out of memory. Default: 32. |
+| `--device-batch` | Rows per forward pass (B). Memory-limited; peak memory scales linearly with it (attention is chunked/flash, so no B·T² term) — reduce if you run out of memory. Default: 32. |
 | `--total-batch` | Tokens per optimizer step. Must be a multiple of `device_batch × sequence_len`; the quotient is the gradient-accumulation count. Default: 16384. |
 | `--sequence-len` | Context length in tokens (T). Default: 512. |
 | `--n-layer` / `--n-head` / `--n-embd` | Transformer depth, attention heads, and residual width (`n_embd` must be divisible by `n_head`). Defaults: 6 / 6 / 384. |

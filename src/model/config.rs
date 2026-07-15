@@ -58,6 +58,14 @@ impl GptConfig {
                 self.n_head
             );
         }
+        if !self.head_dim().is_multiple_of(2) {
+            bail!(
+                "head_dim ({}) must be even: RoPE rotates dimension pairs (n_embd {} / n_head {})",
+                self.head_dim(),
+                self.n_embd,
+                self.n_head
+            );
+        }
         Ok(())
     }
 }
@@ -77,6 +85,15 @@ mod tests {
     fn rejects_n_embd_not_divisible_by_n_head() {
         let mut cfg = GptConfig::mac_smoke();
         cfg.n_embd = 100; // not divisible by n_head = 6
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_odd_head_dim() {
+        // 90 / 6 = 15: divisible, but RoPE rotates dimension *pairs*, so an
+        // odd head_dim can't be split in half.
+        let mut cfg = GptConfig::mac_smoke();
+        cfg.n_embd = 90;
         assert!(cfg.validate().is_err());
     }
 

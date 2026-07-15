@@ -124,6 +124,25 @@ mod tests {
     }
 
     #[test]
+    fn qk_norm_order_is_equivalent() -> Result<()> {
+        // The attention module applies rms_norm *after* RoPE; nanochat norms
+        // first. RoPE rotates disjoint 2-D pairs (orthogonal, so each head
+        // vector keeps its rms) and is linear, so the two orders must agree.
+        // If rms_norm ever grows a learnable scale this stops holding —
+        // revisit the ordering in attention.rs if this test starts failing.
+        use crate::model::rms_norm;
+        use crate::test_support::assert_close;
+        let dev = Device::Cpu;
+        let (b, h, t, hd) = (2usize, 3, 5, 8);
+        let rope = Rope::new(t, hd, BASE, &dev)?;
+        let x = Tensor::randn(0.0f32, 2.0, (b, h, t, hd), &dev)?;
+
+        let norm_then_rope = rope.apply(&rms_norm(&x, 1e-6)?)?;
+        let rope_then_norm = rms_norm(&rope.apply(&x)?, 1e-6)?;
+        assert_close(&norm_then_rope, &rope_then_norm, 1e-5, "qk-norm order")
+    }
+
+    #[test]
     fn dot_product_depends_only_on_relative_offset() -> Result<()> {
         // The defining RoPE property: rope(q, m)·rope(k, n) is unchanged when m
         // and n are shifted together — it depends only on (m − n).

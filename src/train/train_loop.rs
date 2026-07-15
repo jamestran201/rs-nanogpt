@@ -2,7 +2,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use candle_core::backprop::GradStore;
-use candle_core::{Device, Result, Tensor, Var};
+use candle_core::{DType, Device, Result, Tensor, Var};
 use candle_nn::VarMap;
 
 use super::{GroupLrs, GroupedAdamW, lr_mult};
@@ -10,13 +10,21 @@ use crate::checkpoint::{self, CheckpointMeta};
 use crate::data::{Batch, DataLoader};
 use crate::eval::{evaluate, generate};
 use crate::metrics::{MetricRecord, MetricsLogger, Throughput};
-use crate::model::{Gpt, Reduction, cross_entropy};
+use crate::model::{Gpt, cross_entropy_sum_count};
 use crate::tokenizer::BpeTokenizer;
 
 #[derive(Debug, Clone)]
 pub struct TrainConfig {
     pub num_iters: usize,
     pub grad_accum: usize,
+    /// Tokens per optimizer step: `grad_accum · device_batch · sequence_len`
+    /// (the CLI's `--total-batch`). Asserted against real batch dims in the loop.
+    pub tokens_per_step: usize,
+    /// Enables the actual-valid-token grad rescale. Leave false when the data
+    /// pipeline never emits `ignore_index` (all of pretraining): the fixed
+    /// 1/expected pre-scale is then already exact, and skipping the rescale
+    /// saves a full per-parameter multiply each step.
+    pub targets_may_be_ignored: bool,
     pub lrs: GroupLrs,
     pub warmup_steps: usize,
     pub warmdown_ratio: f64,
@@ -89,17 +97,29 @@ fn grad_global_norm(grads: &GradStore, vars: &[Var]) -> Result<f64> {
     }
 }
 
+/// One micro-batch forward/backward on `sum(nll) × inv_expected_tokens`,
+/// where `inv_expected_tokens = 1/(grad_accum·B·T)`. Backwarding a *sum*
+/// (not the micro-batch mean) is what lets unequal valid-token counts
+/// compose correctly across micro-batches: the step's single division by the
+/// actual total count happens later, in `rescale_grads`. The fixed pre-scale
+/// by the *expected* count keeps intermediate gradient magnitudes where a
+/// mean-based loss would have them, and makes the rescale a no-op (scale
+/// exactly 1.0) whenever no target is ignored — all of pretraining.
+///
+/// Returns `(grads, Σ nll, Σ valid)`; the two scalars are f32 tensors, the
+/// sum detached so accumulating it across micro-batches cannot pin each
+/// micro-batch's whole graph.
 fn micro_backward(
     model: &Gpt,
     inputs: &Tensor,
     targets: &Tensor,
-    grad_accum: usize,
-) -> Result<(GradStore, Tensor)> {
+    inv_expected_tokens: f64,
+) -> Result<(GradStore, Tensor, Tensor)> {
     let logits = model.forward(inputs)?;
-    let ce = cross_entropy(&logits, targets, -1, Reduction::Mean)?;
-    let loss = (&ce * (1.0 / grad_accum as f64))?;
+    let (nll_sum, valid_count) = cross_entropy_sum_count(&logits, targets, -1)?;
+    let loss = (&nll_sum * inv_expected_tokens)?;
     let grads = loss.backward()?;
-    Ok((grads, ce))
+    Ok((grads, nll_sum.detach(), valid_count))
 }
 
 fn accumulate(acc: &mut GradStore, src: &GradStore, vars: &[Var]) -> Result<()> {
@@ -111,6 +131,22 @@ fn accumulate(acc: &mut GradStore, src: &GradStore, vars: &[Var]) -> Result<()> 
                 None => g.clone(),
             };
             acc.insert(t, summed);
+        }
+    }
+    Ok(())
+}
+
+/// Multiply every accumulated grad by the scalar tensor `scale` (on-device,
+/// no host sync). This corrects `micro_backward`'s fixed 1/expected pre-scale
+/// to the step's actual valid-token count — the step gradient becomes the
+/// true per-token mean over every scored token, however the tokens were
+/// distributed across micro-batches.
+fn rescale_grads(grads: &mut GradStore, vars: &[Var], scale: &Tensor) -> Result<()> {
+    for v in vars {
+        let t = v.as_tensor();
+        if let Some(g) = grads.get(t) {
+            let scaled = g.broadcast_mul(scale)?;
+            grads.insert(t, scaled);
         }
     }
     Ok(())
@@ -131,7 +167,11 @@ pub fn train(
     let t_start = Instant::now();
     let mut window_start_time = Instant::now(); // start of the current log window
     let mut window_start_step = 0usize; // step at window_start_time
-    let mut tokens_per_step = 0usize; // set from the first micro-batch
+
+    // Loss-scaling invariants, fixed for the whole run (see micro_backward
+    // and rescale_grads for how they compose).
+    let inv_expected_tokens = 1.0 / cfg.tokens_per_step as f64;
+    let expected_tokens = Tensor::full(cfg.tokens_per_step as f32, (), device)?;
 
     for step in 0..=cfg.num_iters {
         let last = step == cfg.num_iters;
@@ -183,23 +223,38 @@ pub fn train(
 
         let logging = step.is_multiple_of(cfg.log_every);
         let mut accum: Option<GradStore> = None;
-        let mut ce_sum = 0.0f32;
+        let mut step_sum = Tensor::zeros((), DType::F32, device)?; // Σ nll over the step
+        let mut step_count = Tensor::zeros((), DType::F32, device)?; // Σ valid tokens
         for _ in 0..cfg.grad_accum {
             let batch = loader.next_batch(device)?;
-            if tokens_per_step == 0 {
-                // B*T*grad_accum; fixed across the run, so derive it once.
-                tokens_per_step = cfg.grad_accum * batch.inputs.dim(0)? * batch.inputs.dim(1)?;
-            }
-            let (grads, ce) = micro_backward(model, &batch.inputs, &batch.targets, cfg.grad_accum)?;
-            if logging {
-                ce_sum += ce.to_scalar::<f32>()?;
-            }
+            let (b, t) = batch.inputs.dims2()?;
+            assert_eq!(
+                cfg.grad_accum * b * t,
+                cfg.tokens_per_step,
+                "batch shape ({b}, {t}) × grad_accum disagrees with cfg.tokens_per_step"
+            );
+            let (grads, nll_sum, valid_count) =
+                micro_backward(model, &batch.inputs, &batch.targets, inv_expected_tokens)?;
             match &mut accum {
                 None => accum = Some(grads),
                 Some(acc) => accumulate(acc, &grads, &vars)?,
             }
+            step_sum = (step_sum + &nll_sum)?;
+            step_count = (step_count + &valid_count)?;
         }
-        let grads = accum.expect("grad_accum >= 1 guarantees one micro-batch ran");
+        let mut grads = accum.expect("grad_accum >= 1 guarantees one micro-batch ran");
+
+        if cfg.targets_may_be_ignored {
+            // scale = expected/actual valid tokens, correcting the fixed
+            // 1/expected pre-scale to the step's true count when ignored
+            // targets make micro-batch counts unequal. Exactly 1.0 when they
+            // don't (f32 counts are exact to 2^24, and IEEE guarantees
+            // N/N == 1); with the flag off that holds for every step, so the
+            // whole rescale is skipped.
+            let scale = (&expected_tokens / &step_count)?;
+            rescale_grads(&mut grads, &vars, &scale)?;
+        }
+
         let m = lr_mult(
             step,
             cfg.num_iters,
@@ -210,8 +265,10 @@ pub fn train(
         opt.set_lr_mult(m);
         opt.step(&grads)?;
         if logging {
-            // Mean micro-batch CE (the per-token loss), independent of grad_accum.
-            let mean_ce = ce_sum / cfg.grad_accum as f32;
+            // True per-token CE over the step's valid tokens (a single global
+            // sum/count, not a mean of per-micro-batch means); one scalar read
+            // instead of the per-micro-batch reads a host-side sum would need.
+            let mean_ce = step_sum.broadcast_div(&step_count)?.to_scalar::<f32>()?;
             check_finite(mean_ce, step)?;
 
             device.synchronize()?; // drain queued GPU work so the timing is real
@@ -225,7 +282,7 @@ pub fn train(
             let rate = if steps_in_window > 0 {
                 let window_secs = now.duration_since(window_start_time).as_secs_f64();
                 let ms_per_step = 1000.0 * window_secs / steps_in_window as f64;
-                let tok_s = (steps_in_window * tokens_per_step) as f64 / window_secs;
+                let tok_s = (steps_in_window * cfg.tokens_per_step) as f64 / window_secs;
                 let eta = fmt_hms(ms_per_step / 1000.0 * (cfg.num_iters - step) as f64);
                 println!(
                     "step {step:>6}/{} | loss {mean_ce:.4} | gnorm {gnorm:.3} \
@@ -260,7 +317,7 @@ pub fn train(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::GptConfig;
+    use crate::model::{GptConfig, Reduction, cross_entropy};
     use candle_core::DType;
     use candle_nn::VarBuilder;
 
@@ -276,19 +333,73 @@ mod tests {
         }
     }
 
+    /// One optimizer step off the zero-init residual projections: at strict
+    /// init the params behind the zeroed c_proj (c_q/c_k/c_v/c_fc) get exactly
+    /// zero gradient and candle stores no grad for them; after a step c_proj
+    /// is nonzero and the residual path is live.
+    fn warm_one_step(
+        vm: &VarMap,
+        model: &Gpt,
+        inputs: &Tensor,
+        targets: &Tensor,
+        inv: f64,
+    ) -> Result<()> {
+        let lrs = GroupLrs {
+            embedding: 0.01,
+            unembedding: 0.01,
+            matrix: 0.01,
+        };
+        let mut warm = GroupedAdamW::new(vm, lrs, model.config().n_embd)?;
+        let (g, _, _) = micro_backward(model, inputs, targets, inv)?;
+        warm.set_lr_mult(1.0);
+        warm.step(&g)?;
+        Ok(())
+    }
+
+    /// The grad-composition contract, per parameter: present-and-equal
+    /// (relative tol — f32 sum reassociation, not a real mismatch), or absent
+    /// in both stores; a one-sided presence means the two paths disagree on
+    /// which params received gradient. Returns how many params were compared.
+    fn compare_grads(want: &GradStore, got: &GradStore, vars: &[Var], label: &str) -> Result<usize> {
+        let mut compared = 0;
+        for v in vars {
+            let t = v.as_tensor();
+            match (want.get(t), got.get(t)) {
+                (Some(w), Some(g)) => {
+                    let w = w.flatten_all()?.to_vec1::<f32>()?;
+                    let g = g.flatten_all()?.to_vec1::<f32>()?;
+                    for (x, y) in w.iter().zip(&g) {
+                        assert!(
+                            (x - y).abs() <= 1e-4 * (1.0 + x.abs()),
+                            "{label}: grad mismatch: {x} vs {y}"
+                        );
+                    }
+                    compared += 1;
+                }
+                (None, None) => {}
+                (w, g) => panic!(
+                    "{label}: presence mismatch: want={} got={}",
+                    w.is_some(),
+                    g.is_some()
+                ),
+            }
+        }
+        Ok(compared)
+    }
+
     /// The accumulation contract: one backward over a 4-row batch equals two
-    /// 2-row micro-batches summed (grad_accum = 2), per parameter. With all
-    /// targets valid (no -1) each micro-batch has the same valid-token count, so
-    /// the per-micro-batch means compose exactly into the full-batch mean:
-    ///   0.5·∇mean_a + 0.5·∇mean_b = ∇((mean_a + mean_b)/2) = ∇mean_all.
+    /// 2-row micro-batches summed (grad_accum = 2), per parameter. Both paths
+    /// pre-scale by the same fixed 1/16 (the step's expected token count), so
+    /// the sums compose exactly:
+    ///   ∇(sum_a/16) + ∇(sum_b/16) = ∇(sum_all/16) = ∇mean_all.
+    /// All targets valid ⇒ the step's rescale would be a no-op (scale 1.0);
+    /// the unequal-count case is covered by the sibling test below.
     /// Compared on the same params before any step, so no init cloning needed.
     #[test]
     fn accumulation_matches_single_batch() -> Result<()> {
         let dev = Device::Cpu;
         let vm = VarMap::new();
-        let cfg = tiny_cfg();
-        let n_embd = cfg.n_embd;
-        let model = Gpt::new(cfg, VarBuilder::from_varmap(&vm, DType::F32, &dev))?;
+        let model = Gpt::new(tiny_cfg(), VarBuilder::from_varmap(&vm, DType::F32, &dev))?;
         let vars = vm.all_vars();
 
         let inputs = Tensor::new(
@@ -310,69 +421,100 @@ mod tests {
             &dev,
         )?;
 
-        // One step off the zero-init residual projections: at strict init the
-        // params behind the zeroed c_proj (c_q/c_k/c_v/c_fc) get exactly zero
-        // gradient and candle stores no grad for them; after a step c_proj is
-        // nonzero and the residual path is live.
-        {
-            let lrs = GroupLrs {
-                embedding: 0.01,
-                unembedding: 0.01,
-                matrix: 0.01,
-            };
-            let mut warm = GroupedAdamW::new(&vm, lrs, n_embd)?;
-            let (g, _) = micro_backward(&model, &inputs, &targets, 1)?;
-            warm.set_lr_mult(1.0);
-            warm.step(&g)?;
-        }
+        warm_one_step(&vm, &model, &inputs, &targets, 1.0 / 16.0)?;
+
+        // 16 expected tokens either way: 1·B(4)·T(4) single, 2·B(2)·T(4) split.
+        let inv = 1.0 / 16.0;
 
         // Single batch, grad_accum = 1.
-        let (single, _) = micro_backward(&model, &inputs, &targets, 1)?;
+        let (single, _, _) = micro_backward(&model, &inputs, &targets, inv)?;
 
         // Two micro-batches of 2 rows each, grad_accum = 2, summed.
-        let (mut accum, _) = micro_backward(
+        let (mut accum, _, _) = micro_backward(
             &model,
             &inputs.narrow(0, 0, 2)?,
             &targets.narrow(0, 0, 2)?,
-            2,
+            inv,
         )?;
-        let (g_b, _) = micro_backward(
+        let (g_b, _, _) = micro_backward(
             &model,
             &inputs.narrow(0, 2, 2)?,
             &targets.narrow(0, 2, 2)?,
-            2,
+            inv,
         )?;
         accumulate(&mut accum, &g_b, &vars)?;
 
         // c_q/c_k reach the loss only through the softmax (scores) path, whose
         // gradient is ~zero right after a symmetric init, so candle stores no
         // grad for them; the rest (incl. c_v via the value path) get real grads.
-        // The contract: present-and-equal, or absent-in-both — never a one-sided
-        // presence (which would mean accumulation changed the gradient set).
-        let mut compared = 0;
-        for v in &vars {
-            let t = v.as_tensor();
-            match (single.get(t), accum.get(t)) {
-                (Some(s), Some(a)) => {
-                    let s = s.flatten_all()?.to_vec1::<f32>()?;
-                    let a = a.flatten_all()?.to_vec1::<f32>()?;
-                    for (x, y) in s.iter().zip(&a) {
-                        // Relative tol: f32 sum reassociation, not a real mismatch.
-                        assert!(
-                            (x - y).abs() <= 1e-4 * (1.0 + x.abs()),
-                            "grad mismatch: single {x} vs accum {y}"
-                        );
-                    }
-                    compared += 1;
-                }
-                (None, None) => {}
-                (s, a) => panic!(
-                    "presence mismatch: single={} accum={}",
-                    s.is_some(),
-                    a.is_some()
-                ),
-            }
-        }
+        let compared = compare_grads(&single, &accum, &vars, "single vs accum")?;
+        assert!(
+            compared >= 8,
+            "expected several params compared, got {compared}"
+        );
+        Ok(())
+    }
+
+    /// The mean-of-means regression: micro-batches with *unequal* valid-token
+    /// counts (via ignore_index) must still compose into the gradient of the
+    /// global per-token mean. Per-micro-batch means would up-weight tokens in
+    /// the sparse micro-batch ~2.7× here (5 vs 8 scored tokens); the
+    /// sum + count + rescale pipeline keeps every scored token equal-weight.
+    #[test]
+    fn accumulation_with_unequal_valid_counts_matches_global_mean() -> Result<()> {
+        let dev = Device::Cpu;
+        let vm = VarMap::new();
+        let model = Gpt::new(tiny_cfg(), VarBuilder::from_varmap(&vm, DType::F32, &dev))?;
+        let vars = vm.all_vars();
+
+        let inputs = Tensor::new(
+            &[
+                [1u32, 2, 3, 4],
+                [5, 6, 7, 8],
+                [9, 10, 11, 12],
+                [13, 14, 15, 16],
+            ],
+            &dev,
+        )?;
+        // Micro-batch A (rows 0-1) scores 5 tokens; B (rows 2-3) scores 8.
+        let targets = Tensor::new(
+            &[
+                [2i64, 3, 4, 5],
+                [6, -1, -1, -1],
+                [10, 11, 12, 13],
+                [14, 15, 16, 17],
+            ],
+            &dev,
+        )?;
+
+        warm_one_step(&vm, &model, &inputs, &targets, 1.0 / 16.0)?;
+
+        // Ground truth: autograd through the global valid-token mean (13 tokens).
+        let logits = model.forward(&inputs)?;
+        let want = cross_entropy(&logits, &targets, -1, Reduction::Mean)?.backward()?;
+
+        // Accumulation path exactly as `train` runs it: fixed 1/expected
+        // pre-scale per micro-batch, then one rescale to the actual count.
+        let inv = 1.0 / 16.0; // grad_accum(2) · B(2) · T(4) expected tokens
+        let (mut accum, _, count_a) = micro_backward(
+            &model,
+            &inputs.narrow(0, 0, 2)?,
+            &targets.narrow(0, 0, 2)?,
+            inv,
+        )?;
+        let (g_b, _, count_b) = micro_backward(
+            &model,
+            &inputs.narrow(0, 2, 2)?,
+            &targets.narrow(0, 2, 2)?,
+            inv,
+        )?;
+        accumulate(&mut accum, &g_b, &vars)?;
+        let count = (count_a + count_b)?;
+        assert_eq!(count.to_scalar::<f32>()?, 13.0);
+        let scale = (Tensor::full(16.0f32, (), &dev)? / &count)?;
+        rescale_grads(&mut accum, &vars, &scale)?;
+
+        let compared = compare_grads(&want, &accum, &vars, "global-mean vs accum")?;
         assert!(
             compared >= 8,
             "expected several params compared, got {compared}"
@@ -396,6 +538,8 @@ mod tests {
         let tcfg = TrainConfig {
             num_iters: 50,
             grad_accum: 1,
+            tokens_per_step: 8, // grad_accum(1) · B(2) · T(4)
+            targets_may_be_ignored: false,
             lrs: GroupLrs {
                 embedding: 0.02,
                 unembedding: 0.004,
@@ -411,8 +555,10 @@ mod tests {
         let mut last = f32::NAN;
         let mut first = f32::NAN;
         for step in 0..=tcfg.num_iters {
-            let (grads, ce) = micro_backward(&model, &inputs, &targets, tcfg.grad_accum)?;
-            let l = ce.to_scalar::<f32>()?;
+            // grad_accum(1) · B(2) · T(4) = 8 expected tokens per step.
+            let (grads, nll_sum, valid_count) =
+                micro_backward(&model, &inputs, &targets, 1.0 / 8.0)?;
+            let l = nll_sum.broadcast_div(&valid_count)?.to_scalar::<f32>()?;
             assert!(l.is_finite(), "loss not finite at step {step}: {l}");
             if step == 0 {
                 first = l;
@@ -468,29 +614,15 @@ mod tests {
     fn grad_global_norm_matches_reference() -> Result<()> {
         let dev = Device::Cpu;
         let vm = VarMap::new();
-        let cfg = tiny_cfg();
-        let n_embd = cfg.n_embd;
-        let model = Gpt::new(cfg, VarBuilder::from_varmap(&vm, DType::F32, &dev))?;
+        let model = Gpt::new(tiny_cfg(), VarBuilder::from_varmap(&vm, DType::F32, &dev))?;
         let vars = vm.all_vars();
 
         let inputs = Tensor::new(&[[1u32, 2, 3, 4], [5, 6, 7, 8]], &dev)?;
         let targets = Tensor::new(&[[2i64, 3, 4, 5], [6, 7, 8, 9]], &dev)?;
 
-        // One step first so the zero-init residual projections carry grad;
-        // otherwise several params store no gradient at strict init.
-        {
-            let lrs = GroupLrs {
-                embedding: 0.01,
-                unembedding: 0.01,
-                matrix: 0.01,
-            };
-            let mut warm = GroupedAdamW::new(&vm, lrs, n_embd)?;
-            let (g, _) = micro_backward(&model, &inputs, &targets, 1)?;
-            warm.set_lr_mult(1.0);
-            warm.step(&g)?;
-        }
+        warm_one_step(&vm, &model, &inputs, &targets, 1.0 / 8.0)?;
 
-        let (grads, _) = micro_backward(&model, &inputs, &targets, 1)?;
+        let (grads, _, _) = micro_backward(&model, &inputs, &targets, 1.0 / 8.0)?;
 
         // Independent f64 reference: sum of squares over every stored grad.
         let mut ref_sumsq = 0.0f64;
@@ -520,7 +652,7 @@ mod tests {
         let model = Gpt::new(tiny_cfg(), VarBuilder::from_varmap(&vm, DType::F32, &dev))?;
         let inputs = Tensor::new(&[[1u32, 2, 3, 4]], &dev)?;
         let targets = Tensor::new(&[[2i64, 3, 4, 5]], &dev)?;
-        let (grads, _) = micro_backward(&model, &inputs, &targets, 1)?;
+        let (grads, _, _) = micro_backward(&model, &inputs, &targets, 1.0 / 4.0)?;
         assert_eq!(grad_global_norm(&grads, &[])?, 0.0);
         Ok(())
     }
@@ -551,6 +683,10 @@ mod tests {
         let tcfg = TrainConfig {
             num_iters: 4,
             grad_accum: 1,
+            tokens_per_step: 16, // grad_accum(1) · B(2) · T(8)
+            // All targets are valid, so scale == 1.0 exactly; true here keeps
+            // the rescale branch of train() exercised.
+            targets_may_be_ignored: true,
             lrs: GroupLrs {
                 embedding: 0.02,
                 unembedding: 0.004,

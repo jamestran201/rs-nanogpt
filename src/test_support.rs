@@ -6,10 +6,10 @@ use std::path::Path;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 
-use candle_core::{DType, Device};
+use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::{VarBuilder, VarMap};
 
-use crate::model::{Gpt, GptConfig};
+use crate::model::{Block, CausalSelfAttention, Gpt, GptConfig, Rope, build_causal_mask};
 use crate::tokenizer::BpeTokenizer;
 
 /// A byte-level tokenizer: one token per byte value, no merges.
@@ -67,4 +67,39 @@ pub(crate) fn tiny_gpt(vocab_size: usize, sequence_len: usize) -> (VarMap, Gpt) 
     let vm = VarMap::new();
     let model = Gpt::new(cfg, VarBuilder::from_varmap(&vm, DType::F32, &Device::Cpu)).unwrap();
     (vm, model)
+}
+
+/// The RoPE tables + causal mask that `Gpt::new` builds once and shares into
+/// every block — for tests that construct an attention module or block alone.
+fn rope_and_mask(cfg: &GptConfig, dev: &Device) -> Result<(Rope, Tensor)> {
+    Ok((
+        Rope::from_config(cfg, dev)?,
+        build_causal_mask(cfg.sequence_len, dev)?,
+    ))
+}
+
+pub(crate) fn new_attn(cfg: &GptConfig, vm: &VarMap, dev: &Device) -> Result<CausalSelfAttention> {
+    let (rope, mask) = rope_and_mask(cfg, dev)?;
+    let vb = VarBuilder::from_varmap(vm, DType::F32, dev);
+    CausalSelfAttention::new(cfg, vb, &rope, &mask)
+}
+
+pub(crate) fn new_block(cfg: &GptConfig, vm: &VarMap, dev: &Device) -> Result<Block> {
+    let (rope, mask) = rope_and_mask(cfg, dev)?;
+    let vb = VarBuilder::from_varmap(vm, DType::F32, dev);
+    Block::new(cfg, vb, &rope, &mask)
+}
+
+/// Elementwise `|got − want| ≤ tol` on the flattened f32 views; shapes must match.
+pub(crate) fn assert_close(got: &Tensor, want: &Tensor, tol: f64, what: &str) -> Result<()> {
+    assert_eq!(got.dims(), want.dims(), "{what}: shape mismatch");
+    let got = got.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+    let want = want.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+    for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+        assert!(
+            (g - w).abs() as f64 <= tol,
+            "{what}[{i}]: {g} vs {w} (tol {tol})"
+        );
+    }
+    Ok(())
 }
