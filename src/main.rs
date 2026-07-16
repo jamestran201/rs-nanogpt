@@ -294,12 +294,16 @@ fn run_pretrain(args: PretrainArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let device = default_device()?;
 
-    let mut loader = DataLoader::open(
+    // Train docs stride by rank (disjoint per-GPU streams); the val split is
+    // NOT strided — every rank snapshots the same batches and eval shards them.
+    let mut loader = DataLoader::open_strided(
         &args.data,
         Split::Train,
         &tokenizer,
         args.device_batch,
         config.sequence_len,
+        dist.rank,
+        dist.world_size,
     )?;
 
     let mut val_loader = DataLoader::open(

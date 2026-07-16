@@ -9,7 +9,7 @@ use super::dist::{DistCtx, canonical_vars};
 use super::{GroupLrs, GroupedAdamW, lr_mult};
 use crate::checkpoint::{self, CheckpointMeta};
 use crate::data::{Batch, DataLoader};
-use crate::eval::{evaluate, generate};
+use crate::eval::{BpbAccumulator, evaluate_shard_sums, generate};
 use crate::metrics::{MetricRecord, MetricsLogger, Throughput};
 use crate::model::{Gpt, cross_entropy_sum_count};
 use crate::tokenizer::BpeTokenizer;
@@ -182,7 +182,21 @@ pub fn train(
         let last = step == cfg.num_iters;
 
         if cadence_fires(step, cfg.num_iters, eval.eval_every) {
-            let m = evaluate(model, eval.val_batches, eval.token_bytes)?;
+            // Every rank scores its 1/world slice of the shared val snapshot;
+            // the reduced sums give all ranks the identical metrics (which
+            // keeps the best-bpb control flow below in lockstep for free).
+            let local = evaluate_shard_sums(
+                model,
+                eval.val_batches,
+                eval.token_bytes,
+                dist.rank,
+                dist.world_size,
+            )?;
+            let sums: [f64; 4] = dist
+                .all_reduce_sums(&local)?
+                .try_into()
+                .expect("all_reduce_sums preserves length");
+            let m = BpbAccumulator::metrics_from_sums(sums);
             if dist.is_master() {
                 println!(
                     "step {step:>6}  val_loss {:.4}  bpb {:.4}",
@@ -753,7 +767,7 @@ mod tests {
         // loaded weights reproduces the stored bpb bit-for-bit (identical f32
         // forward + f64 accumulation over an exact safetensors round-trip).
         let (loaded, _vm, meta) = checkpoint::load(&out.path().join("best"), &dev)?;
-        let rescored = evaluate(&loaded, &val_batches, &token_bytes)?;
+        let rescored = crate::eval::evaluate(&loaded, &val_batches, &token_bytes)?;
         assert_eq!(
             rescored.bpb, meta.val_bpb,
             "reloaded model must reproduce the saved bpb exactly"

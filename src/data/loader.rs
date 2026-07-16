@@ -61,7 +61,9 @@ where
                 None => {
                     assert!(
                         self.docs_produced_this_pass > 0,
-                        "data source produced no documents in a full pass over the source — empty corpus"
+                        "data source produced no documents in a full pass over the source — empty corpus \
+                         (under multi-GPU rank striding each rank keeps only every world_size-th \
+                         document, so a corpus with fewer documents than ranks starves this rank)"
                     );
                     self.docs = (self.make_docs)();
                     self.docs_produced_this_pass = 0;
@@ -152,20 +154,38 @@ pub(crate) fn split_rows(rows: &[u32], batch_size: usize, tokens_dim: usize) -> 
 
 /// One pass's worth of token documents: stream the `text` column of `shards`
 /// and tokenize each non-empty document. This is the source the `BatchAssembler` consumes.
+///
+/// `(rank, world)` stride the document stream for data parallelism: rank `r`
+/// keeps only documents whose index satisfies `i % world == rank`, so the
+/// ranks' streams partition the corpus disjointly and exhaustively. The filter
+/// runs *before* tokenization (each rank also does only 1/world of the BPE
+/// work), and the index counts every non-null text row, so the partition is
+/// identical no matter which rank computes it. `(0, 1)` is the identity.
 pub(crate) fn encode_docs<'a>(
     shards: Vec<PathBuf>,
     tokenizer: &'a BpeTokenizer,
+    rank: usize,
+    world: usize,
 ) -> impl Iterator<Item = Vec<u32>> + 'a {
-    ShardTextIter::new(shards).filter_map(move |res| {
-        let text = res.unwrap_or_else(|e| panic!("failed reading shard text: {e}"));
-        let body = tokenizer.encode(&text);
-        (!body.is_empty()).then(|| {
-            let mut tokens = Vec::with_capacity(body.len() + 1);
-            tokens.push(tokenizer.bos_id());
-            tokens.extend(body);
-            tokens
+    assert!(
+        world >= 1 && rank < world,
+        "invalid rank {rank} / world {world}"
+    );
+    ShardTextIter::new(shards)
+        .enumerate()
+        .filter_map(move |(doc_index, res)| {
+            if doc_index % world != rank {
+                return None;
+            }
+            let text = res.unwrap_or_else(|e| panic!("failed reading shard text: {e}"));
+            let body = tokenizer.encode(&text);
+            (!body.is_empty()).then(|| {
+                let mut tokens = Vec::with_capacity(body.len() + 1);
+                tokens.push(tokenizer.bos_id());
+                tokens.extend(body);
+                tokens
+            })
         })
-    })
 }
 
 /// One pass's document-token iterator, type-erased so `DataLoader` can name it.
@@ -194,13 +214,39 @@ impl<'a> DataLoader<'a> {
         batch_size: usize,
         tokens_dim: usize,
     ) -> std::io::Result<Self> {
-        Self::open_with_buffer_size(
+        Self::open_inner(
             dir,
             split,
             tokenizer,
             batch_size,
             tokens_dim,
             DEFAULT_BUFFER_SIZE,
+            0,
+            1,
+        )
+    }
+
+    /// Like [`open`](Self::open) but reading only rank `rank`'s 1/`world`
+    /// slice of the document stream (see [`encode_docs`]) — the per-GPU train
+    /// loader of a data-parallel run.
+    pub fn open_strided(
+        dir: &Path,
+        split: Split,
+        tokenizer: &'a BpeTokenizer,
+        batch_size: usize,
+        tokens_dim: usize,
+        rank: usize,
+        world: usize,
+    ) -> std::io::Result<Self> {
+        Self::open_inner(
+            dir,
+            split,
+            tokenizer,
+            batch_size,
+            tokens_dim,
+            DEFAULT_BUFFER_SIZE,
+            rank,
+            world,
         )
     }
 
@@ -214,10 +260,34 @@ impl<'a> DataLoader<'a> {
         tokens_dim: usize,
         buffer_size: usize,
     ) -> std::io::Result<Self> {
+        Self::open_inner(
+            dir,
+            split,
+            tokenizer,
+            batch_size,
+            tokens_dim,
+            buffer_size,
+            0,
+            1,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn open_inner(
+        dir: &Path,
+        split: Split,
+        tokenizer: &'a BpeTokenizer,
+        batch_size: usize,
+        tokens_dim: usize,
+        buffer_size: usize,
+        rank: usize,
+        world: usize,
+    ) -> std::io::Result<Self> {
         let all = list_shards(dir)?;
         let shards = shards_for_split(&all, split)?;
-        let factory: DocFactory<'a> =
-            Box::new(move || Box::new(encode_docs(shards.clone(), tokenizer)) as DocIter<'a>);
+        let factory: DocFactory<'a> = Box::new(move || {
+            Box::new(encode_docs(shards.clone(), tokenizer, rank, world)) as DocIter<'a>
+        });
         Ok(Self {
             assembler: BatchAssembler::new(factory, batch_size, tokens_dim, buffer_size),
             batch_size,
@@ -341,7 +411,7 @@ mod tests {
 
         let tok = byte_tokenizer();
 
-        let docs: Vec<Vec<u32>> = encode_docs(vec![shard], &tok).collect();
+        let docs: Vec<Vec<u32>> = encode_docs(vec![shard], &tok, 0, 1).collect();
         let bos = tok.bos_id();
         assert_eq!(
             docs,
@@ -362,11 +432,59 @@ mod tests {
 
         let tok = byte_tokenizer();
 
-        let factory = || encode_docs(vec![shard.clone()], &tok);
+        let factory = || encode_docs(vec![shard.clone()], &tok, 0, 1);
         let first: Vec<Vec<u32>> = factory().collect();
         let second: Vec<Vec<u32>> = factory().collect();
         assert!(!first.is_empty());
         assert_eq!(first, second);
+    }
+
+    /// Rank striding must partition the document stream: for any `world`, the
+    /// per-rank streams are disjoint, order-preserving, and their round-robin
+    /// interleave reconstructs the full (world = 1) stream exactly.
+    #[test]
+    fn strided_doc_streams_partition_the_corpus() {
+        let dir = tempfile::tempdir().unwrap();
+        let shard = dir.path().join("0.parquet");
+        // 7 docs (with a null mixed in) so nothing divides evenly.
+        write_shard(
+            &shard,
+            vec![
+                Some("aa"),
+                Some("bb"),
+                None,
+                Some("cc"),
+                Some("dd"),
+                Some("ee"),
+                Some("ff"),
+                Some("gg"),
+            ],
+        );
+        let tok = byte_tokenizer();
+
+        let full: Vec<Vec<u32>> = encode_docs(vec![shard.clone()], &tok, 0, 1).collect();
+        assert_eq!(full.len(), 7);
+
+        for world in [1usize, 2, 3, 7] {
+            let per_rank: Vec<Vec<Vec<u32>>> = (0..world)
+                .map(|rank| encode_docs(vec![shard.clone()], &tok, rank, world).collect())
+                .collect();
+
+            // Each rank's stream is exactly the full stream's i % world == rank
+            // subsequence (disjointness + order preservation in one shot)...
+            for (rank, docs) in per_rank.iter().enumerate() {
+                let want: Vec<Vec<u32>> = full
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| i % world == rank)
+                    .map(|(_, d)| d.clone())
+                    .collect();
+                assert_eq!(docs, &want, "rank {rank} of world {world}");
+            }
+            // ...and the streams are exhaustive.
+            let total: usize = per_rank.iter().map(|d| d.len()).sum();
+            assert_eq!(total, full.len(), "world {world} must cover every doc");
+        }
     }
 
     /// Build a two-shard corpus (so a train/val split exists) where the chosen
