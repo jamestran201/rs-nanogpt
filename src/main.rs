@@ -15,8 +15,8 @@ use rs_nanogpt::model::{
 };
 use rs_nanogpt::tokenizer::{BpeTokenizer, BpeTokenizerTrainer};
 use rs_nanogpt::train::{
-    DEFAULT_FINAL_LR_FRAC, DEFAULT_WARMDOWN_RATIO, DEFAULT_WARMUP_STEPS, EvalContext, GroupLrs,
-    TrainConfig, train,
+    DEFAULT_FINAL_LR_FRAC, DEFAULT_WARMDOWN_RATIO, DEFAULT_WARMUP_STEPS, DistCtx, EvalContext,
+    GroupLrs, TrainConfig, train,
 };
 
 #[derive(Parser)]
@@ -256,6 +256,7 @@ fn unique_run_dir(root: &Path, id: &str) -> io::Result<PathBuf> {
 fn run_pretrain(args: PretrainArgs) -> Result<(), Box<dyn std::error::Error>> {
     validate_pretrain_args(&args)?;
 
+    let dist = DistCtx::single();
     let micro = args.device_batch * args.sequence_len;
     let grad_accum = args.total_batch / micro;
     let train_cfg = TrainConfig {
@@ -287,7 +288,9 @@ fn run_pretrain(args: PretrainArgs) -> Result<(), Box<dyn std::error::Error>> {
         norm_eps: args.norm_eps,
     };
     config.validate()?;
-    print_config_summary(&config);
+    if dist.is_master() {
+        print_config_summary(&config);
+    }
 
     let device = default_device()?;
 
@@ -313,53 +316,63 @@ fn run_pretrain(args: PretrainArgs) -> Result<(), Box<dyn std::error::Error>> {
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
     let model = Gpt::new(config, vb)?;
     let n_params: usize = varmap.all_vars().iter().map(|v| v.elem_count()).sum();
-    println!(
-        "\nmodel built on {device:?} | compute dtype {:?} (fp32 masters) | {n_params} parameters",
-        compute_dtype(&device)
-    );
-
-    println!(
-        "\ntraining: {} iters, total_batch {} tokens, device_batch {}, grad_accum {}",
-        args.num_iters, args.total_batch, args.device_batch, grad_accum
-    );
+    if dist.is_master() {
+        println!(
+            "\nmodel built on {device:?} | compute dtype {:?} (fp32 masters) | {n_params} parameters",
+            compute_dtype(&device)
+        );
+        println!(
+            "\ntraining: {} iters, total_batch {} tokens, device_batch {}, grad_accum {}",
+            args.num_iters, args.total_batch, args.device_batch, grad_accum
+        );
+    }
     let started_at_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    let run_dir = unique_run_dir(&args.out, &started_at_unix.to_string())?;
-    println!("run dir: {}", run_dir.display());
+    // Run dir, run.json, and metrics.jsonl are master-only side effects; the
+    // other ranks get a discard sink and a path that train() never writes to
+    // (checkpointing is master-gated). This also avoids per-rank timestamp
+    // races into different run dirs.
+    let (run_dir, metrics) = if dist.is_master() {
+        let run_dir = unique_run_dir(&args.out, &started_at_unix.to_string())?;
+        println!("run dir: {}", run_dir.display());
 
-    let run_meta = RunMeta {
-        device: format!("{device:?}"),
-        dtype: "f32",
-        started_at_unix,
-        n_params,
-        vocab_size: config.vocab_size,
-        sequence_len: config.sequence_len,
-        n_layer: config.n_layer,
-        n_head: config.n_head,
-        n_embd: config.n_embd,
-        rope_base: config.rope_base,
-        norm_eps: config.norm_eps,
-        num_iters: args.num_iters,
-        device_batch: args.device_batch,
-        total_batch: args.total_batch,
-        grad_accum,
-        tokens_per_step: args.total_batch, // == grad_accum * device_batch * seq_len
-        embedding_lr: args.embedding_lr,
-        unembedding_lr: args.unembedding_lr,
-        matrix_lr: args.matrix_lr,
-        warmup_steps: args.warmup_steps,
-        warmdown_ratio: args.warmdown_ratio,
-        final_lr_frac: args.final_lr_frac,
-        log_every: args.log_every,
-        eval_every: args.eval_every,
-        eval_steps: args.eval_steps,
-        sample_every: args.sample_every,
+        let run_meta = RunMeta {
+            device: format!("{device:?}"),
+            dtype: "f32",
+            started_at_unix,
+            n_params,
+            vocab_size: config.vocab_size,
+            sequence_len: config.sequence_len,
+            n_layer: config.n_layer,
+            n_head: config.n_head,
+            n_embd: config.n_embd,
+            rope_base: config.rope_base,
+            norm_eps: config.norm_eps,
+            num_iters: args.num_iters,
+            device_batch: args.device_batch,
+            total_batch: args.total_batch,
+            grad_accum,
+            tokens_per_step: args.total_batch, // == grad_accum * device_batch * seq_len
+            embedding_lr: args.embedding_lr,
+            unembedding_lr: args.unembedding_lr,
+            matrix_lr: args.matrix_lr,
+            warmup_steps: args.warmup_steps,
+            warmdown_ratio: args.warmdown_ratio,
+            final_lr_frac: args.final_lr_frac,
+            log_every: args.log_every,
+            eval_every: args.eval_every,
+            eval_steps: args.eval_steps,
+            sample_every: args.sample_every,
+        };
+        write_run_json(&run_dir.join("run.json"), &run_meta)?;
+        let metrics = MetricsLogger::create(&run_dir.join("metrics.jsonl"))?;
+        (run_dir, metrics)
+    } else {
+        (args.out.clone(), MetricsLogger::null())
     };
-    write_run_json(&run_dir.join("run.json"), &run_meta)?;
-    let metrics = MetricsLogger::create(&run_dir.join("metrics.jsonl"))?;
 
     let eval = EvalContext {
         val_batches: &val_batches,
@@ -372,7 +385,15 @@ fn run_pretrain(args: PretrainArgs) -> Result<(), Box<dyn std::error::Error>> {
         sample_tokens: args.sample_tokens,
         sample_temperature: args.sample_temperature,
     };
-    train(&model, &varmap, &mut loader, &train_cfg, &eval, &device)?;
+    train(
+        &model,
+        &varmap,
+        &mut loader,
+        &train_cfg,
+        &eval,
+        &dist,
+        &device,
+    )?;
     Ok(())
 }
 

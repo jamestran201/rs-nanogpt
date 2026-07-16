@@ -5,6 +5,7 @@ use candle_core::backprop::GradStore;
 use candle_core::{DType, Device, Result, Tensor, Var};
 use candle_nn::VarMap;
 
+use super::dist::{DistCtx, canonical_vars};
 use super::{GroupLrs, GroupedAdamW, lr_mult};
 use crate::checkpoint::{self, CheckpointMeta};
 use crate::data::{Batch, DataLoader};
@@ -158,10 +159,14 @@ pub fn train(
     loader: &mut DataLoader,
     cfg: &TrainConfig,
     eval: &EvalContext,
+    dist: &DistCtx,
     device: &Device,
 ) -> Result<()> {
     let mut opt = GroupedAdamW::new(varmap, cfg.lrs, model.config().n_embd)?;
-    let vars = varmap.all_vars();
+    // Canonical (name-sorted) order: NCCL matches collectives across ranks by
+    // call order alone, so every per-var walk below uses this one list. The
+    // local uses (accumulate/rescale/norm) are order-insensitive anyway.
+    let vars: Vec<Var> = canonical_vars(varmap).into_iter().map(|(_, v)| v).collect();
     let mut min_val_bpb = f64::INFINITY;
 
     let t_start = Instant::now();
@@ -178,31 +183,37 @@ pub fn train(
 
         if cadence_fires(step, cfg.num_iters, eval.eval_every) {
             let m = evaluate(model, eval.val_batches, eval.token_bytes)?;
-            println!(
-                "step {step:>6}  val_loss {:.4}  bpb {:.4}",
-                m.val_loss, m.bpb
-            );
-            eval.metrics.log(&MetricRecord::eval(
-                step,
-                t_start.elapsed().as_secs_f64(),
-                m.val_loss,
-                m.bpb,
-            ));
+            if dist.is_master() {
+                println!(
+                    "step {step:>6}  val_loss {:.4}  bpb {:.4}",
+                    m.val_loss, m.bpb
+                );
+                eval.metrics.log(&MetricRecord::eval(
+                    step,
+                    t_start.elapsed().as_secs_f64(),
+                    m.val_loss,
+                    m.bpb,
+                ));
+            }
+            // Every rank tracks the best bpb (identical value everywhere, so
+            // control flow stays in lockstep); only master writes the files.
             if m.bpb < min_val_bpb {
                 min_val_bpb = m.bpb;
-                checkpoint::save(
-                    &eval.ckpt_root.join("best"),
-                    varmap,
-                    &CheckpointMeta {
-                        config: *model.config(),
-                        step,
-                        val_bpb: m.bpb,
-                    },
-                )?;
+                if dist.is_master() {
+                    checkpoint::save(
+                        &eval.ckpt_root.join("best"),
+                        varmap,
+                        &CheckpointMeta {
+                            config: *model.config(),
+                            step,
+                            val_bpb: m.bpb,
+                        },
+                    )?;
+                }
             }
         }
 
-        if cadence_fires(step, cfg.num_iters, eval.sample_every) {
+        if dist.is_master() && cadence_fires(step, cfg.num_iters, eval.sample_every) {
             for p in SAMPLE_PROMPTS {
                 let s = generate(
                     model,
@@ -273,39 +284,43 @@ pub fn train(
 
             device.synchronize()?; // drain queued GPU work so the timing is real
             let now = Instant::now();
-            let lrs = opt.current_lrs();
-            let gnorm = grad_global_norm(&grads, &vars)?;
-            let steps_in_window = step - window_start_step; // 0 only at the step-0 log
-            let elapsed_s = now.duration_since(t_start).as_secs_f64();
-            let elapsed = fmt_hms(elapsed_s);
+            if dist.is_master() {
+                // Post-reduce the gradients are identical on every rank, so
+                // the norm is too: compute and log it on master only.
+                let lrs = opt.current_lrs();
+                let gnorm = grad_global_norm(&grads, &vars)?;
+                let steps_in_window = step - window_start_step; // 0 only at the step-0 log
+                let elapsed_s = now.duration_since(t_start).as_secs_f64();
+                let elapsed = fmt_hms(elapsed_s);
 
-            let rate = if steps_in_window > 0 {
-                let window_secs = now.duration_since(window_start_time).as_secs_f64();
-                let ms_per_step = 1000.0 * window_secs / steps_in_window as f64;
-                let tok_s = (steps_in_window * cfg.tokens_per_step) as f64 / window_secs;
-                let eta = fmt_hms(ms_per_step / 1000.0 * (cfg.num_iters - step) as f64);
-                println!(
-                    "step {step:>6}/{} | loss {mean_ce:.4} | gnorm {gnorm:.3} \
-                     | lr m={:.2e} e={:.2e} u={:.2e} \
-                     | {tok_s:.0} tok/s | {ms_per_step:.0} ms/step | t+{elapsed} | eta {eta}",
-                    cfg.num_iters, lrs.matrix, lrs.embedding, lrs.unembedding,
-                );
-                Some(Throughput {
-                    tok_per_s: tok_s,
-                    ms_per_step,
-                })
-            } else {
-                // step-0 window has no elapsed steps yet: baseline loss only.
-                println!(
-                    "step {step:>6}/{} | loss {mean_ce:.4} | gnorm {gnorm:.3} | t+{elapsed}",
-                    cfg.num_iters
-                );
-                None
-            };
+                let rate = if steps_in_window > 0 {
+                    let window_secs = now.duration_since(window_start_time).as_secs_f64();
+                    let ms_per_step = 1000.0 * window_secs / steps_in_window as f64;
+                    let tok_s = (steps_in_window * cfg.tokens_per_step) as f64 / window_secs;
+                    let eta = fmt_hms(ms_per_step / 1000.0 * (cfg.num_iters - step) as f64);
+                    println!(
+                        "step {step:>6}/{} | loss {mean_ce:.4} | gnorm {gnorm:.3} \
+                         | lr m={:.2e} e={:.2e} u={:.2e} \
+                         | {tok_s:.0} tok/s | {ms_per_step:.0} ms/step | t+{elapsed} | eta {eta}",
+                        cfg.num_iters, lrs.matrix, lrs.embedding, lrs.unembedding,
+                    );
+                    Some(Throughput {
+                        tok_per_s: tok_s,
+                        ms_per_step,
+                    })
+                } else {
+                    // step-0 window has no elapsed steps yet: baseline loss only.
+                    println!(
+                        "step {step:>6}/{} | loss {mean_ce:.4} | gnorm {gnorm:.3} | t+{elapsed}",
+                        cfg.num_iters
+                    );
+                    None
+                };
 
-            eval.metrics.log(&MetricRecord::train(
-                step, elapsed_s, mean_ce, gnorm, lrs, rate,
-            ));
+                eval.metrics.log(&MetricRecord::train(
+                    step, elapsed_s, mean_ce, gnorm, lrs, rate,
+                ));
+            }
 
             window_start_time = now;
             window_start_step = step;
@@ -360,7 +375,12 @@ mod tests {
     /// (relative tol — f32 sum reassociation, not a real mismatch), or absent
     /// in both stores; a one-sided presence means the two paths disagree on
     /// which params received gradient. Returns how many params were compared.
-    fn compare_grads(want: &GradStore, got: &GradStore, vars: &[Var], label: &str) -> Result<usize> {
+    fn compare_grads(
+        want: &GradStore,
+        got: &GradStore,
+        vars: &[Var],
+        label: &str,
+    ) -> Result<usize> {
         let mut compared = 0;
         for v in vars {
             let t = v.as_tensor();
@@ -710,7 +730,15 @@ mod tests {
             sample_temperature: 0.0,
         };
 
-        train(&model, &vm, &mut train_loader, &tcfg, &eval, &dev)?;
+        train(
+            &model,
+            &vm,
+            &mut train_loader,
+            &tcfg,
+            &eval,
+            &DistCtx::single(),
+            &dev,
+        )?;
 
         // Telemetry landed: at least the step-0 train record plus eval records.
         let metrics_len = std::fs::metadata(out.path().join("metrics.jsonl"))

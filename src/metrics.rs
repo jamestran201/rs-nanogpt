@@ -127,7 +127,7 @@ impl MetricRecord {
 /// once to stderr and every failure is otherwise swallowed, so a lost metrics line
 /// never aborts training.
 pub struct MetricsLogger {
-    sink: RefCell<BufWriter<File>>,
+    sink: Option<RefCell<BufWriter<File>>>,
     warned: Cell<bool>,
 }
 
@@ -137,9 +137,19 @@ impl MetricsLogger {
             std::fs::create_dir_all(dir)?;
         }
         Ok(Self {
-            sink: RefCell::new(BufWriter::new(File::create(path)?)),
+            sink: Some(RefCell::new(BufWriter::new(File::create(path)?))),
             warned: Cell::new(false),
         })
+    }
+
+    /// A no-op sink that discards every record. Non-master ranks in a
+    /// multi-GPU run use this so `EvalContext` keeps its shape while only
+    /// rank 0 writes metrics.jsonl.
+    pub fn null() -> Self {
+        Self {
+            sink: None,
+            warned: Cell::new(false),
+        }
     }
 
     pub fn log(&self, rec: &MetricRecord) {
@@ -151,8 +161,11 @@ impl MetricsLogger {
     }
 
     fn try_log(&self, rec: &MetricRecord) -> std::io::Result<()> {
+        let Some(sink) = &self.sink else {
+            return Ok(()); // null logger: silently discard
+        };
         let line = serde_json::to_string(rec).map_err(std::io::Error::other)?;
-        let mut w = self.sink.borrow_mut();
+        let mut w = sink.borrow_mut();
         w.write_all(line.as_bytes())?;
         w.write_all(b"\n")?;
         // Flush per line so a killed run keeps everything logged so far.
@@ -214,6 +227,14 @@ mod tests {
         assert!(eval.get("train_loss").is_none());
         assert!(eval.get("grad_norm").is_none());
         assert!(eval.get("tok_per_s").is_none());
+    }
+
+    #[test]
+    fn null_logger_discards_records_without_error() {
+        let logger = MetricsLogger::null();
+        logger.log(&MetricRecord::eval(1, 0.5, 3.0, 1.2));
+        // Nothing observable to assert beyond "no panic, no warning state".
+        assert!(!logger.warned.get());
     }
 
     #[test]
