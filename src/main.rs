@@ -14,6 +14,7 @@ use rs_nanogpt::model::{
     DEFAULT_SEQUENCE_LEN, Gpt, GptConfig, compute_dtype, default_device,
 };
 use rs_nanogpt::tokenizer::{BpeTokenizer, BpeTokenizerTrainer};
+use rs_nanogpt::train::dist::{self, ChildEnv};
 use rs_nanogpt::train::{
     DEFAULT_FINAL_LR_FRAC, DEFAULT_WARMDOWN_RATIO, DEFAULT_WARMUP_STEPS, DistCtx, EvalContext,
     GroupLrs, TrainConfig, train,
@@ -82,7 +83,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Command::Pretrain(args) => {
-            if let Err(err) = run_pretrain(args) {
+            // Three roles share this subcommand: the launcher parent (--gpus N
+            // with a clean env, spawns one child per GPU and supervises), a
+            // spawned rank (env set by the parent), and the plain
+            // single-process run (everything else).
+            let result: Result<(), Box<dyn std::error::Error>> = match dist::child_env() {
+                Err(e) => Err(e.into()),
+                Ok(None) if args.gpus > 1 => run_launcher(&args),
+                Ok(child) => run_pretrain(args, child),
+            };
+            if let Err(err) = result {
                 eprintln!("pretrain failed: {err}");
                 process::exit(1);
             }
@@ -130,10 +140,17 @@ struct PretrainArgs {
     /// Rows per forward pass (B). Memory-limited; reduce if you OOM.
     #[arg(long, default_value_t = 32)]
     device_batch: usize,
-    /// Total tokens per optimizer step. Must be a multiple of
-    /// device_batch*seq_len; the quotient is the gradient-accumulation steps.
+    /// Global tokens per optimizer step (summed over all GPUs). Must be a
+    /// multiple of gpus*device_batch*seq_len; the quotient is the per-rank
+    /// gradient-accumulation steps.
     #[arg(long, default_value_t = 16384)]
     total_batch: usize,
+    /// Number of GPUs (data-parallel ranks). With N > 1 this process becomes
+    /// a launcher: it re-executes itself once per GPU and supervises the
+    /// ranks. Requires a build with --features nccl and one visible CUDA
+    /// device per rank.
+    #[arg(long, default_value_t = 1)]
+    gpus: usize,
     /// AdamW LR for the token embedding (wte).
     #[arg(long, default_value_t = 0.2)]
     embedding_lr: f64,
@@ -205,19 +222,25 @@ fn validate_pretrain_args(args: &PretrainArgs) -> Result<(), Box<dyn std::error:
         .into());
     }
 
-    // Gradient accumulation: total_batch is reached by whole micro-batches.
+    if args.gpus == 0 {
+        return Err("--gpus must be >= 1".into());
+    }
+
+    // Gradient accumulation: the global total_batch is reached by whole
+    // micro-batches on every rank: grad_accum = total_batch / (gpus · micro).
     let micro = args.device_batch * args.sequence_len;
-    if !args.total_batch.is_multiple_of(micro) {
+    let per_step = args.gpus * micro;
+    if !args.total_batch.is_multiple_of(per_step) {
         return Err(format!(
-            "--total-batch ({}) must be a multiple of device_batch*seq_len ({micro})",
+            "--total-batch ({}) must be a multiple of gpus*device_batch*seq_len ({per_step})",
             args.total_batch
         )
         .into());
     }
-    let grad_accum = args.total_batch / micro;
+    let grad_accum = args.total_batch / per_step;
     if grad_accum == 0 {
         return Err(format!(
-            "--total-batch ({}) must be at least device_batch*seq_len ({micro})",
+            "--total-batch ({}) must be at least gpus*device_batch*seq_len ({per_step})",
             args.total_batch
         )
         .into());
@@ -253,17 +276,127 @@ fn unique_run_dir(root: &Path, id: &str) -> io::Result<PathBuf> {
     unreachable!("u32 run-dir suffixes exhausted")
 }
 
-fn run_pretrain(args: PretrainArgs) -> Result<(), Box<dyn std::error::Error>> {
+/// The `--gpus N` parent: generate the NCCL rendezvous id, re-execute this
+/// binary once per GPU with the rank identity in env vars, and supervise.
+fn run_launcher(args: &PretrainArgs) -> Result<(), Box<dyn std::error::Error>> {
+    // Fail fast on bad args before N processes get spawned to hit the same error.
+    validate_pretrain_args(args)?;
+    #[cfg(not(feature = "nccl"))]
+    {
+        Err(format!(
+            "--gpus {} needs multi-GPU support; rebuild with --features nccl",
+            args.gpus
+        )
+        .into())
+    }
+    #[cfg(feature = "nccl")]
+    {
+        let id_hex = dist::generate_nccl_id_hex()?;
+        let exe = std::env::current_exe()?;
+        let argv: Vec<String> = std::env::args().skip(1).collect();
+        println!("spawning {} ranks (one process per GPU)", args.gpus);
+        let mut children = Vec::with_capacity(args.gpus);
+        for rank in 0..args.gpus {
+            let child = process::Command::new(&exe)
+                .args(&argv)
+                .env(dist::ENV_RANK, rank.to_string())
+                .env(dist::ENV_WORLD_SIZE, args.gpus.to_string())
+                .env(dist::ENV_NCCL_ID, &id_hex)
+                .spawn()
+                .map_err(|e| format!("failed to spawn rank {rank}: {e}"))?;
+            children.push(child);
+        }
+        supervise_ranks(children)
+    }
+}
+
+/// Watchdog over the spawned ranks. Polls with `try_wait` so the *first*
+/// abnormal exit is noticed while the other ranks are still running — a dead
+/// NCCL peer leaves the survivors hung in a collective forever, so they are
+/// killed rather than awaited. (A sequential `wait()` loop cannot do this:
+/// blocked on rank 0, it would never notice rank 5 dying.)
+#[cfg(feature = "nccl")]
+fn supervise_ranks(mut children: Vec<process::Child>) -> Result<(), Box<dyn std::error::Error>> {
+    let n = children.len();
+    let mut running = n;
+    let mut exited = vec![false; n];
+    loop {
+        for i in 0..n {
+            if exited[i] {
+                continue;
+            }
+            let Some(status) = children[i].try_wait()? else {
+                continue;
+            };
+            exited[i] = true;
+            running -= 1;
+            if !status.success() {
+                for (j, child) in children.iter_mut().enumerate() {
+                    if !exited[j] {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    }
+                }
+                return Err(format!(
+                    "rank {i} exited abnormally ({status}); killed the other ranks"
+                )
+                .into());
+            }
+        }
+        if running == 0 {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+fn run_pretrain(
+    args: PretrainArgs,
+    child: Option<ChildEnv>,
+) -> Result<(), Box<dyn std::error::Error>> {
     validate_pretrain_args(&args)?;
 
-    let dist = DistCtx::single();
+    // Single process: today's device selection, no communicator. Spawned
+    // rank: bind to this rank's GPU and join the NCCL world (nccl builds
+    // only — the launcher refuses to spawn without the feature, so reaching
+    // here without it means hand-set env vars).
+    let (device, dist) = match child {
+        None => (default_device()?, DistCtx::single()),
+        #[cfg(feature = "nccl")]
+        Some(env) => {
+            if env.world_size != args.gpus {
+                return Err(format!(
+                    "{} ({}) disagrees with --gpus ({}); the env vars are launcher-internal",
+                    dist::ENV_WORLD_SIZE,
+                    env.world_size,
+                    args.gpus
+                )
+                .into());
+            }
+            let device = candle_core::Device::new_cuda(env.rank)?;
+            let dist = DistCtx::new_nccl(&device, &env)?;
+            (device, dist)
+        }
+        #[cfg(not(feature = "nccl"))]
+        Some(env) => {
+            return Err(format!(
+                "{} is set (rank {}) but this binary was built without the nccl feature",
+                dist::ENV_RANK,
+                env.rank
+            )
+            .into());
+        }
+    };
+
     let micro = args.device_batch * args.sequence_len;
-    let grad_accum = args.total_batch / micro;
+    let grad_accum = args.total_batch / (args.gpus * micro);
     let train_cfg = TrainConfig {
         num_iters: args.num_iters,
         grad_accum,
-        // total_batch = grad_accum · device_batch · sequence_len, validated above.
-        tokens_per_step: args.total_batch,
+        // Per-rank tokens: total_batch / gpus = grad_accum · device_batch ·
+        // sequence_len (divisibility validated above). The cross-rank Avg of
+        // the gradient reduce supplies the remaining 1/gpus factor.
+        tokens_per_step: args.total_batch / args.gpus,
         // The pretraining packer scores every token — no ignore_index targets.
         targets_may_be_ignored: false,
         lrs: GroupLrs {
@@ -291,8 +424,6 @@ fn run_pretrain(args: PretrainArgs) -> Result<(), Box<dyn std::error::Error>> {
     if dist.is_master() {
         print_config_summary(&config);
     }
-
-    let device = default_device()?;
 
     // Train docs stride by rank (disjoint per-GPU streams); the val split is
     // NOT strided — every rank snapshots the same batches and eval shards them.
@@ -326,8 +457,8 @@ fn run_pretrain(args: PretrainArgs) -> Result<(), Box<dyn std::error::Error>> {
             compute_dtype(&device)
         );
         println!(
-            "\ntraining: {} iters, total_batch {} tokens, device_batch {}, grad_accum {}",
-            args.num_iters, args.total_batch, args.device_batch, grad_accum
+            "\ntraining: {} iters, total_batch {} tokens, gpus {}, device_batch {}, grad_accum {}",
+            args.num_iters, args.total_batch, args.gpus, args.device_batch, grad_accum
         );
     }
     let started_at_unix = SystemTime::now()
@@ -358,8 +489,13 @@ fn run_pretrain(args: PretrainArgs) -> Result<(), Box<dyn std::error::Error>> {
             num_iters: args.num_iters,
             device_batch: args.device_batch,
             total_batch: args.total_batch,
+            world_size: args.gpus,
             grad_accum,
-            tokens_per_step: args.total_batch, // == grad_accum * device_batch * seq_len
+            // Global tokens per optimizer step (== total_batch ==
+            // world_size * grad_accum * device_batch * seq_len), so run.json
+            // stays comparable across GPU counts; TrainConfig's field is the
+            // per-rank share.
+            tokens_per_step: args.total_batch,
             embedding_lr: args.embedding_lr,
             unembedding_lr: args.unembedding_lr,
             matrix_lr: args.matrix_lr,
@@ -538,6 +674,7 @@ mod tests {
             num_iters: 5000,
             device_batch: 32,
             total_batch: 16384, // == device_batch * sequence_len => grad_accum 1
+            gpus: 1,
             embedding_lr: 0.2,
             unembedding_lr: 0.004,
             matrix_lr: 0.003,
@@ -607,6 +744,22 @@ mod tests {
     #[test]
     fn rejects_total_batch_not_multiple_of_micro() {
         rejects(|a| a.total_batch = 16384 + 1);
+    }
+
+    #[test]
+    fn rejects_zero_gpus() {
+        rejects(|a| a.gpus = 0);
+    }
+
+    #[test]
+    fn total_batch_divisibility_includes_gpus() {
+        // One micro-batch per rank per step is fine...
+        let mut a = valid_args();
+        a.gpus = 2;
+        a.total_batch = 2 * 16384;
+        assert!(validate_pretrain_args(&a).is_ok());
+        // ...but a total_batch only one rank's micro-batches can fill is not.
+        rejects(|a| a.gpus = 2); // total_batch stays 16384 = 1 * micro
     }
 
     #[test]

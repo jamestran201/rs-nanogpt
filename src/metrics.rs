@@ -25,7 +25,11 @@ pub struct RunMeta {
     pub num_iters: usize,
     pub device_batch: usize,
     pub total_batch: usize,
+    /// Data-parallel ranks (the CLI's `--gpus`); 1 for a single-process run.
+    pub world_size: usize,
     pub grad_accum: usize,
+    /// Global tokens per optimizer step (== `total_batch`), not the per-rank
+    /// share, so runs at different GPU counts stay comparable.
     pub tokens_per_step: usize,
     pub embedding_lr: f64,
     pub unembedding_lr: f64,
@@ -276,6 +280,7 @@ mod tests {
             num_iters: 5000,
             device_batch: 32,
             total_batch: 16384,
+            world_size: 1,
             grad_accum: 1,
             tokens_per_step: 16384,
             embedding_lr: 0.2,
@@ -294,6 +299,7 @@ mod tests {
         assert_eq!(v["dtype"], "f32");
         assert_eq!(v["n_params"], 12_345);
         assert_eq!(v["tokens_per_step"], 16384);
+        assert_eq!(v["world_size"], 1);
         // Git-commit provenance is intentionally out of scope for now.
         assert!(v.get("git_commit").is_none());
     }
