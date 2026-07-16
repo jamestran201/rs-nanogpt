@@ -302,8 +302,8 @@ fn run_pretrain(args: PretrainArgs) -> Result<(), Box<dyn std::error::Error>> {
         &tokenizer,
         args.device_batch,
         config.sequence_len,
-        dist.rank,
-        dist.world_size,
+        dist.rank(),
+        dist.world_size(),
     )?;
 
     let mut val_loader = DataLoader::open(

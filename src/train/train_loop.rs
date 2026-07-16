@@ -189,8 +189,8 @@ pub fn train(
                 model,
                 eval.val_batches,
                 eval.token_bytes,
-                dist.rank,
-                dist.world_size,
+                dist.rank(),
+                dist.world_size(),
             )?;
             let sums: [f64; 4] = dist
                 .all_reduce_sums(&local)?
