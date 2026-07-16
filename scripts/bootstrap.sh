@@ -61,5 +61,18 @@ export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
 EOF
 fi
 
+# --- NCCL (multi-GPU builds) ----------------------------------------------
+# The `nccl` cargo feature links libnccl dynamically at build AND run time.
+# Lambda's CUDA images ship it; warn (don't fail) if it's missing since
+# single-GPU builds don't need it.
+log "Checking for libnccl (needed only for --features nccl / --gpus > 1)"
+if ldconfig -p 2>/dev/null | grep -q libnccl; then
+  log "libnccl found"
+else
+  printf '    \033[1;33mWARNING:\033[0m libnccl not found. Multi-GPU builds (--features nccl) will fail.\n'
+  printf '    Install with: sudo apt-get install -y libnccl2 libnccl-dev\n'
+fi
+
 log "Bootstrap complete."
 printf '    Run \033[1msource ~/.bashrc\033[0m (or open a new shell), then \033[1mmake build-cuda\033[0m.\n'
+printf '    For multi-GPU boxes: \033[1mmake build-nccl\033[0m and pass \033[1m--gpus N\033[0m to pretrain.\n'

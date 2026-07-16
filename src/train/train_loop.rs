@@ -18,8 +18,11 @@ use crate::tokenizer::BpeTokenizer;
 pub struct TrainConfig {
     pub num_iters: usize,
     pub grad_accum: usize,
-    /// Tokens per optimizer step: `grad_accum · device_batch · sequence_len`
-    /// (the CLI's `--total-batch`). Asserted against real batch dims in the loop.
+    /// *Per-rank* tokens per optimizer step: `grad_accum · device_batch ·
+    /// sequence_len` (the CLI's `--total-batch` divided by `--gpus`). The
+    /// cross-rank gradient `Avg` supplies the remaining 1/world factor, so the
+    /// step gradient is the global per-token mean. Asserted against real batch
+    /// dims in the loop.
     pub tokens_per_step: usize,
     /// Enables the actual-valid-token grad rescale. Leave false when the data
     /// pipeline never emits `ignore_index` (all of pretraining): the fixed
@@ -167,6 +170,11 @@ pub fn train(
     // call order alone, so every per-var walk below uses this one list. The
     // local uses (accumulate/rescale/norm) are order-insensitive anyway.
     let vars: Vec<Var> = canonical_vars(varmap).into_iter().map(|(_, v)| v).collect();
+    // One-time init sync: every rank takes rank 0's random init, so replicas
+    // start identical without relying on cross-GPU RNG agreement. From then
+    // on the per-step gradient Avg plus deterministic AdamW keeps them
+    // identical. No-op in a world of 1.
+    dist.broadcast_vars(&vars)?;
     let mut min_val_bpb = f64::INFINITY;
 
     let t_start = Instant::now();
@@ -256,7 +264,8 @@ pub fn train(
             assert_eq!(
                 cfg.grad_accum * b * t,
                 cfg.tokens_per_step,
-                "batch shape ({b}, {t}) × grad_accum disagrees with cfg.tokens_per_step"
+                "batch shape ({b}, {t}) × grad_accum disagrees with cfg.tokens_per_step \
+                 (per-rank tokens: total_batch / world_size)"
             );
             let (grads, nll_sum, valid_count) =
                 micro_backward(model, &batch.inputs, &batch.targets, inv_expected_tokens)?;
@@ -276,9 +285,22 @@ pub fn train(
             // don't (f32 counts are exact to 2^24, and IEEE guarantees
             // N/N == 1); with the flag off that holds for every step, so the
             // whole rescale is skipped.
+            //
+            // Multi-GPU note: this rescale uses the *per-rank* count, so with
+            // ranks seeing different ignored-token counts the reduced result
+            // is an average of per-rank means, not the exact global per-token
+            // mean (that would need the count all-reduced with Sum first).
+            // Pretraining never ignores targets, so the flag stays false and
+            // the distinction is moot; revisit before enabling it under DDP.
             let scale = (&expected_tokens / &step_count)?;
             rescale_grads(&mut grads, &vars, &scale)?;
         }
+
+        // Cross-rank gradient averaging — the whole of DDP. Runs *every*
+        // step; the NaN-abort argument in the logging block below leans on
+        // that (a NaN on any rank spreads to all replicas through this Avg),
+        // so revisit decision 7 of the plan if it is ever made conditional.
+        dist.all_reduce_grads(&mut grads, &vars)?;
 
         let m = lr_mult(
             step,
@@ -291,9 +313,24 @@ pub fn train(
         opt.step(&grads)?;
         if logging {
             // True per-token CE over the step's valid tokens (a single global
-            // sum/count, not a mean of per-micro-batch means); one scalar read
-            // instead of the per-micro-batch reads a host-side sum would need.
-            let mean_ce = step_sum.broadcast_div(&step_count)?.to_scalar::<f32>()?;
+            // sum/count, not a mean of per-micro-batch means). The two scalars
+            // are Sum-reduced across ranks so the logged loss is the *global*
+            // mean and — since every rank now computes the identical value —
+            // the NaN abort below fires on all ranks together instead of
+            // leaving peers hung in the next collective. (A NaN born on one
+            // rank at a non-log step reaches every replica within one step
+            // via the gradient Avg above, so the abort lags by at most
+            // log_every steps.) Exactness: the per-rank f32 count is exact to
+            // 2^24 tokens and the reduce sums in f64, so the post-reduce
+            // count — *global* tokens per step — is exact for any plausible
+            // --total-batch. The final division stays in f32 to match the
+            // single-GPU path bit for bit at world 1.
+            let local = [
+                step_sum.to_scalar::<f32>()? as f64,
+                step_count.to_scalar::<f32>()? as f64,
+            ];
+            let global = dist.all_reduce_sums(&local)?;
+            let mean_ce = global[0] as f32 / global[1] as f32;
             check_finite(mean_ce, step)?;
 
             device.synchronize()?; // drain queued GPU work so the timing is real
@@ -310,7 +347,9 @@ pub fn train(
                 let rate = if steps_in_window > 0 {
                     let window_secs = now.duration_since(window_start_time).as_secs_f64();
                     let ms_per_step = 1000.0 * window_secs / steps_in_window as f64;
-                    let tok_s = (steps_in_window * cfg.tokens_per_step) as f64 / window_secs;
+                    // tokens_per_step is per-rank; report global throughput.
+                    let tok_s = (steps_in_window * cfg.tokens_per_step * dist.world_size()) as f64
+                        / window_secs;
                     let eta = fmt_hms(ms_per_step / 1000.0 * (cfg.num_iters - step) as f64);
                     println!(
                         "step {step:>6}/{} | loss {mean_ce:.4} | gnorm {gnorm:.3} \
