@@ -16,7 +16,7 @@
 //!
 //! See `writeups/flash-attention-plan.md` for the full design.
 
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use candle_core::{
     CpuStorage, CudaStorage, CustomOp3, D, DType, Layout, MetalStorage, Result, Shape, Storage,
@@ -26,7 +26,9 @@ use candle_core::{
 /// Query rows per chunk. Backward transient per chunk is ~4 concurrent
 /// `B·H·CHUNK·W` fp32 tensors, `W ≤ T` the chunk's causal prefix width; the
 /// last (widest) chunk at d24 (H=12, T=2048, B=16) peaks around ~0.8 GB.
-/// Raising this trades memory for fewer, larger kernel launches.
+/// Raising this trades memory for fewer, larger kernel launches; the
+/// `FLASH_CHUNK` env var overrides it at startup for benchmarking (see
+/// `flash_attention`).
 pub(crate) const FLASH_CHUNK: usize = 128;
 
 /// Forward pass, chunked over query rows.
@@ -223,7 +225,18 @@ pub(crate) fn flash_attention(
     mask: &Tensor,
     scale: f64,
 ) -> Result<Tensor> {
-    flash_attention_chunked(q, k, v, mask, scale, FLASH_CHUNK)
+    // Read once per process: lets chunk-size benchmarks run without a
+    // rebuild (`FLASH_CHUNK=256 ... pretrain ...`). Absent, unparsable, or
+    // zero values fall back to the compiled default.
+    static CHUNK: OnceLock<usize> = OnceLock::new();
+    let chunk = *CHUNK.get_or_init(|| {
+        std::env::var("FLASH_CHUNK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&c| c > 0)
+            .unwrap_or(FLASH_CHUNK)
+    });
+    flash_attention_chunked(q, k, v, mask, scale, chunk)
 }
 
 fn flash_attention_chunked(
