@@ -23,9 +23,10 @@ use candle_core::{
     Tensor, bail,
 };
 
-/// Query rows per chunk. Transient memory per chunk is `~4 × B·H·CHUNK·T` fp32
-/// in the backward; at d24 (H=12, T=2048, B=16) that is ~0.8 GB. Raising this
-/// trades memory for fewer kernel launches.
+/// Query rows per chunk. Backward transient per chunk is ~4 concurrent
+/// `B·H·CHUNK·W` fp32 tensors, `W ≤ T` the chunk's causal prefix width; the
+/// last (widest) chunk at d24 (H=12, T=2048, B=16) peaks around ~0.8 GB.
+/// Raising this trades memory for fewer, larger kernel launches.
 pub(crate) const FLASH_CHUNK: usize = 128;
 
 /// Forward pass, chunked over query rows.
@@ -72,8 +73,12 @@ fn flash_attn_fwd(
         // anyway, so skipping them changes nothing: the row max and sum-exp
         // (hence LSE and P) are bit-identical to the full-width versions,
         // while every matmul and elementwise pass shrinks ~2× on average.
-        let s = q_c.matmul(&k_t.narrow(3, 0, w)?)?.to_dtype(DType::F32)?;
-        let s = s.broadcast_add(&mask.narrow(0, c0, len)?.narrow(1, 0, w)?)?;
+        // One chain so the pre-mask scores drop at statement end instead of
+        // living (shadowed) to the end of the iteration.
+        let s = q_c
+            .matmul(&k_t.narrow(3, 0, w)?)?
+            .to_dtype(DType::F32)?
+            .broadcast_add(&mask.narrow(0, c0, len)?.narrow(1, 0, w)?)?;
 
         // Row-wise softmax factored so the exponentials are computed once:
         // E = exp(S − max) is the unnormalized softmax, LSE = log(ΣE) + max
@@ -86,6 +91,7 @@ fn flash_attn_fwd(
         // P = exp(S − LSE) from the stash, which is already one sub + exp.
         let m = s.max_keepdim(D::Minus1)?; // (B,H,len,1)
         let e = s.broadcast_sub(&m)?.exp()?; // (B,H,len,w)
+        drop(s); // dead once E exists; frees an S-sized chunk pre-matmul
         let se = e.sum_keepdim(D::Minus1)?; // (B,H,len,1)
         lse_chunks.push((se.log()? + &m)?.squeeze(D::Minus1)?); // (B,H,len)
 
@@ -147,14 +153,21 @@ fn flash_attn_bwd(
         let lse_c = lse.narrow(2, c0, len)?;
 
         // Reconstruct the chunk's softmax exactly as the forward computed it
-        // (same causal-prefix narrowing, same op sequence).
-        let s = q_c.matmul(&k_t.narrow(3, 0, w)?)?.to_dtype(DType::F32)?;
-        let s = s.broadcast_add(&mask.narrow(0, c0, len)?.narrow(1, 0, w)?)?;
+        // (same causal-prefix narrowing, same op sequence). One chain, and
+        // explicit drops below: several S-sized fp32 tensors coexist in this
+        // loop body, so freeing each at last use instead of iteration end
+        // trims the transient peak by a couple of ~chunk-sized tensors.
+        let s = q_c
+            .matmul(&k_t.narrow(3, 0, w)?)?
+            .to_dtype(DType::F32)?
+            .broadcast_add(&mask.narrow(0, c0, len)?.narrow(1, 0, w)?)?;
         let p = s.broadcast_sub(&lse_c.unsqueeze(D::Minus1)?)?.exp()?; // (B,H,len,w) fp32
+        drop(s);
 
         // dV_c = Pᵀ dO: (B,H,w,len) @ (B,H,len,hd).
         let p_dt = p.to_dtype(dtype)?;
         let dv_c = p_dt.transpose(2, 3)?.matmul(&do_c)?.to_dtype(DType::F32)?;
+        drop(p_dt);
         dv = Some(accum_prefix(dv, dv_c, c0, len)?);
 
         // dS = P ∘ (dP − D), fp32, unscaled (see the folding note above);
@@ -162,7 +175,8 @@ fn flash_attn_bwd(
         let dp = do_c.matmul(&v_t.narrow(3, 0, w)?)?.to_dtype(DType::F32)?; // (B,H,len,w)
         let d_c =
             (do_c.to_dtype(DType::F32)? * o_c.to_dtype(DType::F32)?)?.sum_keepdim(D::Minus1)?; // (B,H,len,1)
-        let ds = (p * dp.broadcast_sub(&d_c)?)?;
+        let ds = (p * dp.broadcast_sub(&d_c)?)?; // consumes p
+        drop(dp);
         let ds_dt = ds.to_dtype(dtype)?;
 
         // dQ_c = dS (scale·K): (B,H,len,w) @ (B,H,w,hd).
