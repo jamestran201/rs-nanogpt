@@ -49,6 +49,12 @@ fn flash_attn_fwd(
     // matmul accepts transposed and narrowed operands directly (uniform
     // batch stride, clean inner 2-D) — including the per-chunk causal-prefix
     // narrows below — so materializing them would only add device traffic.
+    //
+    // Score scale folded into Q once, outside the loop: S = (scale·Q)Kᵀ + M.
+    // One pass over the small Q replaces a full S-sized affine per chunk;
+    // the backward folds identically, keeping its reconstruction of S
+    // bit-for-bit aligned with this forward.
+    let q = q.affine(scale, 0.0)?;
     let k_t = k.transpose(2, 3)?; // (B,H,hd,T) view
     let mask = mask.to_dtype(DType::F32)?;
 
@@ -66,10 +72,7 @@ fn flash_attn_fwd(
         // anyway, so skipping them changes nothing: the row max and sum-exp
         // (hence LSE and P) are bit-identical to the full-width versions,
         // while every matmul and elementwise pass shrinks ~2× on average.
-        let s = q_c
-            .matmul(&k_t.narrow(3, 0, w)?)?
-            .to_dtype(DType::F32)?
-            .affine(scale, 0.0)?;
+        let s = q_c.matmul(&k_t.narrow(3, 0, w)?)?.to_dtype(DType::F32)?;
         let s = s.broadcast_add(&mask.narrow(0, c0, len)?.narrow(1, 0, w)?)?;
 
         // Row-wise softmax via the log-normalizer, so it can be stashed for
@@ -88,12 +91,14 @@ fn flash_attn_fwd(
 /// forward, reconstructing each chunk's softmax from the stashed `lse`.
 ///
 /// Per chunk `c`: `D_c = rowsum(dO_c ∘ O_c)` (the softmax-VJP correction),
-/// `dV += P_cᵀ dO_c`, `dP = dO_c Vᵀ`, `dS = P_c ∘ (dP − D_c)` and, with the
-/// score scale folded in once, `dQ_c = dS K` and `dK += dSᵀ q_c`. Everything
-/// key-sided is narrowed to the chunk's causal prefix, like the forward:
-/// beyond it `P = 0` hence `dS = 0`, so the skipped `dK`/`dV` columns are
-/// exact zeros. `dK`/`dV` accumulate in fp32 prefix accumulators that grow
-/// with the chunks (see `accum_prefix`); all grads return in the input dtype.
+/// `dV += P_cᵀ dO_c`, `dP = dO_c Vᵀ`, `dS = P_c ∘ (dP − D_c)` — unscaled;
+/// the score scale rides in the pre-scaled operands instead of on any
+/// S-sized tensor: `dQ_c = dS (scale·K)` and `dK += dSᵀ (scale·Q)_c`.
+/// Everything key-sided is narrowed to the chunk's causal prefix, like the
+/// forward: beyond it `P = 0` hence `dS = 0`, so the skipped `dK`/`dV`
+/// columns are exact zeros. `dK`/`dV` accumulate in fp32 prefix accumulators
+/// that grow with the chunks (see `accum_prefix`); all grads return in the
+/// input dtype.
 #[allow(clippy::too_many_arguments)]
 fn flash_attn_bwd(
     q: &Tensor,
@@ -109,7 +114,14 @@ fn flash_attn_bwd(
     let (_b, _h, t, _hd) = q.dims4()?;
     let dtype = q.dtype();
     // Strided views only — see the matching note in `flash_attn_fwd`.
-    let k_t = k.transpose(2, 3)?; // (B,H,hd,T) view
+    //
+    // Scale folding, mirroring the forward: S is rebuilt from q_s = scale·Q
+    // (bit-for-bit the forward's S), so dK = dSᵀ·q_s carries the scale via
+    // q_s and dQ = dS·k_s carries it via k_s = scale·K — dS itself stays
+    // unscaled, which is what deletes the per-chunk S-sized affine passes.
+    let q_s = q.affine(scale, 0.0)?;
+    let k_s = k.affine(scale, 0.0)?;
+    let k_t = k.transpose(2, 3)?; // (B,H,hd,T) view (unscaled; scale is in q_s)
     let v_t = v.transpose(2, 3)?; // (B,H,hd,T) view
     let mask = mask.to_dtype(DType::F32)?;
 
@@ -120,17 +132,14 @@ fn flash_attn_bwd(
     while c0 < t {
         let len = chunk.min(t - c0);
         let w = c0 + len; // causal prefix width, as in the forward
-        let q_c = q.narrow(2, c0, len)?; // (B,H,len,hd)
+        let q_c = q_s.narrow(2, c0, len)?; // (B,H,len,hd), pre-scaled
         let o_c = o.narrow(2, c0, len)?;
         let do_c = d_o.narrow(2, c0, len)?;
         let lse_c = lse.narrow(2, c0, len)?;
 
         // Reconstruct the chunk's softmax exactly as the forward computed it
         // (same causal-prefix narrowing, same op sequence).
-        let s = q_c
-            .matmul(&k_t.narrow(3, 0, w)?)?
-            .to_dtype(DType::F32)?
-            .affine(scale, 0.0)?;
+        let s = q_c.matmul(&k_t.narrow(3, 0, w)?)?.to_dtype(DType::F32)?;
         let s = s.broadcast_add(&mask.narrow(0, c0, len)?.narrow(1, 0, w)?)?;
         let p = s.broadcast_sub(&lse_c.unsqueeze(D::Minus1)?)?.exp()?; // (B,H,len,w) fp32
 
@@ -139,18 +148,17 @@ fn flash_attn_bwd(
         let dv_c = p_dt.transpose(2, 3)?.matmul(&do_c)?.to_dtype(DType::F32)?;
         dv = Some(accum_prefix(dv, dv_c, c0, len)?);
 
-        // dS = P ∘ (dP − D), fp32; masked columns have P = 0 so their
-        // gradient is exactly zero. Fold the score scale in here once — it
-        // then covers both dQ and dK.
+        // dS = P ∘ (dP − D), fp32, unscaled (see the folding note above);
+        // masked columns have P = 0 so their gradient is exactly zero.
         let dp = do_c.matmul(&v_t.narrow(3, 0, w)?)?.to_dtype(DType::F32)?; // (B,H,len,w)
         let d_c =
             (do_c.to_dtype(DType::F32)? * o_c.to_dtype(DType::F32)?)?.sum_keepdim(D::Minus1)?; // (B,H,len,1)
-        let ds = ((p * dp.broadcast_sub(&d_c)?)?).affine(scale, 0.0)?;
+        let ds = (p * dp.broadcast_sub(&d_c)?)?;
         let ds_dt = ds.to_dtype(dtype)?;
 
-        // dQ_c = dS K: (B,H,len,w) @ (B,H,w,hd).
-        dq_chunks.push(ds_dt.matmul(&k.narrow(2, 0, w)?)?);
-        // dK_c = dSᵀ q_c: (B,H,w,len) @ (B,H,len,hd).
+        // dQ_c = dS (scale·K): (B,H,len,w) @ (B,H,w,hd).
+        dq_chunks.push(ds_dt.matmul(&k_s.narrow(2, 0, w)?)?);
+        // dK_c = dSᵀ (scale·Q)_c: (B,H,w,len) @ (B,H,len,hd).
         let dk_c = ds_dt.transpose(2, 3)?.matmul(&q_c)?.to_dtype(DType::F32)?;
         dk = Some(accum_prefix(dk, dk_c, c0, len)?);
         c0 += len;
