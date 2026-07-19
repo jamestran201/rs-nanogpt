@@ -75,13 +75,22 @@ fn flash_attn_fwd(
         let s = q_c.matmul(&k_t.narrow(3, 0, w)?)?.to_dtype(DType::F32)?;
         let s = s.broadcast_add(&mask.narrow(0, c0, len)?.narrow(1, 0, w)?)?;
 
-        // Row-wise softmax via the log-normalizer, so it can be stashed for
-        // the backward: P = exp(S − LSE).
-        let lse = s.log_sum_exp(D::Minus1)?; // (B,H,len)
-        let p = s.broadcast_sub(&lse.unsqueeze(D::Minus1)?)?.exp()?;
+        // Row-wise softmax factored so the exponentials are computed once:
+        // E = exp(S − max) is the unnormalized softmax, LSE = log(ΣE) + max
+        // (value-identical to `log_sum_exp`, which is composed of these same
+        // ops but discards E, forcing a second sub + exp for P), and the ÷ΣE
+        // normalization lands on the (len, hd) output instead of the
+        // (len, w) score block. ΣE ≥ 1 — the row max is causally visible and
+        // contributes exp(0) — so the division is safe; it runs in fp32
+        // before the downcast. The backward is untouched: it reconstructs
+        // P = exp(S − LSE) from the stash, which is already one sub + exp.
+        let m = s.max_keepdim(D::Minus1)?; // (B,H,len,1)
+        let e = s.broadcast_sub(&m)?.exp()?; // (B,H,len,w)
+        let se = e.sum_keepdim(D::Minus1)?; // (B,H,len,1)
+        lse_chunks.push((se.log()? + &m)?.squeeze(D::Minus1)?); // (B,H,len)
 
-        o_chunks.push(p.to_dtype(dtype)?.matmul(&v.narrow(2, 0, w)?)?); // (B,H,len,hd)
-        lse_chunks.push(lse);
+        let o_raw = e.to_dtype(dtype)?.matmul(&v.narrow(2, 0, w)?)?; // (B,H,len,hd)
+        o_chunks.push(o_raw.to_dtype(DType::F32)?.broadcast_div(&se)?.to_dtype(dtype)?);
         c0 += len;
     }
     Ok((Tensor::cat(&o_chunks, 2)?, Tensor::cat(&lse_chunks, 2)?))
