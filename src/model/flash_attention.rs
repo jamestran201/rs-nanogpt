@@ -46,9 +46,9 @@ fn flash_attn_fwd(
     let (_b, _h, t, _hd) = q.dims4()?;
     let dtype = q.dtype();
     // Strided views only, no .contiguous() copies: on every backend candle's
-    // matmul accepts transposed and row-narrowed operands directly (uniform
-    // batch stride, clean inner 2-D), so materializing them would only add
-    // device write traffic.
+    // matmul accepts transposed and narrowed operands directly (uniform
+    // batch stride, clean inner 2-D) — including the per-chunk causal-prefix
+    // narrows below — so materializing them would only add device traffic.
     let k_t = k.transpose(2, 3)?; // (B,H,hd,T) view
     let mask = mask.to_dtype(DType::F32)?;
 
@@ -58,21 +58,26 @@ fn flash_attn_fwd(
     let mut c0 = 0;
     while c0 < t {
         let len = chunk.min(t - c0);
+        let w = c0 + len; // rows [c0, c0+len) attend keys [0, w) only
         let q_c = q.narrow(2, c0, len)?; // (B,H,len,hd)
 
-        // Masked scores for this row block, fp32: (B,H,len,T). Full key width
-        // for simplicity — masked columns softmax to exact zeros. Narrowing K
-        // to the causal prefix per chunk (as the fused kernels do) would
-        // halve the score compute and is a possible follow-up.
-        let s = q_c.matmul(&k_t)?.to_dtype(DType::F32)?.affine(scale, 0.0)?;
-        let s = s.broadcast_add(&mask.narrow(0, c0, len)?)?;
+        // Masked scores for this row block, fp32: (B,H,len,w) — narrowed to
+        // the causal key prefix. Keys ≥ w would be masked to exp(-inf) = 0
+        // anyway, so skipping them changes nothing: the row max and sum-exp
+        // (hence LSE and P) are bit-identical to the full-width versions,
+        // while every matmul and elementwise pass shrinks ~2× on average.
+        let s = q_c
+            .matmul(&k_t.narrow(3, 0, w)?)?
+            .to_dtype(DType::F32)?
+            .affine(scale, 0.0)?;
+        let s = s.broadcast_add(&mask.narrow(0, c0, len)?.narrow(1, 0, w)?)?;
 
         // Row-wise softmax via the log-normalizer, so it can be stashed for
         // the backward: P = exp(S − LSE).
         let lse = s.log_sum_exp(D::Minus1)?; // (B,H,len)
         let p = s.broadcast_sub(&lse.unsqueeze(D::Minus1)?)?.exp()?;
 
-        o_chunks.push(p.to_dtype(dtype)?.matmul(v)?); // (B,H,len,hd)
+        o_chunks.push(p.to_dtype(dtype)?.matmul(&v.narrow(2, 0, w)?)?); // (B,H,len,hd)
         lse_chunks.push(lse);
         c0 += len;
     }
@@ -84,8 +89,11 @@ fn flash_attn_fwd(
 ///
 /// Per chunk `c`: `D_c = rowsum(dO_c ∘ O_c)` (the softmax-VJP correction),
 /// `dV += P_cᵀ dO_c`, `dP = dO_c Vᵀ`, `dS = P_c ∘ (dP − D_c)` and, with the
-/// score scale folded in once, `dQ_c = dS K` and `dK += dSᵀ q_c`. `dK`/`dV`
-/// accumulate in fp32 across chunks; all grads return in the input dtype.
+/// score scale folded in once, `dQ_c = dS K` and `dK += dSᵀ q_c`. Everything
+/// key-sided is narrowed to the chunk's causal prefix, like the forward:
+/// beyond it `P = 0` hence `dS = 0`, so the skipped `dK`/`dV` columns are
+/// exact zeros. `dK`/`dV` accumulate in fp32 prefix accumulators that grow
+/// with the chunks (see `accum_prefix`); all grads return in the input dtype.
 #[allow(clippy::too_many_arguments)]
 fn flash_attn_bwd(
     q: &Tensor,
@@ -98,7 +106,7 @@ fn flash_attn_bwd(
     scale: f64,
     chunk: usize,
 ) -> Result<(Tensor, Tensor, Tensor)> {
-    let (b, h, t, hd) = q.dims4()?;
+    let (_b, _h, t, _hd) = q.dims4()?;
     let dtype = q.dtype();
     // Strided views only — see the matching note in `flash_attn_fwd`.
     let k_t = k.transpose(2, 3)?; // (B,H,hd,T) view
@@ -106,47 +114,69 @@ fn flash_attn_bwd(
     let mask = mask.to_dtype(DType::F32)?;
 
     let mut dq_chunks = Vec::with_capacity(t.div_ceil(chunk));
-    let mut dk = Tensor::zeros((b, h, t, hd), DType::F32, q.device())?;
-    let mut dv = Tensor::zeros((b, h, t, hd), DType::F32, q.device())?;
+    let mut dk: Option<Tensor> = None; // fp32, width = the last chunk's prefix
+    let mut dv: Option<Tensor> = None;
     let mut c0 = 0;
     while c0 < t {
         let len = chunk.min(t - c0);
+        let w = c0 + len; // causal prefix width, as in the forward
         let q_c = q.narrow(2, c0, len)?; // (B,H,len,hd)
         let o_c = o.narrow(2, c0, len)?;
         let do_c = d_o.narrow(2, c0, len)?;
         let lse_c = lse.narrow(2, c0, len)?;
 
-        // Reconstruct the chunk's softmax exactly as the forward computed it.
-        let s = q_c.matmul(&k_t)?.to_dtype(DType::F32)?.affine(scale, 0.0)?;
-        let s = s.broadcast_add(&mask.narrow(0, c0, len)?)?;
-        let p = s.broadcast_sub(&lse_c.unsqueeze(D::Minus1)?)?.exp()?; // (B,H,len,T) fp32
+        // Reconstruct the chunk's softmax exactly as the forward computed it
+        // (same causal-prefix narrowing, same op sequence).
+        let s = q_c
+            .matmul(&k_t.narrow(3, 0, w)?)?
+            .to_dtype(DType::F32)?
+            .affine(scale, 0.0)?;
+        let s = s.broadcast_add(&mask.narrow(0, c0, len)?.narrow(1, 0, w)?)?;
+        let p = s.broadcast_sub(&lse_c.unsqueeze(D::Minus1)?)?.exp()?; // (B,H,len,w) fp32
 
-        // dV += Pᵀ dO: (B,H,T,len) @ (B,H,len,hd).
+        // dV_c = Pᵀ dO: (B,H,w,len) @ (B,H,len,hd).
         let p_dt = p.to_dtype(dtype)?;
-        let dv_c = p_dt.transpose(2, 3)?.matmul(&do_c)?;
-        dv = (dv + dv_c.to_dtype(DType::F32)?)?;
+        let dv_c = p_dt.transpose(2, 3)?.matmul(&do_c)?.to_dtype(DType::F32)?;
+        dv = Some(accum_prefix(dv, dv_c, c0, len)?);
 
         // dS = P ∘ (dP − D), fp32; masked columns have P = 0 so their
         // gradient is exactly zero. Fold the score scale in here once — it
         // then covers both dQ and dK.
-        let dp = do_c.matmul(&v_t)?.to_dtype(DType::F32)?; // (B,H,len,T)
+        let dp = do_c.matmul(&v_t.narrow(3, 0, w)?)?.to_dtype(DType::F32)?; // (B,H,len,w)
         let d_c =
             (do_c.to_dtype(DType::F32)? * o_c.to_dtype(DType::F32)?)?.sum_keepdim(D::Minus1)?; // (B,H,len,1)
         let ds = ((p * dp.broadcast_sub(&d_c)?)?).affine(scale, 0.0)?;
         let ds_dt = ds.to_dtype(dtype)?;
 
-        // dQ_c = dS K: (B,H,len,T) @ (B,H,T,hd).
-        dq_chunks.push(ds_dt.matmul(k)?);
-        // dK += dSᵀ q_c: (B,H,T,len) @ (B,H,len,hd).
-        let dk_c = ds_dt.transpose(2, 3)?.matmul(&q_c)?;
-        dk = (dk + dk_c.to_dtype(DType::F32)?)?;
+        // dQ_c = dS K: (B,H,len,w) @ (B,H,w,hd).
+        dq_chunks.push(ds_dt.matmul(&k.narrow(2, 0, w)?)?);
+        // dK_c = dSᵀ q_c: (B,H,w,len) @ (B,H,len,hd).
+        let dk_c = ds_dt.transpose(2, 3)?.matmul(&q_c)?.to_dtype(DType::F32)?;
+        dk = Some(accum_prefix(dk, dk_c, c0, len)?);
         c0 += len;
     }
+    let dk = dk.expect("t >= 1 guarantees at least one chunk");
+    let dv = dv.expect("t >= 1 guarantees at least one chunk");
     Ok((
         Tensor::cat(&dq_chunks, 2)?,
         dk.to_dtype(dtype)?,
         dv.to_dtype(dtype)?,
     ))
+}
+
+/// Fold one chunk's fp32 `(B,H,w,hd)` dK/dV contribution into the growing
+/// prefix accumulator. Chunks arrive in increasing width and the previous
+/// accumulator's width is always exactly `c0` (chunks advance by `len`), so
+/// the contribution splits into an overlap `[0, c0)` added into the prefix
+/// and the new diagonal-block columns `[c0, c0+len)` appended after it.
+fn accum_prefix(acc: Option<Tensor>, contrib: Tensor, c0: usize, len: usize) -> Result<Tensor> {
+    match acc {
+        None => Ok(contrib),
+        Some(prev) => Tensor::cat(
+            &[(prev + contrib.narrow(2, 0, c0)?)?, contrib.narrow(2, c0, len)?],
+            2,
+        ),
+    }
 }
 
 /// Flash attention as a single autograd node: `(q, k, v) → O` with the
@@ -329,13 +359,15 @@ mod tests {
 
     #[test]
     fn fwd_matches_naive_across_shapes() -> Result<()> {
-        // (b, h, t, hd, chunk): divisible, ragged, t < chunk, t = 1, chunk = 1.
+        // (b, h, t, hd, chunk): divisible, ragged, t < chunk, t = 1,
+        // chunk = 1, many chunks with a ragged tail.
         for (b, h, t, hd, chunk) in [
             (2, 3, 16, 4, 8),
             (1, 2, 7, 4, 5),
             (1, 1, 3, 4, 128),
             (1, 1, 1, 4, 128),
             (1, 2, 4, 4, 1),
+            (2, 2, 19, 4, 4),
         ] {
             let (q, k, v, mask) = qkv_mask(b, h, t, hd)?;
             let scale = 1.0 / (hd as f64).sqrt();
@@ -463,7 +495,12 @@ mod tests {
     fn bwd_matches_autograd_through_naive() -> Result<()> {
         // Reference grads: autograd through the naive path with
         // loss = sum(out ∘ w), whose gradient w.r.t. out is exactly w.
-        for (b, h, t, hd, chunk) in [(2, 2, 8, 4, 3), (1, 2, 7, 4, 5), (1, 1, 1, 4, 2)] {
+        for (b, h, t, hd, chunk) in [
+            (2, 2, 8, 4, 3),
+            (1, 2, 7, 4, 5),
+            (1, 1, 1, 4, 2),
+            (2, 2, 19, 4, 4),
+        ] {
             let dev = Device::Cpu;
             let (q0, k0, v0, mask) = qkv_mask(b, h, t, hd)?;
             let scale = 1.0 / (hd as f64).sqrt();
