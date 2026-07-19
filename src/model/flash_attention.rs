@@ -98,7 +98,12 @@ fn flash_attn_fwd(
         lse_chunks.push((se.log()? + &m)?.squeeze(D::Minus1)?); // (B,H,len)
 
         let o_raw = e.to_dtype(dtype)?.matmul(&v.narrow(2, 0, w)?)?; // (B,H,len,hd)
-        o_chunks.push(o_raw.to_dtype(DType::F32)?.broadcast_div(&se)?.to_dtype(dtype)?);
+        o_chunks.push(
+            o_raw
+                .to_dtype(DType::F32)?
+                .broadcast_div(&se)?
+                .to_dtype(dtype)?,
+        );
         c0 += len;
     }
     Ok((Tensor::cat(&o_chunks, 2)?, Tensor::cat(&lse_chunks, 2)?))
@@ -206,7 +211,10 @@ fn accum_prefix(acc: Option<Tensor>, contrib: Tensor, c0: usize, len: usize) -> 
     match acc {
         None => Ok(contrib),
         Some(prev) => Tensor::cat(
-            &[(prev + contrib.narrow(2, 0, c0)?)?, contrib.narrow(2, c0, len)?],
+            &[
+                (prev + contrib.narrow(2, 0, c0)?)?,
+                contrib.narrow(2, c0, len)?,
+            ],
             2,
         ),
     }
