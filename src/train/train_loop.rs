@@ -360,7 +360,12 @@ mod tests {
     /// (relative tol — f32 sum reassociation, not a real mismatch), or absent
     /// in both stores; a one-sided presence means the two paths disagree on
     /// which params received gradient. Returns how many params were compared.
-    fn compare_grads(want: &GradStore, got: &GradStore, vars: &[Var], label: &str) -> Result<usize> {
+    fn compare_grads(
+        want: &GradStore,
+        got: &GradStore,
+        vars: &[Var],
+        label: &str,
+    ) -> Result<usize> {
         let mut compared = 0;
         for v in vars {
             let t = v.as_tensor();

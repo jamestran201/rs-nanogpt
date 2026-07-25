@@ -28,12 +28,7 @@ pub struct Block {
 impl Block {
     /// `rope`/`causal_mask` are shared from `Gpt::new`; the clones taken here
     /// are cheap handles.
-    pub fn new(
-        cfg: &GptConfig,
-        vb: VarBuilder,
-        rope: &Rope,
-        causal_mask: &Tensor,
-    ) -> Result<Self> {
+    pub fn new(cfg: &GptConfig, vb: VarBuilder, rope: &Rope, causal_mask: &Tensor) -> Result<Self> {
         let attn = CausalSelfAttention::new(cfg, vb.pp("attn"), rope, causal_mask)?;
         let mlp = Mlp::new(cfg, vb.pp("mlp"))?;
         Ok(Self {

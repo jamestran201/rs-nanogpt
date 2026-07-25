@@ -30,12 +30,7 @@ pub struct CausalSelfAttention {
 }
 
 impl CausalSelfAttention {
-    pub fn new(
-        cfg: &GptConfig,
-        vb: VarBuilder,
-        rope: &Rope,
-        causal_mask: &Tensor,
-    ) -> Result<Self> {
+    pub fn new(cfg: &GptConfig, vb: VarBuilder, rope: &Rope, causal_mask: &Tensor) -> Result<Self> {
         let c = cfg.n_embd;
         let s = (3.0 / cfg.n_embd as f64).sqrt();
         let c_q = Linear::uniform(c, c, s, vb.pp("c_q"))?;
