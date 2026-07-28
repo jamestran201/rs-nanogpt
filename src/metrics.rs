@@ -25,7 +25,11 @@ pub struct RunMeta {
     pub num_iters: usize,
     pub device_batch: usize,
     pub total_batch: usize,
+    /// Data-parallel ranks (the CLI's `--gpus`); 1 for a single-process run.
+    pub world_size: usize,
     pub grad_accum: usize,
+    /// Global tokens per optimizer step (== `total_batch`), not the per-rank
+    /// share, so runs at different GPU counts stay comparable.
     pub tokens_per_step: usize,
     pub embedding_lr: f64,
     pub unembedding_lr: f64,
@@ -127,7 +131,7 @@ impl MetricRecord {
 /// once to stderr and every failure is otherwise swallowed, so a lost metrics line
 /// never aborts training.
 pub struct MetricsLogger {
-    sink: RefCell<BufWriter<File>>,
+    sink: Option<RefCell<BufWriter<File>>>,
     warned: Cell<bool>,
 }
 
@@ -137,9 +141,19 @@ impl MetricsLogger {
             std::fs::create_dir_all(dir)?;
         }
         Ok(Self {
-            sink: RefCell::new(BufWriter::new(File::create(path)?)),
+            sink: Some(RefCell::new(BufWriter::new(File::create(path)?))),
             warned: Cell::new(false),
         })
+    }
+
+    /// A no-op sink that discards every record. Non-master ranks in a
+    /// multi-GPU run use this so `EvalContext` keeps its shape while only
+    /// rank 0 writes metrics.jsonl.
+    pub fn null() -> Self {
+        Self {
+            sink: None,
+            warned: Cell::new(false),
+        }
     }
 
     pub fn log(&self, rec: &MetricRecord) {
@@ -151,8 +165,11 @@ impl MetricsLogger {
     }
 
     fn try_log(&self, rec: &MetricRecord) -> std::io::Result<()> {
+        let Some(sink) = &self.sink else {
+            return Ok(()); // null logger: silently discard
+        };
         let line = serde_json::to_string(rec).map_err(std::io::Error::other)?;
-        let mut w = self.sink.borrow_mut();
+        let mut w = sink.borrow_mut();
         w.write_all(line.as_bytes())?;
         w.write_all(b"\n")?;
         // Flush per line so a killed run keeps everything logged so far.
@@ -217,6 +234,14 @@ mod tests {
     }
 
     #[test]
+    fn null_logger_discards_records_without_error() {
+        let logger = MetricsLogger::null();
+        logger.log(&MetricRecord::eval(1, 0.5, 3.0, 1.2));
+        // Nothing observable to assert beyond "no panic, no warning state".
+        assert!(!logger.warned.get());
+    }
+
+    #[test]
     fn train_record_omits_rate_fields_when_none() {
         let rec = MetricRecord::train(
             0,
@@ -255,6 +280,7 @@ mod tests {
             num_iters: 5000,
             device_batch: 32,
             total_batch: 16384,
+            world_size: 1,
             grad_accum: 1,
             tokens_per_step: 16384,
             embedding_lr: 0.2,
@@ -273,6 +299,7 @@ mod tests {
         assert_eq!(v["dtype"], "f32");
         assert_eq!(v["n_params"], 12_345);
         assert_eq!(v["tokens_per_step"], 16384);
+        assert_eq!(v["world_size"], 1);
         // Git-commit provenance is intentionally out of scope for now.
         assert!(v.get("git_commit").is_none());
     }

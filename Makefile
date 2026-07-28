@@ -1,6 +1,6 @@
 ARG ?= default-value
 
-.PHONY: bootstrap build-cpu build-cuda build-metal covhtml covlcov lint bench memprofile
+.PHONY: bootstrap build-cpu build-cuda build-nccl build-metal covhtml covlcov lint bench memprofile
 
 # Provision a fresh Lambda Labs GPU box: system deps, Rust, and CUDA env vars.
 # Idempotent; run `source ~/.bashrc` afterward to pick up the CUDA env.
@@ -16,6 +16,11 @@ build-cpu:
 # GPU arch, set CUDA_COMPUTE_CAP (e.g. 80=A100, 89=L4/4090, 90=H100).
 build-cuda:
 	cargo build --release --features cuda
+
+# CUDA build with multi-GPU data parallelism (pretrain --gpus N).
+# Additionally needs libnccl at build and run time (bootstrap.sh checks).
+build-nccl:
+	cargo build --release --features nccl
 
 # Release binary for Apple GPUs (Metal), for Mac dev/debug runs.
 build-metal:

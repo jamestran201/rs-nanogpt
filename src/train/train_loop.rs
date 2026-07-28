@@ -5,10 +5,11 @@ use candle_core::backprop::GradStore;
 use candle_core::{DType, Device, Result, Tensor, Var};
 use candle_nn::VarMap;
 
+use super::dist::{DistCtx, canonical_vars};
 use super::{GroupLrs, GroupedAdamW, lr_mult};
 use crate::checkpoint::{self, CheckpointMeta};
 use crate::data::{Batch, DataLoader};
-use crate::eval::{evaluate, generate};
+use crate::eval::{BpbAccumulator, evaluate_shard_sums, generate};
 use crate::metrics::{MetricRecord, MetricsLogger, Throughput};
 use crate::model::{Gpt, cross_entropy_sum_count};
 use crate::tokenizer::BpeTokenizer;
@@ -17,8 +18,11 @@ use crate::tokenizer::BpeTokenizer;
 pub struct TrainConfig {
     pub num_iters: usize,
     pub grad_accum: usize,
-    /// Tokens per optimizer step: `grad_accum · device_batch · sequence_len`
-    /// (the CLI's `--total-batch`). Asserted against real batch dims in the loop.
+    /// *Per-rank* tokens per optimizer step: `grad_accum · device_batch ·
+    /// sequence_len` (the CLI's `--total-batch` divided by `--gpus`). The
+    /// cross-rank gradient `Avg` supplies the remaining 1/world factor, so the
+    /// step gradient is the global per-token mean. Asserted against real batch
+    /// dims in the loop.
     pub tokens_per_step: usize,
     /// Enables the actual-valid-token grad rescale. Leave false when the data
     /// pipeline never emits `ignore_index` (all of pretraining): the fixed
@@ -158,10 +162,19 @@ pub fn train(
     loader: &mut DataLoader,
     cfg: &TrainConfig,
     eval: &EvalContext,
+    dist: &DistCtx,
     device: &Device,
 ) -> Result<()> {
     let mut opt = GroupedAdamW::new(varmap, cfg.lrs, model.config().n_embd)?;
-    let vars = varmap.all_vars();
+    // Canonical (name-sorted) order: NCCL matches collectives across ranks by
+    // call order alone, so every per-var walk below uses this one list. The
+    // local uses (accumulate/rescale/norm) are order-insensitive anyway.
+    let vars: Vec<Var> = canonical_vars(varmap).into_iter().map(|(_, v)| v).collect();
+    // One-time init sync: every rank takes rank 0's random init, so replicas
+    // start identical without relying on cross-GPU RNG agreement. From then
+    // on the per-step gradient Avg plus deterministic AdamW keeps them
+    // identical. No-op in a world of 1.
+    dist.broadcast_vars(&vars)?;
     let mut min_val_bpb = f64::INFINITY;
 
     let t_start = Instant::now();
@@ -177,32 +190,52 @@ pub fn train(
         let last = step == cfg.num_iters;
 
         if cadence_fires(step, cfg.num_iters, eval.eval_every) {
-            let m = evaluate(model, eval.val_batches, eval.token_bytes)?;
-            println!(
-                "step {step:>6}  val_loss {:.4}  bpb {:.4}",
-                m.val_loss, m.bpb
-            );
-            eval.metrics.log(&MetricRecord::eval(
-                step,
-                t_start.elapsed().as_secs_f64(),
-                m.val_loss,
-                m.bpb,
-            ));
+            // Every rank scores its 1/world slice of the shared val snapshot;
+            // the reduced sums give all ranks the identical metrics (which
+            // keeps the best-bpb control flow below in lockstep for free).
+            let local = evaluate_shard_sums(
+                model,
+                eval.val_batches,
+                eval.token_bytes,
+                dist.rank(),
+                dist.world_size(),
+            )?;
+            let sums: [f64; 4] = dist
+                .all_reduce_sums(&local)?
+                .try_into()
+                .expect("all_reduce_sums preserves length");
+            let m = BpbAccumulator::metrics_from_sums(sums);
+            if dist.is_master() {
+                println!(
+                    "step {step:>6}  val_loss {:.4}  bpb {:.4}",
+                    m.val_loss, m.bpb
+                );
+                eval.metrics.log(&MetricRecord::eval(
+                    step,
+                    t_start.elapsed().as_secs_f64(),
+                    m.val_loss,
+                    m.bpb,
+                ));
+            }
+            // Every rank tracks the best bpb (identical value everywhere, so
+            // control flow stays in lockstep); only master writes the files.
             if m.bpb < min_val_bpb {
                 min_val_bpb = m.bpb;
-                checkpoint::save(
-                    &eval.ckpt_root.join("best"),
-                    varmap,
-                    &CheckpointMeta {
-                        config: *model.config(),
-                        step,
-                        val_bpb: m.bpb,
-                    },
-                )?;
+                if dist.is_master() {
+                    checkpoint::save(
+                        &eval.ckpt_root.join("best"),
+                        varmap,
+                        &CheckpointMeta {
+                            config: *model.config(),
+                            step,
+                            val_bpb: m.bpb,
+                        },
+                    )?;
+                }
             }
         }
 
-        if cadence_fires(step, cfg.num_iters, eval.sample_every) {
+        if dist.is_master() && cadence_fires(step, cfg.num_iters, eval.sample_every) {
             for p in SAMPLE_PROMPTS {
                 let s = generate(
                     model,
@@ -231,7 +264,8 @@ pub fn train(
             assert_eq!(
                 cfg.grad_accum * b * t,
                 cfg.tokens_per_step,
-                "batch shape ({b}, {t}) × grad_accum disagrees with cfg.tokens_per_step"
+                "batch shape ({b}, {t}) × grad_accum disagrees with cfg.tokens_per_step \
+                 (per-rank tokens: total_batch / world_size)"
             );
             let (grads, nll_sum, valid_count) =
                 micro_backward(model, &batch.inputs, &batch.targets, inv_expected_tokens)?;
@@ -251,9 +285,22 @@ pub fn train(
             // don't (f32 counts are exact to 2^24, and IEEE guarantees
             // N/N == 1); with the flag off that holds for every step, so the
             // whole rescale is skipped.
+            //
+            // Multi-GPU note: this rescale uses the *per-rank* count, so with
+            // ranks seeing different ignored-token counts the reduced result
+            // is an average of per-rank means, not the exact global per-token
+            // mean (that would need the count all-reduced with Sum first).
+            // Pretraining never ignores targets, so the flag stays false and
+            // the distinction is moot; revisit before enabling it under DDP.
             let scale = (&expected_tokens / &step_count)?;
             rescale_grads(&mut grads, &vars, &scale)?;
         }
+
+        // Cross-rank gradient averaging — the whole of DDP. Runs *every*
+        // step; the NaN-abort argument in the logging block below leans on
+        // that (a NaN on any rank spreads to all replicas through this Avg),
+        // so revisit decision 7 of the plan if it is ever made conditional.
+        dist.all_reduce_grads(&mut grads, &vars)?;
 
         let m = lr_mult(
             step,
@@ -266,46 +313,67 @@ pub fn train(
         opt.step(&grads)?;
         if logging {
             // True per-token CE over the step's valid tokens (a single global
-            // sum/count, not a mean of per-micro-batch means); one scalar read
-            // instead of the per-micro-batch reads a host-side sum would need.
-            let mean_ce = step_sum.broadcast_div(&step_count)?.to_scalar::<f32>()?;
+            // sum/count, not a mean of per-micro-batch means). The two scalars
+            // are Sum-reduced across ranks so the logged loss is the *global*
+            // mean and — since every rank now computes the identical value —
+            // the NaN abort below fires on all ranks together instead of
+            // leaving peers hung in the next collective. (A NaN born on one
+            // rank at a non-log step reaches every replica within one step
+            // via the gradient Avg above, so the abort lags by at most
+            // log_every steps.) Exactness: the per-rank f32 count is exact to
+            // 2^24 tokens and the reduce sums in f64, so the post-reduce
+            // count — *global* tokens per step — is exact for any plausible
+            // --total-batch. The final division stays in f32 to match the
+            // single-GPU path bit for bit at world 1.
+            let local = [
+                step_sum.to_scalar::<f32>()? as f64,
+                step_count.to_scalar::<f32>()? as f64,
+            ];
+            let global = dist.all_reduce_sums(&local)?;
+            let mean_ce = global[0] as f32 / global[1] as f32;
             check_finite(mean_ce, step)?;
 
             device.synchronize()?; // drain queued GPU work so the timing is real
             let now = Instant::now();
-            let lrs = opt.current_lrs();
-            let gnorm = grad_global_norm(&grads, &vars)?;
-            let steps_in_window = step - window_start_step; // 0 only at the step-0 log
-            let elapsed_s = now.duration_since(t_start).as_secs_f64();
-            let elapsed = fmt_hms(elapsed_s);
+            if dist.is_master() {
+                // Post-reduce the gradients are identical on every rank, so
+                // the norm is too: compute and log it on master only.
+                let lrs = opt.current_lrs();
+                let gnorm = grad_global_norm(&grads, &vars)?;
+                let steps_in_window = step - window_start_step; // 0 only at the step-0 log
+                let elapsed_s = now.duration_since(t_start).as_secs_f64();
+                let elapsed = fmt_hms(elapsed_s);
 
-            let rate = if steps_in_window > 0 {
-                let window_secs = now.duration_since(window_start_time).as_secs_f64();
-                let ms_per_step = 1000.0 * window_secs / steps_in_window as f64;
-                let tok_s = (steps_in_window * cfg.tokens_per_step) as f64 / window_secs;
-                let eta = fmt_hms(ms_per_step / 1000.0 * (cfg.num_iters - step) as f64);
-                println!(
-                    "step {step:>6}/{} | loss {mean_ce:.4} | gnorm {gnorm:.3} \
-                     | lr m={:.2e} e={:.2e} u={:.2e} \
-                     | {tok_s:.0} tok/s | {ms_per_step:.0} ms/step | t+{elapsed} | eta {eta}",
-                    cfg.num_iters, lrs.matrix, lrs.embedding, lrs.unembedding,
-                );
-                Some(Throughput {
-                    tok_per_s: tok_s,
-                    ms_per_step,
-                })
-            } else {
-                // step-0 window has no elapsed steps yet: baseline loss only.
-                println!(
-                    "step {step:>6}/{} | loss {mean_ce:.4} | gnorm {gnorm:.3} | t+{elapsed}",
-                    cfg.num_iters
-                );
-                None
-            };
+                let rate = if steps_in_window > 0 {
+                    let window_secs = now.duration_since(window_start_time).as_secs_f64();
+                    let ms_per_step = 1000.0 * window_secs / steps_in_window as f64;
+                    // tokens_per_step is per-rank; report global throughput.
+                    let tok_s = (steps_in_window * cfg.tokens_per_step * dist.world_size()) as f64
+                        / window_secs;
+                    let eta = fmt_hms(ms_per_step / 1000.0 * (cfg.num_iters - step) as f64);
+                    println!(
+                        "step {step:>6}/{} | loss {mean_ce:.4} | gnorm {gnorm:.3} \
+                         | lr m={:.2e} e={:.2e} u={:.2e} \
+                         | {tok_s:.0} tok/s | {ms_per_step:.0} ms/step | t+{elapsed} | eta {eta}",
+                        cfg.num_iters, lrs.matrix, lrs.embedding, lrs.unembedding,
+                    );
+                    Some(Throughput {
+                        tok_per_s: tok_s,
+                        ms_per_step,
+                    })
+                } else {
+                    // step-0 window has no elapsed steps yet: baseline loss only.
+                    println!(
+                        "step {step:>6}/{} | loss {mean_ce:.4} | gnorm {gnorm:.3} | t+{elapsed}",
+                        cfg.num_iters
+                    );
+                    None
+                };
 
-            eval.metrics.log(&MetricRecord::train(
-                step, elapsed_s, mean_ce, gnorm, lrs, rate,
-            ));
+                eval.metrics.log(&MetricRecord::train(
+                    step, elapsed_s, mean_ce, gnorm, lrs, rate,
+                ));
+            }
 
             window_start_time = now;
             window_start_step = step;
@@ -715,7 +783,15 @@ mod tests {
             sample_temperature: 0.0,
         };
 
-        train(&model, &vm, &mut train_loader, &tcfg, &eval, &dev)?;
+        train(
+            &model,
+            &vm,
+            &mut train_loader,
+            &tcfg,
+            &eval,
+            &DistCtx::single(),
+            &dev,
+        )?;
 
         // Telemetry landed: at least the step-0 train record plus eval records.
         let metrics_len = std::fs::metadata(out.path().join("metrics.jsonl"))
@@ -730,7 +806,7 @@ mod tests {
         // loaded weights reproduces the stored bpb bit-for-bit (identical f32
         // forward + f64 accumulation over an exact safetensors round-trip).
         let (loaded, _vm, meta) = checkpoint::load(&out.path().join("best"), &dev)?;
-        let rescored = evaluate(&loaded, &val_batches, &token_bytes)?;
+        let rescored = crate::eval::evaluate(&loaded, &val_batches, &token_bytes)?;
         assert_eq!(
             rescored.bpb, meta.val_bpb,
             "reloaded model must reproduce the saved bpb exactly"
