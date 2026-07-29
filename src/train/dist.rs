@@ -252,6 +252,7 @@ pub fn decode_id_hex(hex: &str) -> std::result::Result<[u8; NCCL_ID_LEN], String
 mod nccl {
     use std::rc::Rc;
 
+    use candle_core::backend::BackendStorage;
     use candle_core::backprop::GradStore;
     use candle_core::cuda_backend::cudarc::nccl::safe::{Comm, Id, ReduceOp};
     use candle_core::{
