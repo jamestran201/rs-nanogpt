@@ -38,6 +38,100 @@ pub(crate) fn write_shard(path: &Path, texts: Vec<Option<&str>>) {
     writer.close().unwrap();
 }
 
+/// Write a parquet file shaped like smoltalk: one `messages`
+/// list<struct<content, role>> column, one list entry per conversation.
+pub(crate) fn write_smoltalk_shard(path: &Path, rows: &[&[(&str, &str)]]) {
+    use std::sync::Arc;
+
+    use arrow_array::builder::{ListBuilder, StringBuilder, StructBuilder};
+    use arrow_array::{ArrayRef, RecordBatch};
+    use arrow_schema::{DataType, Field, Fields};
+    use parquet::arrow::ArrowWriter;
+
+    let fields = Fields::from(vec![
+        Field::new("content", DataType::Utf8, true),
+        Field::new("role", DataType::Utf8, true),
+    ]);
+    let mut lists = ListBuilder::new(StructBuilder::from_fields(fields, 0));
+    for conversation in rows {
+        let structs = lists.values();
+        for (role, content) in *conversation {
+            structs
+                .field_builder::<StringBuilder>(0)
+                .unwrap()
+                .append_value(content);
+            structs
+                .field_builder::<StringBuilder>(1)
+                .unwrap()
+                .append_value(role);
+            structs.append(true);
+        }
+        lists.append(true);
+    }
+    let arr: ArrayRef = Arc::new(lists.finish());
+    let batch = RecordBatch::try_from_iter([("messages", arr)]).unwrap();
+    let file = std::fs::File::create(path).unwrap();
+    let mut writer = ArrowWriter::try_new(file, batch.schema(), None).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+}
+
+/// Write a parquet file shaped like mmlu: `question` (string), `choices`
+/// (list<string>), `answer` (int64), one row per tuple.
+pub(crate) fn write_mmlu_shard(path: &Path, rows: &[(&str, &[&str], i64)]) {
+    use std::sync::Arc;
+
+    use arrow_array::builder::{Int64Builder, ListBuilder, StringBuilder};
+    use arrow_array::{ArrayRef, RecordBatch};
+    use parquet::arrow::ArrowWriter;
+
+    let mut questions = StringBuilder::new();
+    let mut choices = ListBuilder::new(StringBuilder::new());
+    let mut answers = Int64Builder::new();
+    for (question, row_choices, answer) in rows {
+        questions.append_value(question);
+        for choice in *row_choices {
+            choices.values().append_value(choice);
+        }
+        choices.append(true);
+        answers.append_value(*answer);
+    }
+    let batch = RecordBatch::try_from_iter([
+        ("question", Arc::new(questions.finish()) as ArrayRef),
+        ("choices", Arc::new(choices.finish()) as ArrayRef),
+        ("answer", Arc::new(answers.finish()) as ArrayRef),
+    ])
+    .unwrap();
+    let file = std::fs::File::create(path).unwrap();
+    let mut writer = ArrowWriter::try_new(file, batch.schema(), None).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+}
+
+/// Write a parquet file shaped like gsm8k: `question` and `answer` string
+/// columns, one row per tuple.
+pub(crate) fn write_gsm8k_shard(path: &Path, rows: &[(&str, &str)]) {
+    use std::sync::Arc;
+
+    use arrow_array::{ArrayRef, RecordBatch, StringArray};
+    use parquet::arrow::ArrowWriter;
+
+    let questions: Vec<&str> = rows.iter().map(|(q, _)| *q).collect();
+    let answers: Vec<&str> = rows.iter().map(|(_, a)| *a).collect();
+    let batch = RecordBatch::try_from_iter([
+        (
+            "question",
+            Arc::new(StringArray::from(questions)) as ArrayRef,
+        ),
+        ("answer", Arc::new(StringArray::from(answers)) as ArrayRef),
+    ])
+    .unwrap();
+    let file = std::fs::File::create(path).unwrap();
+    let mut writer = ArrowWriter::try_new(file, batch.schema(), None).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+}
+
 /// A two-shard corpus so a train/val split exists: shard 0 (sorted first) is
 /// the Train split's filler, shard 1 the Val split's real text.
 pub(crate) fn two_shard_corpus() -> tempfile::TempDir {

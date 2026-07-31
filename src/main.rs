@@ -13,6 +13,7 @@ use rs_nanogpt::model::{
     DEFAULT_N_EMBD, DEFAULT_N_HEAD, DEFAULT_N_LAYER, DEFAULT_NORM_EPS, DEFAULT_ROPE_BASE,
     DEFAULT_SEQUENCE_LEN, Gpt, GptConfig, compute_dtype, default_device,
 };
+use rs_nanogpt::tasks::download_sft_data;
 use rs_nanogpt::tokenizer::{BpeTokenizer, BpeTokenizerTrainer};
 use rs_nanogpt::train::dist::{self, ChildEnv};
 use rs_nanogpt::train::{
@@ -59,6 +60,8 @@ enum Command {
     Pretrain(PretrainArgs),
     /// Download pretraining dataset shards into a local directory.
     DownloadData(DownloadArgs),
+    /// Download the SFT datasets (SmolTalk, MMLU, GSM8K, identity conversations).
+    DownloadSftData(DownloadSftArgs),
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -99,6 +102,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::DownloadData(args) => {
             if let Err(err) = run_download(args) {
+                eprintln!("download failed: {err}");
+                process::exit(1);
+            }
+        }
+        Command::DownloadSftData(args) => {
+            if let Err(err) = run_download_sft(args) {
                 eprintln!("download failed: {err}");
                 process::exit(1);
             }
@@ -624,6 +633,33 @@ fn run_download(args: DownloadArgs) -> Result<(), Box<dyn std::error::Error>> {
     if summary.failed > 0 {
         return Err(format!(
             "{} of {} shard(s) failed to download",
+            summary.failed, summary.requested
+        )
+        .into());
+    }
+    Ok(())
+}
+
+#[derive(clap::Args)]
+struct DownloadSftArgs {
+    /// Directory the SFT data files are written to (created if missing).
+    #[arg(long, default_value = "sft-data")]
+    out: PathBuf,
+    /// Number of parallel downloads.
+    #[arg(long, default_value_t = 4)]
+    workers: usize,
+}
+
+/// The file set is a fixed manifest (`src/tasks/download.rs`), so unlike
+/// `download-data` there are no range flags.
+fn run_download_sft(args: DownloadSftArgs) -> Result<(), Box<dyn std::error::Error>> {
+    if args.workers == 0 {
+        return Err("--workers must be >= 1".into());
+    }
+    let summary = download_sft_data(&args.out, args.workers)?;
+    if summary.failed > 0 {
+        return Err(format!(
+            "{} of {} file(s) failed to download",
             summary.failed, summary.requested
         )
         .into());

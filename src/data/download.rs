@@ -50,6 +50,15 @@ pub struct Summary {
     pub failed: usize,
 }
 
+/// One file to fetch: an absolute `url` and the local `filename` it is saved
+/// under. The two need not agree — the SFT manifest renames upstream
+/// `train-00000-of-00004.parquet` to `smoltalk-train-00000.parquet`.
+#[derive(Debug)]
+pub struct FileJob {
+    pub url: String,
+    pub filename: String,
+}
+
 fn shard_indices(start: usize, num: usize, val_shard: Option<usize>) -> Vec<usize> {
     let range = start..start + num;
     let mut indices: Vec<usize> = range.clone().collect();
@@ -80,26 +89,19 @@ fn try_download(agent: &Agent, url: &str, tmp_path: &Path, final_path: &Path) ->
     fs::rename(tmp_path, final_path)
 }
 
-fn download_one(
-    agent: &Agent,
-    dir: &Path,
-    index: usize,
-    base_url: &str,
-    policy: &RetryPolicy,
-) -> Outcome {
-    let filename = shard_filename(index);
-    let final_path = dir.join(&filename);
+fn download_one(agent: &Agent, dir: &Path, job: &FileJob, policy: &RetryPolicy) -> Outcome {
+    let filename = job.filename.as_str();
+    let final_path = dir.join(filename);
     if final_path.exists() {
         println!("skip     {filename} (already present)");
         return Outcome::Skipped;
     }
 
-    let url = format!("{}/{}", base_url.trim_end_matches('/'), filename);
     let tmp_path = dir.join(format!("{filename}.tmp"));
 
     println!("get      {filename}");
     for attempt in 1..=policy.max_attempts {
-        match try_download(agent, &url, &tmp_path, &final_path) {
+        match try_download(agent, &job.url, &tmp_path, &final_path) {
             Ok(()) => {
                 println!("done     {filename}");
                 return Outcome::Downloaded;
@@ -129,6 +131,8 @@ fn download_one(
     Outcome::Failed
 }
 
+/// Fetch ClimbMix pretraining shards `[start, start+num)` plus the pinned val
+/// shard, via [`download_files`].
 pub fn download_shards(
     dir: &Path,
     start: usize,
@@ -137,26 +141,53 @@ pub fn download_shards(
     workers: usize,
     base_url: &str,
 ) -> io::Result<Summary> {
+    let jobs: Vec<FileJob> = shard_indices(start, num, val_shard)
+        .into_iter()
+        .map(|index| {
+            let filename = shard_filename(index);
+            FileJob {
+                url: format!("{}/{}", base_url.trim_end_matches('/'), filename),
+                filename,
+            }
+        })
+        .collect();
+    download_files(dir, &jobs, workers)
+}
+
+/// Fetch `jobs` into `dir` in parallel (`workers` threads), skipping files
+/// already present. Each file streams to `<filename>.tmp` and is renamed into
+/// place only when complete, so an interrupted run never leaves a truncated
+/// file under its final name. Failures retry with exponential backoff before
+/// counting toward `Summary::failed`.
+pub fn download_files(dir: &Path, jobs: &[FileJob], workers: usize) -> io::Result<Summary> {
+    download_files_with_policy(dir, jobs, workers, &RetryPolicy::default())
+}
+
+/// [`download_files`] with an explicit retry policy, so tests can hit the
+/// failure path without the default's ~30s of backoff sleeps.
+fn download_files_with_policy(
+    dir: &Path,
+    jobs: &[FileJob],
+    workers: usize,
+    policy: &RetryPolicy,
+) -> io::Result<Summary> {
     fs::create_dir_all(dir)?;
 
-    let indices = shard_indices(start, num, val_shard);
-    let requested = indices.len();
+    let requested = jobs.len();
     println!(
-        "downloading {requested} shard(s) to {} with {workers} worker(s)",
+        "downloading {requested} file(s) to {} with {workers} worker(s)",
         dir.display()
     );
 
     let agent = build_agent();
-    let policy = RetryPolicy::default();
     let pool = ThreadPoolBuilder::new()
         .num_threads(workers)
         .build()
         .map_err(io::Error::other)?;
 
     let outcomes: Vec<Outcome> = pool.install(|| {
-        indices
-            .par_iter()
-            .map(|&index| download_one(&agent, dir, index, base_url, &policy))
+        jobs.par_iter()
+            .map(|job| download_one(&agent, dir, job, policy))
             .collect()
     });
 
@@ -239,6 +270,13 @@ mod tests {
         }
     }
 
+    fn job(url: String, filename: &str) -> FileJob {
+        FileJob {
+            url,
+            filename: filename.to_string(),
+        }
+    }
+
     #[test]
     fn shard_filename_zero_pads_to_five_digits() {
         assert_eq!(shard_filename(0), "shard_00000.parquet");
@@ -263,7 +301,8 @@ mod tests {
         )]);
         let agent = build_agent();
 
-        let outcome = download_one(&agent, dir.path(), 5, &base, &fast_policy());
+        let j = job(format!("{base}/shard_00005.parquet"), "shard_00005.parquet");
+        let outcome = download_one(&agent, dir.path(), &j, &fast_policy());
         assert!(matches!(outcome, Outcome::Downloaded));
 
         let path = dir.path().join("shard_00005.parquet");
@@ -280,7 +319,8 @@ mod tests {
         let base = serve(vec![("/shard_00005.parquet".into(), b"NEW".to_vec())]);
         let agent = build_agent();
 
-        let outcome = download_one(&agent, dir.path(), 5, &base, &RetryPolicy::default());
+        let j = job(format!("{base}/shard_00005.parquet"), "shard_00005.parquet");
+        let outcome = download_one(&agent, dir.path(), &j, &RetryPolicy::default());
         assert!(matches!(outcome, Outcome::Skipped));
         assert_eq!(fs::read(&path).unwrap(), b"original");
     }
@@ -291,10 +331,51 @@ mod tests {
         let base = serve(vec![]); // 404 everything
         let agent = build_agent();
 
-        let outcome = download_one(&agent, dir.path(), 5, &base, &fast_policy());
+        let j = job(format!("{base}/shard_00005.parquet"), "shard_00005.parquet");
+        let outcome = download_one(&agent, dir.path(), &j, &fast_policy());
         assert!(matches!(outcome, Outcome::Failed));
         assert!(!dir.path().join("shard_00005.parquet").exists());
         assert!(!dir.path().join("shard_00005.parquet.tmp").exists());
+    }
+
+    /// One job per outcome kind: a renamed fresh file (downloaded), a
+    /// pre-existing one the server's newer bytes must not overwrite (skipped),
+    /// and a 404 (failed).
+    #[test]
+    fn download_files_saves_under_local_names_and_counts_outcomes() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("already.bin"), b"original").unwrap();
+        let base = serve(vec![
+            (
+                "/data/train-00000-of-00004.parquet".into(),
+                b"fresh".to_vec(),
+            ),
+            ("/already.bin".into(), b"NEW".to_vec()),
+        ]);
+
+        let jobs = vec![
+            job(
+                format!("{base}/data/train-00000-of-00004.parquet"),
+                "smoltalk-train-00000.parquet",
+            ),
+            job(format!("{base}/already.bin"), "already.bin"),
+            job(format!("{base}/missing.bin"), "missing.bin"),
+        ];
+        let summary = download_files_with_policy(dir.path(), &jobs, 2, &fast_policy()).unwrap();
+
+        assert_eq!(summary.requested, 3);
+        assert_eq!(summary.downloaded, 1);
+        assert_eq!(summary.skipped, 1);
+        assert_eq!(summary.failed, 1);
+        assert_eq!(
+            fs::read(dir.path().join("smoltalk-train-00000.parquet")).unwrap(),
+            b"fresh"
+        );
+        assert_eq!(
+            fs::read(dir.path().join("already.bin")).unwrap(),
+            b"original"
+        );
+        assert!(!dir.path().join("missing.bin").exists());
     }
 
     #[test]

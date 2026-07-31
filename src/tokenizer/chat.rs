@@ -1,23 +1,21 @@
 //! Chat conversation rendering for SFT: a [`Conversation`] becomes token ids
-//! plus a loss mask selecting which of them are scored.
+//! plus a loss mask. Port of nanochat's `render_conversation`
+//! (`nanochat/tokenizer.py:266`).
 //!
-//! Faithful port of nanochat's `render_conversation`
-//! (`nanochat/tokenizer.py:266`). The mask rule: `true` exactly on the tokens
-//! the model will be asked to produce at inference time — assistant text,
-//! `<|python_*|>` tool-call spans, and `<|assistant_end|>` (the stop-token
-//! supervision). Everything the harness or user supplies (BOS, user turns,
-//! `<|assistant_start|>`, tool outputs) stays unscored context. Masked-out
-//! tokens still enter the forward pass as inputs; the SFT packer later maps
-//! `false` positions to `-1` (ignore_index) targets.
+//! The mask is true exactly on the tokens the model must produce at inference
+//! time: assistant text, `<|python_*|>` tool-call spans, and
+//! `<|assistant_end|>` (stop-token supervision). Everything the user or
+//! harness supplies — BOS, user turns, `<|assistant_start|>`, tool outputs —
+//! stays unscored context, still fed through the forward pass as input. The
+//! SFT packer later turns unscored positions into `-1` (ignore_index) targets.
 
 use std::io;
 
 use super::bpe::BpeTokenizer;
 use super::shared::TokenId;
 
-/// Who authored a message. `System` may only appear as the first message; it
-/// has no delimiter tokens of its own and is merged into the following user
-/// turn at render time.
+/// Who authored a message. `System` is legal only as the first message: it has
+/// no delimiter tokens and merges into the following user turn at render time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     System,
@@ -25,9 +23,9 @@ pub enum Role {
     Assistant,
 }
 
-/// One piece of a structured assistant message — the GSM8K tool-call shape
-/// (`tasks/gsm8k.py:60-76` splits `<<expr=result>>` calculator annotations
-/// into a `Python` call and its `PythonOutput`).
+/// One piece of a structured assistant message. The shape comes from GSM8K,
+/// whose `<<expr=result>>` calculator annotations split into a `Python` call
+/// and its `PythonOutput` (`tasks/gsm8k.py:60-76`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Part {
     /// Assistant prose (scored).
@@ -69,9 +67,9 @@ pub struct RenderedConversation {
     pub mask: Vec<bool>,
 }
 
-/// The eight chat special ids, resolved once per render call. Infallible:
-/// every `BpeTokenizer` reserves all nine specials above its learned merges
-/// (`shared::SPECIAL_TOKENS`).
+/// The chat special ids, resolved once per render. Infallible: every
+/// `BpeTokenizer` reserves the whole `shared::SPECIAL_TOKENS` block above its
+/// learned merges.
 struct ChatSpecials {
     user_start: TokenId,
     user_end: TokenId,
@@ -129,9 +127,9 @@ impl Renderer<'_> {
     }
 
     fn assistant_turn(&mut self, content: &Content) {
-        // The start token is given at inference to prime the reply, so it is
-        // never a prediction target; the end token is how the model yields
-        // the turn, so it always is.
+        // The start token primes the reply at inference, so it is never a
+        // target; the end token is how the model yields the turn, so it
+        // always is.
         self.push(self.sp.assistant_start, false);
         match content {
             Content::Text(t) => self.text(t, true),
@@ -179,16 +177,14 @@ fn invalid(msg: impl Into<String>) -> io::Error {
 }
 
 impl BpeTokenizer {
-    /// Render a chat conversation into token ids plus a loss mask, truncating
-    /// both to `max_tokens`. Truncation may cut mid-assistant-span, leaving
-    /// no `<|assistant_end|>` — accepted, matching nanochat
-    /// (`tokenizer.py:347`).
+    /// Render a conversation into token ids plus a loss mask, both truncated
+    /// to `max_tokens`. Truncation may cut mid-assistant-span, leaving no
+    /// `<|assistant_end|>` — accepted, matching nanochat (`tokenizer.py:347`).
     ///
-    /// Errors (`InvalidData`) are data-corruption guards, ports of nanochat's
-    /// asserts: empty conversation, a leading system message not followed by
-    /// a user message, broken user/assistant alternation, or non-text
-    /// user/system content. Callers treat them as fatal and attach
-    /// dataset/row context; message indices refer to `conv.messages`.
+    /// `InvalidData` errors are data-corruption guards ported from nanochat's
+    /// asserts: empty conversation, a leading system message not followed by a
+    /// user message, broken user/assistant alternation, non-text user/system
+    /// content. Indices they report are indices into `conv.messages`.
     pub fn render_conversation(
         &self,
         conv: &Conversation,
@@ -199,8 +195,8 @@ impl BpeTokenizer {
             return Err(invalid("conversation has no messages"));
         }
 
-        // A leading system message has no tokens of its own: it renders as
-        // "{system}\n\n{user}" inside the first user turn (tokenizer.py:283).
+        // A leading system message renders as "{system}\n\n{user}" inside the
+        // first user turn (tokenizer.py:283).
         let (merged_first_user, rest, index_offset) = if messages[0].role == Role::System {
             let Content::Text(sys) = &messages[0].content else {
                 return Err(invalid("system message content must be text"));
@@ -237,8 +233,8 @@ impl BpeTokenizer {
         };
         r.push(self.bos_id(), false);
 
-        // `logical` walks the post-merge user/assistant alternation; errors
-        // report `logical + index_offset` — the caller's message index.
+        // `logical` walks the post-merge alternation, so errors add
+        // `index_offset` to recover the caller's message index.
         let mut logical = 0usize;
         if let Some(text) = &merged_first_user {
             r.user_turn(text);
@@ -326,7 +322,6 @@ mod tests {
         );
     }
 
-    /// The core contract, bit for bit: user "Hi", assistant "Yo".
     #[test]
     fn two_message_layout_exact() {
         let r = render(&conv(vec![user("Hi"), assistant("Yo")]));
@@ -338,8 +333,8 @@ mod tests {
         );
     }
 
-    /// The GSM8K tool-call shape: the call span is scored, the output span
-    /// is not (it comes from the interpreter at inference time).
+    /// The call span is scored; the output span is not, since it comes from
+    /// the interpreter at inference time.
     #[test]
     fn parts_render_and_mask() {
         let c = conv(vec![
@@ -368,8 +363,7 @@ mod tests {
         );
     }
 
-    /// Every assistant turn is scored (content + end token); every user turn
-    /// stays context, including ones after the first exchange.
+    /// User turns stay unscored after the first exchange too.
     #[test]
     fn multi_turn_mask_pattern() {
         let c = conv(vec![user("a"), assistant("b"), user("c"), assistant("d")]);
@@ -388,8 +382,8 @@ mod tests {
         );
     }
 
-    /// A leading system message renders exactly as if its text were merged
-    /// into the first user message with "\n\n" (tokenizer.py:283-291).
+    /// A leading system message renders exactly as if its text were already
+    /// joined to the first user message with "\n\n" (tokenizer.py:283-291).
     #[test]
     fn system_merge_matches_premerged() {
         let merged = render(&conv(vec![system("S"), user("U"), assistant("A")]));
@@ -398,7 +392,6 @@ mod tests {
         assert_eq!(merged.mask, premerged.mask);
     }
 
-    /// Truncation caps both vectors at max_tokens and preserves the prefix.
     #[test]
     fn truncation_caps_both_vectors() {
         let c = conv(vec![user("Hi"), assistant("Yo")]);
@@ -410,9 +403,8 @@ mod tests {
         assert_eq!(cut.mask[..], full.mask[..4]);
     }
 
-    /// A conversation ending on a user message renders with an all-false
-    /// mask — the prefill shape the chat CLI will use (it appends
-    /// `<|assistant_start|>` and lets the model continue).
+    /// The prefill shape the chat CLI will use: nothing to score, because it
+    /// appends `<|assistant_start|>` and lets the model continue.
     #[test]
     fn ends_on_user_renders_all_unmasked() {
         let r = render(&conv(vec![user("Hi")]));
@@ -420,8 +412,8 @@ mod tests {
         assert!(r.mask.iter().all(|&m| !m));
     }
 
-    /// Decoding the rendered ids reproduces the conversation with special
-    /// tokens as literal strings (decode renders specials literally).
+    /// `decode` renders specials as literal strings, so the round trip shows
+    /// the full wire format.
     #[test]
     fn decode_round_trip() {
         let tok = byte_tokenizer();
@@ -455,8 +447,8 @@ mod tests {
         );
     }
 
-    /// System is only legal as the first message; anywhere else it breaks
-    /// alternation and reports the caller's index.
+    /// Anywhere but first, a system message breaks alternation and is
+    /// reported at the caller's index.
     #[test]
     fn mid_conversation_system_errors() {
         assert_render_err(
@@ -481,8 +473,7 @@ mod tests {
         assert_render_err(&c, "message 0: user message content must be text");
     }
 
-    /// The merge path validates content too: system and merged-user must both
-    /// be plain text.
+    /// The merge path validates content too: both halves must be plain text.
     #[test]
     fn system_or_merged_user_with_parts_errors() {
         let parts = Content::Parts(vec![Part::Text("x".into())]);
