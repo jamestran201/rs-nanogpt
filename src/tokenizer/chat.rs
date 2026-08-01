@@ -61,7 +61,7 @@ pub struct Conversation {
 
 /// A rendered conversation. `ids` and `mask` have equal length; `mask[i]` is
 /// true when the loss scores `ids[i]` as a prediction target.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct RenderedConversation {
     pub ids: Vec<TokenId>,
     pub mask: Vec<bool>,

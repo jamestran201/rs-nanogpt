@@ -12,7 +12,9 @@
 pub mod custom_json;
 mod download;
 pub mod gsm8k;
+pub mod mixture;
 pub mod mmlu;
+pub mod pack;
 pub mod smoltalk;
 
 use std::fs;
@@ -169,6 +171,117 @@ mod tests {
         }
     }
 
+    /// One JSONL line per identity-style conversation, as
+    /// `identity_conversations.jsonl` ships.
+    fn write_identity_jsonl(path: &Path, count: usize) {
+        let mut file = fs::File::create(path).unwrap();
+        for i in 0..count {
+            writeln!(
+                file,
+                r#"[{{"role":"user","content":"Who are you? ({i})"}},{{"role":"assistant","content":"I am nanochat, a small language model."}}]"#
+            )
+            .unwrap();
+        }
+    }
+
+    /// Capstone: every parser's output → mixture → packed epoch → batch →
+    /// model → masked loss. Closes the loop the `sft` subcommand will run,
+    /// mirroring `loader_feeds_model_and_loss_end_to_end` for pretraining.
+    #[test]
+    fn mixture_packs_into_batches_that_feed_model_and_loss() {
+        use candle_core::Device;
+
+        use crate::model::{Reduction, cross_entropy};
+        use crate::test_support::tiny_gpt;
+        use mixture::{Source, render_mixture};
+        use pack::pack_epoch;
+
+        let dir = tempfile::tempdir().unwrap();
+        write_smoltalk_shard(
+            &dir.path().join("smoltalk-train-00000.parquet"),
+            &[
+                &[("system", "Be brief."), ("user", "Hi"), ("assistant", "Yo")],
+                &[("user", "One"), ("assistant", "Two")],
+            ],
+        );
+        write_mmlu_shard(
+            &dir.path().join("mmlu-train-00000.parquet"),
+            &[("What is 2+2?", &["3", "4", "5", "6"], 1)],
+        );
+        write_gsm8k_shard(
+            &dir.path().join("gsm8k-train-00000.parquet"),
+            &[("How many?", "It is <<1+2=3>>3.\n#### 3")],
+        );
+        let jsonl = dir.path().join("identity_conversations.jsonl");
+        write_identity_jsonl(&jsonl, 4);
+
+        // Rows of seq_len + 1, wide enough that no fixture is truncated (the
+        // longest is MMLU's rendered prompt at ~121 byte-tokens), so every
+        // conversation keeps its scored `<|assistant_end|>`.
+        let (device_batch, seq_len) = (2usize, 128usize);
+        let tok = byte_tokenizer();
+        let sources = vec![
+            Source {
+                name: "smoltalk",
+                conversations: smoltalk::load(dir.path(), Split::Train).unwrap(),
+            },
+            Source {
+                name: "mmlu",
+                conversations: mmlu::load(dir.path(), Split::Train).unwrap(),
+            },
+            Source {
+                name: "gsm8k",
+                conversations: gsm8k::load(dir.path(), Split::Train).unwrap(),
+            },
+            Source {
+                name: "identity",
+                conversations: custom_json::load(&jsonl).unwrap(),
+            },
+        ];
+
+        let rendered = render_mixture(&tok, sources, seq_len + 1, 42).unwrap();
+        assert!(rendered.iter().all(|r| r.ids.len() <= seq_len + 1));
+        let epoch = pack_epoch(rendered, seq_len + 1, tok.bos_id());
+        let num_batches = epoch.num_batches(1, device_batch);
+        assert!(
+            num_batches >= 1,
+            "fixtures pack into {} rows, too few for a batch of {device_batch}",
+            epoch.num_rows()
+        );
+
+        let (_vm, model) = tiny_gpt(tok.vocab_size(), seq_len);
+        let (mut saw_ignored, mut saw_scored) = (false, false);
+        for i in 0..num_batches {
+            let batch = epoch.batch(i, 0, 1, device_batch, &Device::Cpu).unwrap();
+            let logits = model.forward(&batch.inputs).unwrap();
+            assert_eq!(logits.dims(), &[device_batch, seq_len, tok.vocab_size()]);
+
+            let loss = cross_entropy(&logits, &batch.targets, -1, Reduction::Mean)
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            assert!(loss.is_finite(), "expected finite loss, got {loss}");
+
+            for target in batch
+                .targets
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<i64>()
+                .unwrap()
+            {
+                if target < 0 {
+                    saw_ignored = true;
+                } else {
+                    saw_scored = true;
+                }
+            }
+        }
+        assert!(
+            saw_ignored && saw_scored,
+            "the epoch must contain both ignored and scored targets"
+        );
+    }
+
     // Smokes against the real files in `sft-data/`; run with
     // `cargo test -- --ignored`. Counts are per single local file — smoltalk
     // asserts `>=` because the box holds all 4 train shards.
@@ -209,5 +322,69 @@ mod tests {
         let convs = gsm8k::load(&sft_dir(), Split::Train).unwrap();
         assert_eq!(convs.len(), 7_473);
         render_prefix(&convs, convs.len());
+    }
+
+    /// Real conversations through the whole phase-3 pipeline at the production
+    /// row size, checking the conservation invariants and printing what the
+    /// pack cost. Run with `cargo test --release -- --ignored --nocapture`.
+    ///
+    /// The pad fraction here is *not* the number the box will see: the byte
+    /// tokenizer emits ~4× the tokens a trained vocab does, so most
+    /// conversations render to exactly 2049 and fill rows perfectly — which is
+    /// why the truncation count is printed alongside it.
+    #[test]
+    #[ignore = "needs real data in sft-data/"]
+    fn real_mixture_packs_with_conservation() {
+        use mixture::{Source, render_mixture};
+        use pack::pack_epoch;
+
+        const ROW_CAPACITY: usize = 2049; // seq_len 2048 + 1
+
+        let mut conversations = smoltalk::load(&sft_dir(), Split::Train).unwrap();
+        conversations.truncate(20_000);
+
+        let dir = tempfile::tempdir().unwrap();
+        let jsonl = dir.path().join("identity_conversations.jsonl");
+        write_identity_jsonl(&jsonl, 1_000);
+        let identity = custom_json::load(&jsonl).unwrap();
+
+        let tok = byte_tokenizer();
+        let sources = vec![
+            Source {
+                name: "smoltalk",
+                conversations,
+            },
+            // Twice, as nanochat oversamples the identity file.
+            Source {
+                name: "identity",
+                conversations: identity.clone(),
+            },
+            Source {
+                name: "identity",
+                conversations: identity,
+            },
+        ];
+        let expected: usize = sources.iter().map(|s| s.conversations.len()).sum();
+
+        let rendered = render_mixture(&tok, sources, ROW_CAPACITY, 42).unwrap();
+        assert_eq!(rendered.len(), expected);
+        let content: usize = rendered.iter().map(|r| r.ids.len()).sum();
+        let truncated = rendered
+            .iter()
+            .filter(|r| r.ids.len() == ROW_CAPACITY)
+            .count();
+
+        let epoch = pack_epoch(rendered, ROW_CAPACITY, tok.bos_id());
+        let stats = epoch.stats;
+        assert_eq!(stats.conversations, expected, "no conversation may be lost");
+        assert_eq!(stats.total_tokens, stats.rows * ROW_CAPACITY);
+        assert_eq!(content + stats.pad_tokens, stats.total_tokens);
+        assert_eq!(epoch.num_rows(), stats.rows);
+
+        println!(
+            "{stats:?}\npad {:.2}% | truncated at cap {truncated}/{expected} ({:.1}%)",
+            100.0 * stats.pad_fraction(),
+            100.0 * truncated as f64 / expected as f64,
+        );
     }
 }
