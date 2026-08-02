@@ -6,6 +6,7 @@ use candle_core::{DType, Device, Result, Tensor, Var};
 use candle_nn::VarMap;
 
 use super::dist::{DistCtx, canonical_vars};
+use super::mem::MemProbe;
 use super::{GroupLrs, GroupedAdamW, lr_mult};
 use crate::checkpoint::{self, CheckpointMeta};
 use crate::data::{Batch, DataLoader};
@@ -186,6 +187,26 @@ pub fn train(
     let inv_expected_tokens = 1.0 / cfg.tokens_per_step as f64;
     let expected_tokens = Tensor::full(cfg.tokens_per_step as f32, (), device)?;
 
+    // CUDA async-mempool telemetry for the OOM investigation; `None` unless
+    // RS_NANOGPT_MEM_TRACE asks for it (see `super::mem`). Master-only: every
+    // rank's pool behaves alike and one stream of lines is what gets read.
+    let probe = if dist.is_master() {
+        MemProbe::from_env(device)?
+    } else {
+        None
+    };
+    if let Some(p) = &probe {
+        // The one sync the probe adds, and it is outside the steady state:
+        // there is no cross-step allocation history to perturb yet, and it
+        // makes the baseline exact (masters + moments ≈ 9.4 GB at d24).
+        device.synchronize()?;
+        let s = p.stats()?;
+        println!("mem init         | {}", s.summary());
+        eval.metrics
+            .log(&MetricRecord::mem(0, t_start.elapsed().as_secs_f64(), s));
+        p.reset_highs()?;
+    }
+
     for step in 0..=cfg.num_iters {
         let last = step == cfg.num_iters;
 
@@ -258,7 +279,7 @@ pub fn train(
         let mut accum: Option<GradStore> = None;
         let mut step_sum = Tensor::zeros((), DType::F32, device)?; // Σ nll over the step
         let mut step_count = Tensor::zeros((), DType::F32, device)?; // Σ valid tokens
-        for _ in 0..cfg.grad_accum {
+        for micro in 0..cfg.grad_accum {
             let batch = loader.next_batch(device)?;
             let (b, t) = batch.inputs.dims2()?;
             assert_eq!(
@@ -268,13 +289,37 @@ pub fn train(
                  (per-rank tokens: total_batch / world_size)"
             );
             let (grads, nll_sum, valid_count) =
-                micro_backward(model, &batch.inputs, &batch.targets, inv_expected_tokens)?;
+                match micro_backward(model, &batch.inputs, &batch.targets, inv_expected_tokens) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // Essentially all allocation happens inside the
+                        // forward/backward, so this is where an OOM surfaces.
+                        // Capture the pool at the failure instant — `dev_free`
+                        // in particular bounds the request that could not be
+                        // placed — before the error unwinds out of `train`.
+                        if let Some(p) = &probe {
+                            p.dump(&format!("OOM step {step} micro {micro}"));
+                        }
+                        return Err(e);
+                    }
+                };
             match &mut accum {
                 None => accum = Some(grads),
                 Some(acc) => accumulate(acc, &grads, &vars)?,
             }
             step_sum = (step_sum + &nll_sum)?;
             step_count = (step_count + &valid_count)?;
+            if let Some(p) = &probe
+                && p.per_micro()
+            {
+                // No sync: `cuMemAllocAsync` grows `reserved` when the request
+                // is *made*, so the enqueue-order view is the one that shows
+                // where inside a step the pool actually grows.
+                println!(
+                    "mem step {step:>6} micro {micro:>3} | {}",
+                    p.stats()?.summary()
+                );
+            }
         }
         let mut grads = accum.expect("grad_accum >= 1 guarantees one micro-batch ran");
 
@@ -334,6 +379,19 @@ pub fn train(
             check_finite(mean_ce, step)?;
 
             device.synchronize()?; // drain queued GPU work so the timing is real
+            // Ride the sync above instead of adding one. `grads` is still live
+            // here, so this reads the pool at the same instant the on-box
+            // trace's per-step floor was measured; sampling after `grads`
+            // drops would amount to applying the candidate fix (writeup step
+            // B) under the guise of measuring the bug. Sampled before
+            // `grad_global_norm` below so its transients are not counted.
+            if let Some(p) = &probe {
+                let s = p.stats()?;
+                println!("mem step {step:>6}   | {}", s.summary());
+                eval.metrics
+                    .log(&MetricRecord::mem(step, t_start.elapsed().as_secs_f64(), s));
+                p.reset_highs()?;
+            }
             let now = Instant::now();
             if dist.is_master() {
                 // Post-reduce the gradients are identical on every rank, so
