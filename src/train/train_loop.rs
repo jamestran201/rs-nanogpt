@@ -113,18 +113,53 @@ fn grad_global_norm(grads: &GradStore, vars: &[Var]) -> Result<f64> {
 ///
 /// Returns `(grads, Σ nll, Σ valid)`; the two scalars are f32 tensors, the
 /// sum detached so accumulating it across micro-batches cannot pin each
-/// micro-batch's whole graph.
+/// micro-batch's whole graph. The returned store holds *only* parameter
+/// gradients, all detached — see `retain_param_grads` for why that has to be
+/// enforced rather than assumed.
 fn micro_backward(
     model: &Gpt,
     inputs: &Tensor,
     targets: &Tensor,
     inv_expected_tokens: f64,
+    vars: &[Var],
 ) -> Result<(GradStore, Tensor, Tensor)> {
     let logits = model.forward(inputs)?;
     let (nll_sum, valid_count) = cross_entropy_sum_count(&logits, targets, -1)?;
     let loss = (&nll_sum * inv_expected_tokens)?;
-    let grads = loss.backward()?;
+    let grads = retain_param_grads(loss.backward()?, vars);
     Ok((grads, nll_sum.detach(), valid_count))
+}
+
+/// Drop every `GradStore` entry that is not a parameter gradient.
+///
+/// candle's backward writes a gradient for *both* operands of every binary op,
+/// constants included — rope's cos/sin (`model/rope.rs:58-59`) and the loss
+/// mask (`model/loss.rs:38`). Those keys never enter `sorted_nodes` (`walk`
+/// only pushes nodes with a `Var` upstream), and the pop out of `sorted_nodes`
+/// is the *only* place candle detaches and removes. So each such entry keeps
+/// `zeros ⊕ (g ⊙ activation)` with live op history and pins the forward graph.
+/// Micro-batch 0's store becomes the step accumulator, so without this prune
+/// one entire forward graph stays alive for the whole optimizer step — ~24.5 GB
+/// at d24, measured (`writeups/pretrain-oom-investigation.md`).
+///
+/// Numerically inert: `accumulate`, `rescale_grads`, `DistCtx::all_reduce_grads`,
+/// `opt.step` and `grad_global_norm` all look gradients up *by var*, so the
+/// dropped entries are written once by candle and never read by anything.
+///
+/// `vars` is used as a set — unlike the collectives, the order does not matter.
+fn retain_param_grads(mut grads: GradStore, vars: &[Var]) -> GradStore {
+    let mut kept = GradStore::default();
+    for v in vars {
+        let t = v.as_tensor();
+        // `remove` moves the tensor across instead of cloning. A var with no
+        // stored gradient simply stays absent: that is the strict-init step,
+        // where the zeroed residual projections get exactly zero and candle
+        // stores nothing for them.
+        if let Some(g) = grads.remove(t) {
+            kept.insert(t, g);
+        }
+    }
+    kept // `grads` drops here, releasing the graph-pinning entries
 }
 
 fn accumulate(acc: &mut GradStore, src: &GradStore, vars: &[Var]) -> Result<()> {
@@ -288,21 +323,26 @@ pub fn train(
                 "batch shape ({b}, {t}) × grad_accum disagrees with cfg.tokens_per_step \
                  (per-rank tokens: total_batch / world_size)"
             );
-            let (grads, nll_sum, valid_count) =
-                match micro_backward(model, &batch.inputs, &batch.targets, inv_expected_tokens) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        // Essentially all allocation happens inside the
-                        // forward/backward, so this is where an OOM surfaces.
-                        // Capture the pool at the failure instant — `dev_free`
-                        // in particular bounds the request that could not be
-                        // placed — before the error unwinds out of `train`.
-                        if let Some(p) = &probe {
-                            p.dump(&format!("OOM step {step} micro {micro}"));
-                        }
-                        return Err(e);
+            let (grads, nll_sum, valid_count) = match micro_backward(
+                model,
+                &batch.inputs,
+                &batch.targets,
+                inv_expected_tokens,
+                &vars,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    // Essentially all allocation happens inside the
+                    // forward/backward, so this is where an OOM surfaces.
+                    // Capture the pool at the failure instant — `dev_free`
+                    // in particular bounds the request that could not be
+                    // placed — before the error unwinds out of `train`.
+                    if let Some(p) = &probe {
+                        p.dump(&format!("OOM step {step} micro {micro}"));
                     }
-                };
+                    return Err(e);
+                }
+            };
             match &mut accum {
                 None => accum = Some(grads),
                 Some(acc) => accumulate(acc, &grads, &vars)?,
@@ -476,7 +516,7 @@ mod tests {
             matrix: 0.01,
         };
         let mut warm = GroupedAdamW::new(vm, lrs, model.config().n_embd)?;
-        let (g, _, _) = micro_backward(model, inputs, targets, inv)?;
+        let (g, _, _) = micro_backward(model, inputs, targets, inv, &vm.all_vars())?;
         warm.set_lr_mult(1.0);
         warm.step(&g)?;
         Ok(())
@@ -516,6 +556,106 @@ mod tests {
             }
         }
         Ok(compared)
+    }
+
+    /// The invariant `micro_backward` guarantees, and the regression test for
+    /// the OOM root cause: the returned store holds *only* parameter
+    /// gradients, every one of them detached. A single entry with live op
+    /// history pins the whole forward graph until the store drops — and since
+    /// micro-batch 0's store becomes the step accumulator, that means one
+    /// forward graph per step (~24.5 GB at d24, measured).
+    #[test]
+    fn micro_backward_returns_only_detached_param_grads() -> Result<()> {
+        use std::collections::HashSet;
+
+        let dev = Device::Cpu;
+        let vm = VarMap::new();
+        let model = Gpt::new(tiny_cfg(), VarBuilder::from_varmap(&vm, DType::F32, &dev))?;
+        let vars = vm.all_vars();
+        let inputs = Tensor::new(&[[1u32, 2, 3, 4], [5, 6, 7, 8]], &dev)?;
+        let targets = Tensor::new(&[[2i64, 3, 4, 5], [6, 7, 8, 9]], &dev)?;
+
+        let (grads, _, _) = micro_backward(&model, &inputs, &targets, 1.0 / 8.0, &vars)?;
+
+        let var_ids: HashSet<_> = vars.iter().map(|v| v.as_tensor().id()).collect();
+        let mut kept = 0usize;
+        for id in grads.get_ids() {
+            assert!(
+                var_ids.contains(id),
+                "store holds an entry that is not a parameter gradient"
+            );
+            let g = grads.get_id(*id).expect("id came from the store");
+            assert_eq!(
+                g.sorted_nodes().len(),
+                0,
+                "a stored gradient still reaches graph nodes, so it pins activations"
+            );
+            kept += 1;
+        }
+        // The prune kept real work rather than emptying the store. Fewer than
+        // `vars.len()` is expected at strict init: the zeroed residual
+        // projections get exactly zero gradient and candle stores nothing.
+        assert!(kept > 0 && kept <= vars.len(), "kept {kept}/{}", vars.len());
+        Ok(())
+    }
+
+    /// Why `retain_param_grads` has to exist, pinned to candle's actual
+    /// behaviour so a candle bump cannot silently make it dead code.
+    ///
+    /// candle writes a gradient for *both* operands of every binary op,
+    /// constants included, but only detaches and removes entries it pops out
+    /// of `sorted_nodes` (`backprop.rs:174-182`) — and `walk` populates that
+    /// list with grad-*tracking* nodes only. So a raw store comes back holding
+    /// activation-shaped entries keyed by rope's cos/sin broadcasts (4 per
+    /// `Rope::apply` × q and k = 8 per block, `model/rope.rs:58-59`) plus one
+    /// for the loss mask (`model/loss.rs:38`), each carrying live op history.
+    ///
+    /// If this fails after a candle upgrade, candle's backward changed: work
+    /// out whether the prune is still needed before deleting it.
+    #[test]
+    fn retain_param_grads_drops_the_graph_pinning_entries() -> Result<()> {
+        use std::collections::HashSet;
+
+        let dev = Device::Cpu;
+        let vm = VarMap::new();
+        let cfg = tiny_cfg();
+        let model = Gpt::new(cfg, VarBuilder::from_varmap(&vm, DType::F32, &dev))?;
+        let vars = vm.all_vars();
+        let inputs = Tensor::new(&[[1u32, 2, 3, 4], [5, 6, 7, 8]], &dev)?;
+        let targets = Tensor::new(&[[2i64, 3, 4, 5], [6, 7, 8, 9]], &dev)?;
+
+        // The unpruned store, exactly as candle hands it back.
+        let logits = model.forward(&inputs)?;
+        let (nll_sum, _) = cross_entropy_sum_count(&logits, &targets, -1)?;
+        let raw = nll_sum.backward()?;
+
+        let var_ids: HashSet<_> = vars.iter().map(|v| v.as_tensor().id()).collect();
+        let mut non_param = 0usize;
+        let mut pinned = 0usize; // graph nodes reachable from a non-param entry
+        for id in raw.get_ids() {
+            if !var_ids.contains(id) {
+                non_param += 1;
+                let g = raw.get_id(*id).expect("id came from the store");
+                pinned = pinned.max(g.sorted_nodes().len());
+            }
+        }
+        assert_eq!(
+            non_param,
+            8 * cfg.n_layer + 1,
+            "unexpected non-parameter entry count in candle's raw store"
+        );
+        assert!(
+            pinned > 0,
+            "non-parameter entries pin nothing — candle's backward may have changed"
+        );
+
+        // And the prune removes exactly those.
+        let pruned = retain_param_grads(raw, &vars);
+        assert!(
+            pruned.get_ids().all(|id| var_ids.contains(id)),
+            "prune left a non-parameter entry behind"
+        );
+        Ok(())
     }
 
     /// The accumulation contract: one backward over a 4-row batch equals two
@@ -558,7 +698,7 @@ mod tests {
         let inv = 1.0 / 16.0;
 
         // Single batch, grad_accum = 1.
-        let (single, _, _) = micro_backward(&model, &inputs, &targets, inv)?;
+        let (single, _, _) = micro_backward(&model, &inputs, &targets, inv, &vars)?;
 
         // Two micro-batches of 2 rows each, grad_accum = 2, summed.
         let (mut accum, _, _) = micro_backward(
@@ -566,12 +706,14 @@ mod tests {
             &inputs.narrow(0, 0, 2)?,
             &targets.narrow(0, 0, 2)?,
             inv,
+            &vars,
         )?;
         let (g_b, _, _) = micro_backward(
             &model,
             &inputs.narrow(0, 2, 2)?,
             &targets.narrow(0, 2, 2)?,
             inv,
+            &vars,
         )?;
         accumulate(&mut accum, &g_b, &vars)?;
 
@@ -632,12 +774,14 @@ mod tests {
             &inputs.narrow(0, 0, 2)?,
             &targets.narrow(0, 0, 2)?,
             inv,
+            &vars,
         )?;
         let (g_b, _, count_b) = micro_backward(
             &model,
             &inputs.narrow(0, 2, 2)?,
             &targets.narrow(0, 2, 2)?,
             inv,
+            &vars,
         )?;
         accumulate(&mut accum, &g_b, &vars)?;
         let count = (count_a + count_b)?;
@@ -688,7 +832,7 @@ mod tests {
         for step in 0..=tcfg.num_iters {
             // grad_accum(1) · B(2) · T(4) = 8 expected tokens per step.
             let (grads, nll_sum, valid_count) =
-                micro_backward(&model, &inputs, &targets, 1.0 / 8.0)?;
+                micro_backward(&model, &inputs, &targets, 1.0 / 8.0, &vm.all_vars())?;
             let l = nll_sum.broadcast_div(&valid_count)?.to_scalar::<f32>()?;
             assert!(l.is_finite(), "loss not finite at step {step}: {l}");
             if step == 0 {
@@ -753,7 +897,7 @@ mod tests {
 
         warm_one_step(&vm, &model, &inputs, &targets, 1.0 / 8.0)?;
 
-        let (grads, _, _) = micro_backward(&model, &inputs, &targets, 1.0 / 8.0)?;
+        let (grads, _, _) = micro_backward(&model, &inputs, &targets, 1.0 / 8.0, &vars)?;
 
         // Independent f64 reference: sum of squares over every stored grad.
         let mut ref_sumsq = 0.0f64;
@@ -783,7 +927,9 @@ mod tests {
         let model = Gpt::new(tiny_cfg(), VarBuilder::from_varmap(&vm, DType::F32, &dev))?;
         let inputs = Tensor::new(&[[1u32, 2, 3, 4]], &dev)?;
         let targets = Tensor::new(&[[2i64, 3, 4, 5]], &dev)?;
-        let (grads, _, _) = micro_backward(&model, &inputs, &targets, 1.0 / 4.0)?;
+        // Real vars for the prune (so `grads` is populated); the *empty* slice
+        // goes to `grad_global_norm`, which is what this test is about.
+        let (grads, _, _) = micro_backward(&model, &inputs, &targets, 1.0 / 4.0, &vm.all_vars())?;
         assert_eq!(grad_global_norm(&grads, &[])?, 0.0);
         Ok(())
     }
