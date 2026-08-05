@@ -1,3 +1,4 @@
+pub mod chat;
 pub mod checkpoint;
 pub mod data;
 pub mod eval;
