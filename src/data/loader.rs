@@ -200,6 +200,25 @@ pub struct Batch {
     pub targets: Tensor,
 }
 
+/// A stream of training micro-batches. The training loop pulls exactly
+/// `num_iters · grad_accum` of them and never rewinds.
+///
+/// The seam that lets `train()` consume both the pretraining [`DataLoader`]
+/// (an endless cycling stream) and SFT's pre-packed epoch
+/// (`crate::tasks::EpochView`, a finite one).
+pub trait BatchSource {
+    fn next_batch(&mut self, device: &Device) -> candle_core::Result<Batch>;
+}
+
+impl BatchSource for DataLoader<'_> {
+    fn next_batch(&mut self, device: &Device) -> candle_core::Result<Batch> {
+        // Fully qualified on purpose: the inherent method has the same name and
+        // signature, so `self.next_batch(..)` here would become unbounded
+        // recursion the day the inherent one is removed.
+        DataLoader::next_batch(self, device)
+    }
+}
+
 pub struct DataLoader<'a> {
     assembler: BatchAssembler<DocFactory<'a>, DocIter<'a>>,
     batch_size: usize,
@@ -553,6 +572,38 @@ mod tests {
             assert_eq!(
                 x.targets.to_vec2::<i64>().unwrap(),
                 y.targets.to_vec2::<i64>().unwrap()
+            );
+        }
+    }
+
+    /// The `BatchSource` impl really forwards to the inherent method: two
+    /// fresh loaders over the same corpus, one driven through `&mut dyn
+    /// BatchSource` and one directly, must yield identical batches. Asserting
+    /// through the `dyn` reference is what proves the coercion `train()`
+    /// relies on, rather than only that the impl compiles.
+    #[test]
+    fn dyn_batch_source_yields_the_same_batches_as_the_inherent_method() {
+        use candle_core::Device;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tok = byte_tokenizer();
+        let text = "the quick brown fox jumps over the lazy dog";
+        let (b, t) = (2usize, 4usize);
+
+        let mut direct = loader_over(dir.path(), &tok, Split::Val, text, b, t);
+        let mut through = loader_over(dir.path(), &tok, Split::Val, text, b, t);
+        let src: &mut dyn BatchSource = &mut through;
+
+        for _ in 0..3 {
+            let want = direct.next_batch(&Device::Cpu).unwrap();
+            let got = src.next_batch(&Device::Cpu).unwrap();
+            assert_eq!(
+                want.inputs.to_vec2::<u32>().unwrap(),
+                got.inputs.to_vec2::<u32>().unwrap()
+            );
+            assert_eq!(
+                want.targets.to_vec2::<i64>().unwrap(),
+                got.targets.to_vec2::<i64>().unwrap()
             );
         }
     }

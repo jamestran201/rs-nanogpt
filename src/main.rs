@@ -1,5 +1,4 @@
-use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -8,7 +7,7 @@ use candle_nn::{VarBuilder, VarMap};
 use clap::{Parser, Subcommand};
 use rs_nanogpt::data::{BASE_URL, DataLoader, MAX_SHARD, Split, download_shards};
 use rs_nanogpt::eval::tokenizer as tokenizer_eval;
-use rs_nanogpt::metrics::{MetricsLogger, RunMeta, write_run_json};
+use rs_nanogpt::metrics::{MetricsLogger, RunMeta, unique_run_dir, write_run_json};
 use rs_nanogpt::model::{
     DEFAULT_N_EMBD, DEFAULT_N_HEAD, DEFAULT_N_LAYER, DEFAULT_NORM_EPS, DEFAULT_ROPE_BASE,
     DEFAULT_SEQUENCE_LEN, Gpt, GptConfig, compute_dtype, default_device,
@@ -18,7 +17,7 @@ use rs_nanogpt::tokenizer::{BpeTokenizer, BpeTokenizerTrainer};
 use rs_nanogpt::train::dist::{self, ChildEnv};
 use rs_nanogpt::train::{
     DEFAULT_FINAL_LR_FRAC, DEFAULT_WARMDOWN_RATIO, DEFAULT_WARMUP_STEPS, DistCtx, EvalContext,
-    GroupLrs, TrainConfig, train,
+    GroupLrs, GroupWeightDecay, TrainConfig, train,
 };
 
 #[derive(Parser)]
@@ -271,20 +270,6 @@ fn validate_pretrain_args(args: &PretrainArgs) -> Result<(), Box<dyn std::error:
     Ok(())
 }
 
-fn unique_run_dir(root: &Path, id: &str) -> io::Result<PathBuf> {
-    std::fs::create_dir_all(root)?;
-    let names = std::iter::once(String::new()).chain((2u32..).map(|n| format!("-{n}")));
-    for suffix in names {
-        let candidate = root.join(format!("{id}{suffix}"));
-        match std::fs::create_dir(&candidate) {
-            Ok(()) => return Ok(candidate),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e),
-        }
-    }
-    unreachable!("u32 run-dir suffixes exhausted")
-}
-
 /// The `--gpus N` parent: generate the NCCL rendezvous id, re-execute this
 /// binary once per GPU with the rank identity in env vars, and supervise.
 fn run_launcher(args: &PretrainArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -413,6 +398,9 @@ fn run_pretrain(
             unembedding: args.unembedding_lr,
             matrix: args.matrix_lr,
         },
+        // Pretraining keeps the decays that were hardcoded before the knob
+        // existed; only SFT deviates.
+        weight_decays: GroupWeightDecay::default(),
         warmup_steps: args.warmup_steps,
         warmdown_ratio: args.warmdown_ratio,
         final_lr_frac: args.final_lr_frac,
@@ -484,6 +472,7 @@ fn run_pretrain(
         println!("run dir: {}", run_dir.display());
 
         let run_meta = RunMeta {
+            phase: "pretrain",
             device: format!("{device:?}"),
             dtype: "f32",
             started_at_unix,
@@ -515,6 +504,7 @@ fn run_pretrain(
             eval_every: args.eval_every,
             eval_steps: args.eval_steps,
             sample_every: args.sample_every,
+            sft: None,
         };
         write_run_json(&run_dir.join("run.json"), &run_meta)?;
         let metrics = MetricsLogger::create(&run_dir.join("metrics.jsonl"))?;
@@ -670,30 +660,6 @@ fn run_download_sft(args: DownloadSftArgs) -> Result<(), Box<dyn std::error::Err
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// First call claims `root/<id>`; each subsequent call with the same id walks
-    /// to the next `-N` suffix, and every returned path is a real, distinct dir.
-    #[test]
-    fn unique_run_dir_walks_suffixes_on_collision() {
-        let root = tempfile::tempdir().unwrap();
-        let a = unique_run_dir(root.path(), "run").unwrap();
-        let b = unique_run_dir(root.path(), "run").unwrap();
-        let c = unique_run_dir(root.path(), "run").unwrap();
-        assert_eq!(a, root.path().join("run"));
-        assert_eq!(b, root.path().join("run-2"));
-        assert_eq!(c, root.path().join("run-3"));
-        assert!(a.is_dir() && b.is_dir() && c.is_dir());
-    }
-
-    /// The root is created on demand, so a not-yet-existing `--out` just works.
-    #[test]
-    fn unique_run_dir_creates_missing_root() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("does/not/exist/yet");
-        let dir = unique_run_dir(&root, "1752192000").unwrap();
-        assert_eq!(dir, root.join("1752192000"));
-        assert!(dir.is_dir());
-    }
 
     /// A known-good set of args; tests mutate one field to probe a single rule.
     /// `data`/`vocab` are never touched by `validate_pretrain_args`, so dummy paths are fine.

@@ -20,7 +20,7 @@
 //! along with the rank and world size.
 
 use candle_core::backprop::GradStore;
-use candle_core::{Result, Var};
+use candle_core::{Result, Tensor, Var};
 use candle_nn::VarMap;
 
 /// Env var carrying the spawned process's rank (its presence marks a child).
@@ -92,6 +92,30 @@ impl DistCtx {
         }
         #[cfg(feature = "nccl")]
         return self.comm()?.all_reduce_sums(xs);
+        #[cfg(not(feature = "nccl"))]
+        unreachable!("world_size > 1 cannot be constructed without the nccl feature")
+    }
+
+    /// Cross-rank `Sum` of a device tensor, in place of a host round-trip.
+    /// Identity when `world_size == 1`.
+    ///
+    /// The device-side sibling of [`all_reduce_sums`](Self::all_reduce_sums):
+    /// the training loop reduces its valid-token count every step, and going
+    /// through the host would add a `to_scalar` sync to every step (today it
+    /// syncs only on logging steps).
+    pub fn all_reduce_sum_tensor(&self, t: &Tensor) -> Result<Tensor> {
+        // Hoisted *above* the early return on purpose. `cuda_fwd` rejects a
+        // non-contiguous input, which is why `all_reduce_grads` normalizes —
+        // but it does so inside the nccl module, past this same early return,
+        // so mirroring that placement would put the normalization on a branch
+        // no local test can reach. A scalar copy is free, and world 1 then
+        // honours the same contract as world N.
+        let t = t.contiguous()?;
+        if self.world_size == 1 {
+            return Ok(t);
+        }
+        #[cfg(feature = "nccl")]
+        return self.comm()?.all_reduce_sum_tensor(&t);
         #[cfg(not(feature = "nccl"))]
         unreachable!("world_size > 1 cannot be constructed without the nccl feature")
     }
@@ -331,6 +355,16 @@ mod nccl {
             t.apply_op1_no_bwd(&op)?.to_vec1::<f64>()
         }
 
+        /// The caller (`DistCtx::all_reduce_sum_tensor`) has already made `t`
+        /// contiguous, which is what `cuda_fwd` requires.
+        pub(super) fn all_reduce_sum_tensor(&self, t: &Tensor) -> Result<Tensor> {
+            let op = AllReduce {
+                comm: self.comm.clone(),
+                op: ReduceOp::Sum,
+            };
+            t.apply_op1_no_bwd(&op)
+        }
+
         pub(super) fn broadcast_vars(&self, vars: &[Var]) -> Result<()> {
             let op = Broadcast {
                 comm: self.comm.clone(),
@@ -485,6 +519,30 @@ mod tests {
             t.to_vec1::<f32>()?,
             "broadcast must not touch params in a world of 1"
         );
+        Ok(())
+    }
+
+    /// `all_reduce_sum_tensor` is the identity at world 1 — and specifically
+    /// for a **non-contiguous** input, since the real collective rejects one.
+    /// The assertion only has teeth because `contiguous()` is hoisted above the
+    /// world-1 early return; against `all_reduce_grads`' placement (inside the
+    /// nccl module) this would be testing `t.clone()`.
+    #[test]
+    fn all_reduce_sum_tensor_is_identity_at_world_one() -> Result<()> {
+        let dist = DistCtx::single();
+        let dev = Device::Cpu;
+
+        let t = Tensor::new(&[[1.0f32, 2.0], [3.0, 4.0]], &dev)?.t()?;
+        assert!(!t.is_contiguous(), "the fixture must be non-contiguous");
+
+        let out = dist.all_reduce_sum_tensor(&t)?;
+        assert_eq!(out.dtype(), t.dtype());
+        assert_eq!(out.to_vec2::<f32>()?, t.to_vec2::<f32>()?);
+        assert!(out.is_contiguous(), "the contract is a contiguous result");
+
+        // The shape the training loop actually reduces: a scalar count.
+        let c = Tensor::full(13f32, (), &dev)?;
+        assert_eq!(dist.all_reduce_sum_tensor(&c)?.to_scalar::<f32>()?, 13.0);
         Ok(())
     }
 

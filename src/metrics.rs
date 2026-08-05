@@ -1,7 +1,7 @@
 use std::cell::{Cell, RefCell};
 use std::fs::File;
-use std::io::{BufWriter, Write};
-use std::path::Path;
+use std::io::{self, BufWriter, Write};
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
@@ -9,6 +9,8 @@ use crate::train::{GroupLrs, PoolStats};
 
 #[derive(Debug, Serialize)]
 pub struct RunMeta {
+    /// Which training phase produced this run: `"pretrain"` or `"sft"`.
+    pub phase: &'static str,
     pub device: String,
     pub dtype: &'static str,
     pub started_at_unix: u64,
@@ -42,6 +44,27 @@ pub struct RunMeta {
     pub eval_every: usize,
     pub eval_steps: usize,
     pub sample_every: usize,
+    /// Present only on an SFT run (`phase == "sft"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sft: Option<SftRunMeta>,
+}
+
+/// The SFT-only half of a run's provenance: what the finetune was built from
+/// and what the mixture packed to, so an `sft` run is reproducible from its
+/// artifact alone. The shared `RunMeta` fields keep pretraining's conventions
+/// (global `tokens_per_step`, post-`init_lr_frac` LRs) so the two phases stay
+/// comparable.
+#[derive(Debug, Serialize)]
+pub struct SftRunMeta {
+    pub base_checkpoint: String,
+    pub seed: u64,
+    pub mmlu_epochs: usize,
+    pub gsm8k_epochs: usize,
+    pub conversations: usize,
+    pub rows: usize,
+    pub pad_fraction: f64,
+    pub scored_fraction: f64,
+    pub val_rows: usize,
 }
 
 pub fn write_run_json(path: &Path, meta: &RunMeta) -> std::io::Result<()> {
@@ -50,6 +73,24 @@ pub fn write_run_json(path: &Path, meta: &RunMeta) -> std::io::Result<()> {
     }
     let bytes = serde_json::to_vec_pretty(meta).expect("RunMeta serializes");
     std::fs::write(path, bytes)
+}
+
+/// Claim a fresh run directory `root/<id>`, walking `-2`, `-3`, … on
+/// collision, and create it. Lives here rather than in the binary so both
+/// training phases can reach it — `run.json` and `metrics.jsonl` are written
+/// into what it returns.
+pub fn unique_run_dir(root: &Path, id: &str) -> io::Result<PathBuf> {
+    std::fs::create_dir_all(root)?;
+    let names = std::iter::once(String::new()).chain((2u32..).map(|n| format!("-{n}")));
+    for suffix in names {
+        let candidate = root.join(format!("{id}{suffix}"));
+        match std::fs::create_dir(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!("u32 run-dir suffixes exhausted")
 }
 
 #[derive(Debug, Serialize)]
@@ -231,6 +272,30 @@ mod tests {
     use serde_json::Value;
     use std::io::{BufRead, BufReader};
 
+    /// First call claims `root/<id>`; each subsequent call with the same id walks
+    /// to the next `-N` suffix, and every returned path is a real, distinct dir.
+    #[test]
+    fn unique_run_dir_walks_suffixes_on_collision() {
+        let root = tempfile::tempdir().unwrap();
+        let a = unique_run_dir(root.path(), "run").unwrap();
+        let b = unique_run_dir(root.path(), "run").unwrap();
+        let c = unique_run_dir(root.path(), "run").unwrap();
+        assert_eq!(a, root.path().join("run"));
+        assert_eq!(b, root.path().join("run-2"));
+        assert_eq!(c, root.path().join("run-3"));
+        assert!(a.is_dir() && b.is_dir() && c.is_dir());
+    }
+
+    /// The root is created on demand, so a not-yet-existing `--out` just works.
+    #[test]
+    fn unique_run_dir_creates_missing_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("does/not/exist/yet");
+        let dir = unique_run_dir(&root, "1752192000").unwrap();
+        assert_eq!(dir, root.join("1752192000"));
+        assert!(dir.is_dir());
+    }
+
     #[test]
     fn metrics_logger_writes_train_and_eval_lines() {
         let dir = tempfile::tempdir().unwrap();
@@ -350,6 +415,7 @@ mod tests {
     #[test]
     fn run_meta_serializes_expected_keys() {
         let meta = RunMeta {
+            phase: "pretrain",
             device: "Cpu".into(),
             dtype: "f32",
             started_at_unix: 1_700_000_000,
@@ -377,6 +443,7 @@ mod tests {
             eval_every: 250,
             eval_steps: 20,
             sample_every: 0,
+            sft: None,
         };
         let v: Value = serde_json::to_value(&meta).unwrap();
         assert_eq!(v["device"], "Cpu");
@@ -384,7 +451,30 @@ mod tests {
         assert_eq!(v["n_params"], 12_345);
         assert_eq!(v["tokens_per_step"], 16384);
         assert_eq!(v["world_size"], 1);
+        assert_eq!(v["phase"], "pretrain");
+        // A pretrain run carries no SFT block at all, rather than a null one.
+        assert!(v.get("sft").is_none());
         // Git-commit provenance is intentionally out of scope for now.
         assert!(v.get("git_commit").is_none());
+    }
+
+    /// An SFT run's nested block serializes inline under `sft`.
+    #[test]
+    fn run_meta_carries_the_sft_block_when_present() {
+        let v: Value = serde_json::to_value(SftRunMeta {
+            base_checkpoint: "out-d24/1752192000/best".into(),
+            seed: 42,
+            mmlu_epochs: 3,
+            gsm8k_epochs: 4,
+            conversations: 800_000,
+            rows: 150_000,
+            pad_fraction: 0.07,
+            scored_fraction: 0.38,
+            val_rows: 1_600,
+        })
+        .unwrap();
+        assert_eq!(v["base_checkpoint"], "out-d24/1752192000/best");
+        assert_eq!(v["mmlu_epochs"], 3);
+        assert_eq!(v["val_rows"], 1_600);
     }
 }

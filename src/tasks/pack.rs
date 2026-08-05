@@ -28,7 +28,7 @@ use std::vec::IntoIter;
 
 use candle_core::{Device, Tensor};
 
-use crate::data::Batch;
+use crate::data::{Batch, BatchSource};
 use crate::tokenizer::{RenderedConversation, TokenId};
 
 /// Best-fit lookahead window, in conversations (`chat_sft.py:187`). Smaller
@@ -46,6 +46,16 @@ pub struct PackStats {
     pub pad_tokens: usize,
     /// `rows · row_capacity` — every token in the pack, padding included.
     pub total_tokens: usize,
+    /// Tokens the loss actually scores — the SFT-specific number worth seeing,
+    /// since it is the fraction of the compute that produces gradient
+    /// (typically 30–45%), and the guard against a mixture that scores nothing.
+    ///
+    /// A raw count of `true` in `mask` is exactly the number of scored
+    /// *targets*, even though [`PackedEpoch::batch`] scores `mask[1..]` per row:
+    /// `mask[0]` of every row is always false — a rendered conversation opens
+    /// with an unscored BOS (`crate::tokenizer::BpeTokenizer::render_conversation`)
+    /// and a padding tail is BOS + false — so `count(mask) == count(mask[1..])`.
+    pub scored_tokens: usize,
 }
 
 impl PackStats {
@@ -208,6 +218,7 @@ fn pack_epoch_with_buffer(
         conversations,
         pad_tokens,
         total_tokens: rows.len(),
+        scored_tokens: mask.iter().filter(|&&scored| scored).count(),
     };
     PackedEpoch {
         rows,
@@ -287,6 +298,107 @@ impl PackedEpoch {
             targets: Tensor::from_vec(targets, (device_batch, tokens_dim), device)?,
         })
     }
+
+    /// An order-sensitive 44-bit fingerprint of the pack's ids **and** mask,
+    /// for the startup check that every rank built the identical epoch.
+    ///
+    /// DDP does zero communication about the data during training — each rank
+    /// packs the same mixture independently and strides its own rows — so
+    /// nothing else would ever notice a rank whose pack diverged. FNV-1a rather
+    /// than a `Σ ids`: a sum is invariant under exactly the row reordering this
+    /// has to rule out. Folding the mask in catches a desynchronized mask,
+    /// which [`PackStats::scored_tokens`] would only catch if the *count*
+    /// changed too.
+    ///
+    /// Width 44 is load-bearing, not cosmetic: the check reduces this value as
+    /// f64 across ranks and compares against an exactly-computed
+    /// `world × local`, so every partial sum the reduction forms must itself be
+    /// an exactly-representable integer. `W · (2^b − 1) < 2^53` guarantees that
+    /// for *any* reduction order or tree shape, and yields `b ≤ 44` at
+    /// `W ≤ 512`.
+    ///
+    /// The **top** bits (`h >> 20`), not a low-bit mask: in a multiplicative
+    /// hash chain the low bits barely avalanche (bit 0 is just the XOR-parity
+    /// of the inputs' bit 0), so masking would keep the 20 worst-mixed bits and
+    /// throw away the 20 best.
+    ///
+    /// A method rather than a [`PackStats`] field: `PackStats` is "what the
+    /// pack cost", and a hash is not a cost — as a field it would put a magic
+    /// constant into every test that asserts the stats as a struct literal.
+    /// Computed on demand (one pass over ~300 M ids, ~0.4 s), so a single-GPU
+    /// run — where the check is vacuous — never pays for it.
+    pub fn digest(&self) -> u64 {
+        const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+        let mut h = FNV_OFFSET;
+        for (&id, &scored) in self.rows.iter().zip(&self.mask) {
+            h ^= id as u64 | ((scored as u64) << 32);
+            h = h.wrapping_mul(FNV_PRIME);
+        }
+        h >> 20
+    }
+
+    /// This rank's slice of the epoch as a sequential [`BatchSource`].
+    ///
+    /// Collapses [`batch`](Self::batch)'s five arguments to one call site each,
+    /// and makes the val-snapshot rule — build it with `rank = 0, world = 1`,
+    /// because `evaluate_shard_sums` shards the snapshot itself
+    /// (`crate::eval::evaluate_shard_sums`) — a constructor argument rather
+    /// than a comment to remember at two call sites.
+    pub fn view(&self, rank: usize, world: usize, device_batch: usize) -> EpochView<'_> {
+        assert!(rank < world, "invalid rank {rank} / world {world}");
+        EpochView {
+            epoch: self,
+            rank,
+            world,
+            device_batch,
+            next: 0,
+        }
+    }
+}
+
+/// A cursor over one rank's micro-batches of a [`PackedEpoch`], in order.
+pub struct EpochView<'a> {
+    epoch: &'a PackedEpoch,
+    rank: usize,
+    world: usize,
+    device_batch: usize,
+    next: usize,
+}
+
+impl EpochView<'_> {
+    /// Micro-batches this view can serve in total — [`PackedEpoch::num_batches`],
+    /// identical on every rank by construction.
+    ///
+    /// Deliberately **not** `len()`: the view holds a cursor, and a `len()`
+    /// that never decreases as it is consumed is a trap (`while v.len() > 0`
+    /// would spin forever).
+    pub fn num_batches(&self) -> usize {
+        self.epoch.num_batches(self.world, self.device_batch)
+    }
+}
+
+impl BatchSource for EpochView<'_> {
+    fn next_batch(&mut self, device: &Device) -> candle_core::Result<Batch> {
+        // Error, not wrap-around: the training horizon is computed from
+        // `num_batches()` up front, so running past the end means the caller's
+        // arithmetic is wrong and silently replaying the epoch would hide it.
+        let total = self.num_batches();
+        if self.next >= total {
+            candle_core::bail!(
+                "epoch view exhausted: {total} micro-batches served at world {} × \
+                 device_batch {}",
+                self.world,
+                self.device_batch
+            );
+        }
+        let batch =
+            self.epoch
+                .batch(self.next, self.rank, self.world, self.device_batch, device)?;
+        self.next += 1;
+        Ok(batch)
+    }
 }
 
 #[cfg(test)]
@@ -328,6 +440,7 @@ mod tests {
                 conversations: num_rows,
                 pad_tokens: 0,
                 total_tokens: rows.len(),
+                scored_tokens: rows.len(), // the fabricated mask is all-true
             },
             rows,
             row_capacity: capacity,
@@ -360,6 +473,9 @@ mod tests {
                 conversations: 3,
                 pad_tokens: 4,
                 total_tokens: 16,
+                // Row 0 scores 4 + 2, row 1 scores 3 (the BOS of each
+                // conversation and the whole pad tail are unscored).
+                scored_tokens: 9,
             }
         );
         assert!((epoch.stats.pad_fraction() - 0.25).abs() < 1e-12);
@@ -471,6 +587,63 @@ mod tests {
         assert_eq!(a.rows, b.rows);
         assert_eq!(a.mask, b.mask);
         assert_eq!(a.stats, b.stats);
+        // The cross-rank check's premise: two processes packing the same
+        // mixture agree on the fingerprint.
+        assert_eq!(a.digest(), b.digest());
+    }
+
+    /// `scored_tokens` counts the `true` mask positions — and that count is
+    /// exactly the number of targets `batch()` does not ignore.
+    #[test]
+    fn scored_tokens_counts_the_unignored_targets() -> candle_core::Result<()> {
+        let epoch = pack_epoch_with_buffer(vec![conv(1, 4), conv(2, 5), conv(3, 3)], 8, BOS, 3);
+        assert_eq!(
+            epoch.stats.scored_tokens,
+            epoch.mask.iter().filter(|&&m| m).count()
+        );
+
+        // Cross-check through the consumer. Pinned to `view(0, 1, 1)`: that
+        // shape covers every row, whereas any other drops the tail remainder
+        // and the identity would be off by it.
+        let mut view = epoch.view(0, 1, 1);
+        let mut unignored = 0usize;
+        for _ in 0..view.num_batches() {
+            let batch = view.next_batch(&Device::Cpu)?;
+            unignored += batch
+                .targets
+                .flatten_all()?
+                .to_vec1::<i64>()?
+                .iter()
+                .filter(|&&t| t != -1)
+                .count();
+        }
+        assert_eq!(unignored, epoch.stats.scored_tokens);
+        Ok(())
+    }
+
+    /// The digest must catch both divergences the startup check exists for:
+    /// the same conversations packed in a different order (which a `Σ ids`
+    /// would miss entirely), and an identical id stream with a different mask.
+    /// And it must fit the 44 bits the f64 cross-rank sum needs.
+    #[test]
+    fn digest_is_order_and_mask_sensitive_and_fits_44_bits() {
+        let a = pack_epoch_with_buffer(vec![conv(1, 4), conv(2, 4), conv(3, 4)], 4, BOS, 1);
+        let b = pack_epoch_with_buffer(vec![conv(3, 4), conv(1, 4), conv(2, 4)], 4, BOS, 1);
+
+        // Same rows, permuted — a sum over ids cannot tell these apart.
+        let sum = |e: &PackedEpoch| e.rows.iter().map(|&id| id as u64).sum::<u64>();
+        assert_eq!(sum(&a), sum(&b), "the fixture must defeat a Σ ids check");
+        assert_ne!(a.digest(), b.digest(), "digest must be order-sensitive");
+
+        // Identical ids, one flipped mask bit.
+        let mut c = pack_epoch_with_buffer(vec![conv(1, 4), conv(2, 4), conv(3, 4)], 4, BOS, 1);
+        assert_eq!(c.rows, a.rows);
+        c.mask[1] = !c.mask[1];
+        assert_ne!(a.digest(), c.digest(), "digest must cover the mask");
+
+        for e in [&a, &b, &c] {
+            assert!(e.digest() < 1u64 << 44, "digest must fit 44 bits");
+        }
     }
 
     /// Through a real render: only the assistant's text and its
@@ -548,6 +721,41 @@ mod tests {
         }
     }
 
+    /// The view is exactly `batch()` plus a cursor: same horizon, same batches
+    /// in index order, and running past the end is an error rather than a
+    /// silent replay of the epoch.
+    #[test]
+    fn view_serves_the_indexed_batches_in_order_then_errors() -> candle_core::Result<()> {
+        for &(num_rows, rank, world, device_batch) in &[
+            (12usize, 0usize, 1usize, 2usize),
+            (12, 1, 2, 2),
+            (13, 2, 3, 2),
+        ] {
+            let epoch = epoch_of(num_rows, 4);
+            let mut view = epoch.view(rank, world, device_batch);
+            assert_eq!(view.num_batches(), epoch.num_batches(world, device_batch));
+
+            for i in 0..view.num_batches() {
+                let want = epoch.batch(i, rank, world, device_batch, &Device::Cpu)?;
+                let got = view.next_batch(&Device::Cpu)?;
+                assert_eq!(
+                    want.inputs.to_vec2::<u32>()?,
+                    got.inputs.to_vec2::<u32>()?,
+                    "rows {num_rows}, rank {rank}/{world}, B {device_batch}, batch {i}"
+                );
+                assert_eq!(
+                    want.targets.to_vec2::<i64>()?,
+                    got.targets.to_vec2::<i64>()?
+                );
+            }
+            assert!(
+                view.next_batch(&Device::Cpu).is_err(),
+                "one call past the end must error"
+            );
+        }
+        Ok(())
+    }
+
     /// The horizon every rank agrees on without communicating equals what the
     /// slowest rank could actually serve from its own stride.
     #[test]
@@ -591,6 +799,7 @@ mod tests {
                 conversations: 1,
                 pad_tokens: 0,
                 total_tokens: 8,
+                scored_tokens: 7, // all but the conversation's leading BOS
             }
         );
     }
