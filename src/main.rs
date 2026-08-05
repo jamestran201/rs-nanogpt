@@ -5,6 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use candle_core::DType;
 use candle_nn::{VarBuilder, VarMap};
 use clap::{Parser, Subcommand};
+use rs_nanogpt::chat::{self, ChatConfig};
 use rs_nanogpt::checkpoint;
 use rs_nanogpt::data::{BASE_URL, DataLoader, MAX_SHARD, Split, download_shards};
 use rs_nanogpt::eval::tokenizer as tokenizer_eval;
@@ -61,6 +62,8 @@ enum Command {
     Pretrain(PretrainArgs),
     /// Chat-finetune a pretrained checkpoint on the SFT mixture.
     Sft(SftArgs),
+    /// Talk to a finetuned checkpoint on the terminal.
+    Chat(ChatArgs),
     /// Download pretraining dataset shards into a local directory.
     DownloadData(DownloadArgs),
     /// Download the SFT datasets (SmolTalk, MMLU, GSM8K, identity conversations).
@@ -117,6 +120,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             if let Err(err) = result {
                 eprintln!("sft failed: {err}");
+                process::exit(1);
+            }
+        }
+        Command::Chat(args) => {
+            if let Err(err) = run_chat(args) {
+                eprintln!("chat failed: {err}");
                 process::exit(1);
             }
         }
@@ -722,6 +731,57 @@ fn run_sft(args: SftArgs, child: Option<ChildEnv>) -> Result<(), Box<dyn std::er
     Ok(())
 }
 
+#[derive(clap::Args)]
+struct ChatArgs {
+    /// The finetuned checkpoint to talk to, e.g. out-sft/<run>/best.
+    #[arg(long)]
+    checkpoint: PathBuf,
+    /// Tiktoken-format vocabulary. Must be the one the checkpoint was trained
+    /// with — a mismatch loads fine and replies with garbage.
+    #[arg(long)]
+    vocab: PathBuf,
+    /// Answer this one prompt and exit, instead of opening the REPL.
+    #[arg(long)]
+    prompt: Option<String>,
+    /// Sampling temperature; 0 = greedy.
+    #[arg(long, default_value_t = 0.6)]
+    temperature: f64,
+    /// Sample only from the k highest-logit tokens (0 = the whole vocabulary).
+    #[arg(long, default_value_t = 50)]
+    top_k: usize,
+    /// Maximum tokens per reply.
+    #[arg(long, default_value_t = 256)]
+    max_tokens: usize,
+    /// Seed for temperature sampling.
+    #[arg(long, default_value_t = 42)]
+    seed: u64,
+}
+
+/// The twin of [`sft_config`], and pinned by a test for the same reason:
+/// `temperature`/`seed`/`top_k`/`max_tokens` are adjacent knobs whose crossed
+/// assignment would type-check and validate.
+fn chat_config(args: ChatArgs) -> ChatConfig {
+    ChatConfig {
+        checkpoint: args.checkpoint,
+        vocab: args.vocab,
+        prompt: args.prompt,
+        max_tokens: args.max_tokens,
+        temperature: args.temperature,
+        top_k: args.top_k,
+        seed: args.seed,
+    }
+}
+
+/// Single process, single device — inference has no launcher and no `DistCtx`
+/// (`chat_cli.py`'s docstring says the same).
+fn run_chat(args: ChatArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let cfg = chat_config(args);
+    cfg.validate()?;
+    let device = default_device()?;
+    chat::run(&cfg, &device)?;
+    Ok(())
+}
+
 fn print_config_summary(config: &GptConfig) {
     println!("GPT config:");
     println!("  vocab_size   {}", config.vocab_size);
@@ -1037,6 +1097,68 @@ mod tests {
         assert_eq!(cfg.sample_tokens, 128);
         assert_eq!(cfg.sample_temperature, 0.0);
         assert_eq!(cfg.validate(), Ok(()));
+    }
+
+    /// The `sft` mapping test's twin: distinct values per same-typed field, so
+    /// a crossed line in the mapping is observable rather than merely
+    /// type-correct.
+    #[test]
+    fn chat_flags_map_to_the_right_config_fields() {
+        let cfg = match Cli::try_parse_from([
+            "rs-nanogpt",
+            "chat",
+            "--checkpoint",
+            "out-sft/run/best",
+            "--vocab",
+            "my-vocab.txt",
+            "--prompt",
+            "who are you?",
+            "--temperature",
+            "0.9",
+            "--top-k",
+            "20",
+            "--max-tokens",
+            "77",
+            "--seed",
+            "1234",
+        ])
+        .expect("argv should parse")
+        .command
+        {
+            Command::Chat(args) => chat_config(args),
+            _ => panic!("expected the chat subcommand"),
+        };
+
+        assert_eq!(cfg.checkpoint, PathBuf::from("out-sft/run/best"));
+        assert_eq!(cfg.vocab, PathBuf::from("my-vocab.txt"));
+        assert_eq!(cfg.prompt.as_deref(), Some("who are you?"));
+        assert_eq!(cfg.temperature, 0.9);
+        assert_eq!(cfg.top_k, 20);
+        assert_eq!(cfg.max_tokens, 77);
+        assert_eq!(cfg.seed, 1234);
+        assert_eq!(cfg.validate(), Ok(()));
+
+        // nanochat's chat defaults (chat_cli.py:17-19, :81), and no prompt
+        // means the REPL rather than a single shot.
+        let bare = match Cli::try_parse_from([
+            "rs-nanogpt",
+            "chat",
+            "--checkpoint",
+            "ckpt",
+            "--vocab",
+            "vocab.txt",
+        ])
+        .expect("argv should parse")
+        .command
+        {
+            Command::Chat(args) => chat_config(args),
+            _ => panic!("expected the chat subcommand"),
+        };
+        assert_eq!(bare.prompt, None);
+        assert_eq!(bare.temperature, 0.6);
+        assert_eq!(bare.top_k, 50);
+        assert_eq!(bare.max_tokens, 256);
+        assert_eq!(bare.seed, 42);
     }
 
     /// A known-good set of args; tests mutate one field to probe a single rule.
