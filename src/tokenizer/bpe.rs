@@ -212,6 +212,18 @@ impl BpeTokenizer {
         String::from_utf8_lossy(&self.decode_bytes(ids)).into_owned()
     }
 
+    /// A decoder that turns a *stream* of token ids into printable text,
+    /// holding back a trailing partial UTF-8 sequence until the token that
+    /// completes it arrives. For callers that print tokens as they are
+    /// generated; [`decode_lossy`](Self::decode_lossy) remains the whole-slice
+    /// form.
+    pub fn decode_stream(&self) -> TokenDecoder<'_> {
+        TokenDecoder {
+            tok: self,
+            buf: Vec::new(),
+        }
+    }
+
     pub fn encode(&self, text: &str) -> Vec<TokenId> {
         let pieces = self.pre_tokenize(text);
         if pieces.len() >= PARALLEL_THRESHOLD {
@@ -328,6 +340,74 @@ impl BpeTokenizer {
             pos = next[i];
         }
         result
+    }
+}
+
+/// The third member of the `decode`/`decode_lossy` family, for token-at-a-time
+/// output. The vocabulary is byte-level, so one token can carry a *partial*
+/// UTF-8 sequence: `decode` would panic on it and `decode_lossy` would emit
+/// U+FFFD in the middle of every multi-byte character. Here the incomplete
+/// tail is buffered (at most 3 bytes) until the next token completes it.
+pub struct TokenDecoder<'a> {
+    tok: &'a BpeTokenizer,
+    buf: Vec<u8>,
+}
+
+impl TokenDecoder<'_> {
+    /// Text that is now complete — possibly empty, when the token only
+    /// extended a partial character.
+    pub fn push(&mut self, id: TokenId) -> String {
+        let bytes = self.tok.decode_bytes(&[id]);
+        self.push_bytes(&bytes)
+    }
+
+    /// Flush a tail truncated at end of stream as one U+FFFD, so a reply that
+    /// stops mid-character does not swallow bytes silently. This is also what
+    /// makes the streamed text agree with `decode_lossy` on such a sequence.
+    pub fn finish(&mut self) -> String {
+        if self.buf.is_empty() {
+            return String::new();
+        }
+        self.buf.clear();
+        "\u{FFFD}".to_string()
+    }
+
+    /// `from_utf8`'s error carries exactly what is needed: `valid_up_to()`
+    /// bounds what can be emitted now, and `error_len()` separates *incomplete*
+    /// (`None` — keep buffering) from *invalid* (`Some(n)` — emit U+FFFD, skip
+    /// `n` bytes, keep going). That is the maximal-subpart rule `decode_lossy`
+    /// follows too, which is why the two agree.
+    ///
+    /// Takes bytes rather than an id so the tests can drive a split that this
+    /// vocabulary's merges may not happen to produce.
+    fn push_bytes(&mut self, bytes: &[u8]) -> String {
+        self.buf.extend_from_slice(bytes);
+        let mut out = String::new();
+        loop {
+            match std::str::from_utf8(&self.buf) {
+                Ok(s) => {
+                    out.push_str(s);
+                    self.buf.clear();
+                    return out;
+                }
+                Err(e) => {
+                    let valid = e.valid_up_to();
+                    out.push_str(
+                        std::str::from_utf8(&self.buf[..valid]).expect("valid_up_to() is valid"),
+                    );
+                    match e.error_len() {
+                        None => {
+                            self.buf.drain(..valid);
+                            return out;
+                        }
+                        Some(n) => {
+                            out.push('\u{FFFD}');
+                            self.buf.drain(..valid + n);
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -547,6 +627,84 @@ mod tests {
         // A lone UTF-8 continuation byte (0x80) is invalid on its own; `decode`
         // would panic, but `decode_lossy` yields the replacement character.
         assert_eq!(tok.decode_lossy(&[0x80]), "\u{FFFD}");
+    }
+
+    /// The branch that matters: a chunk of bytes that both *completes* a
+    /// pending character and *starts* a new partial one (`valid_up_to() > 0`
+    /// with `error_len() == None`). Driving `push_bytes` directly is what makes
+    /// it expressible — through `push(id)` the split is whatever the vocab's
+    /// merges happen to be.
+    #[test]
+    fn token_decoder_joins_split_characters() {
+        let vocab_file = train_tiny_vocab(265);
+        let tok = BpeTokenizer::from_file(vocab_file.path()).unwrap();
+        let mut dec = tok.decode_stream();
+
+        // "é" = C3 A9, one byte at a time.
+        assert_eq!(dec.push_bytes(&[0xC3]), "");
+        assert_eq!(dec.push_bytes(&[0xA9]), "é");
+
+        // A 4-byte emoji split 1+1+2 emits only once the last byte lands.
+        let emoji = "\u{1F389}".as_bytes(); // F0 9F 8E 89
+        assert_eq!(dec.push_bytes(&emoji[..1]), "");
+        assert_eq!(dec.push_bytes(&emoji[1..2]), "");
+        assert_eq!(dec.push_bytes(&emoji[2..]), "\u{1F389}");
+
+        // The straddling case: completes the pending "é" and holds a new C3.
+        assert_eq!(dec.push_bytes(&[0xC3]), "");
+        assert_eq!(dec.push_bytes(&[0xA9, 0xC3]), "é");
+        assert_eq!(dec.push_bytes(&[0xA9]), "é");
+    }
+
+    #[test]
+    fn token_decoder_replaces_invalid_bytes() {
+        let vocab_file = train_tiny_vocab(265);
+        let tok = BpeTokenizer::from_file(vocab_file.path()).unwrap();
+        let mut dec = tok.decode_stream();
+
+        // A lone 0xFF is invalid on its own: one U+FFFD, and the character
+        // after it still decodes — the buffer does not desynchronize.
+        assert_eq!(dec.push_bytes(&[0xFF]), "\u{FFFD}");
+        assert_eq!(dec.push_bytes(b"a"), "a");
+        assert_eq!(dec.push_bytes(&[0xFF, 0xC3, 0xA9]), "\u{FFFD}é");
+    }
+
+    #[test]
+    fn token_decoder_finish_flushes_a_truncated_tail() {
+        let vocab_file = train_tiny_vocab(265);
+        let tok = BpeTokenizer::from_file(vocab_file.path()).unwrap();
+        let mut dec = tok.decode_stream();
+
+        assert_eq!(dec.push_bytes(&[0xC3]), "");
+        assert_eq!(dec.finish(), "\u{FFFD}");
+        assert_eq!(dec.finish(), "", "finish() clears the buffer");
+    }
+
+    /// Streaming and batch decoding must agree, including on a sequence cut
+    /// mid-character — the only case where they could genuinely diverge, since
+    /// `finish()` is what supplies the trailing U+FFFD that `decode_lossy`
+    /// produces from the whole slice. A merge vocab (not `byte_tokenizer`), so
+    /// `push(id)` is exercised on tokens carrying more than one byte.
+    #[test]
+    fn decode_stream_matches_decode_lossy() {
+        let vocab_file = train_tiny_vocab(300);
+        let tok = BpeTokenizer::from_file(vocab_file.path()).unwrap();
+
+        let streamed = |ids: &[TokenId]| {
+            let mut dec = tok.decode_stream();
+            let mut out: String = ids.iter().map(|&id| dec.push(id)).collect();
+            out.push_str(&dec.finish());
+            out
+        };
+
+        let complete = tok.encode("Hello \u{4E16}\u{754C}! \u{1F389}");
+        assert_eq!(streamed(&complete), tok.decode_lossy(&complete));
+
+        // Cut inside the 3-byte "\u{754C}": every token here is one byte, so
+        // dropping the last id leaves a two-byte partial.
+        let truncated = &tok.encode("\u{4E16}\u{754C}")[..5];
+        assert!(tok.decode_lossy(truncated).ends_with('\u{FFFD}'));
+        assert_eq!(streamed(truncated), tok.decode_lossy(truncated));
     }
 
     #[test]
