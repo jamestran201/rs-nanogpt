@@ -53,7 +53,14 @@ pub fn load(dir: &Path, device: &Device) -> Result<(Gpt, VarMap, CheckpointMeta)
 /// `sequence_len == 0`, and every caller feeds `sequence_len` straight into
 /// batch arithmetic.
 pub fn load_meta(dir: &Path) -> Result<CheckpointMeta> {
-    let contents = fs::read_to_string(dir.join(META_FILE))?;
+    // Name the file. A mistyped `--checkpoint` is the likeliest first error of
+    // any run that takes one, and a bare "No such file or directory" does not
+    // say whether the directory, the meta file, or the path spelling is wrong.
+    // The `ErrorKind` is preserved, so `NotFound` stays matchable.
+    let path = dir.join(META_FILE);
+    let contents = fs::read_to_string(&path).map_err(|e| {
+        std::io::Error::new(e.kind(), format!("checkpoint {}: {e}", path.display()))
+    })?;
     let meta = parse_meta(&contents)?;
     meta.config.validate()?;
     Ok(meta)
@@ -256,6 +263,20 @@ mod tests {
         )?;
         assert!(load_meta(dir.path()).is_err());
         Ok(())
+    }
+
+    /// A missing checkpoint names the path it looked for. `--checkpoint`
+    /// pointing at a run dir instead of its `best/` subdir is the common slip,
+    /// and "No such file or directory" alone does not locate it.
+    #[test]
+    fn a_missing_checkpoint_names_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("not-a-run");
+        let err = load_meta(&missing).unwrap_err().to_string();
+        assert!(
+            err.contains(&missing.join(META_FILE).display().to_string()),
+            "error should name the meta path, got {err:?}"
+        );
     }
 
     #[test]
