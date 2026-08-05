@@ -593,8 +593,16 @@ struct SftArgs {
     device_batch: usize,
     /// Global tokens per optimizer step (summed over all GPUs). Must be a
     /// multiple of gpus*device_batch*seq_len, where seq_len comes from the
-    /// checkpoint.
-    #[arg(long, default_value_t = 524_288)]
+    /// checkpoint. Required: pass the value your pretraining run used.
+    ///
+    /// Not defaulted, for the reason the three LRs are not: nanochat's SFT
+    /// inherits this from the checkpoint meta (chat_sft.py:100-113, where
+    /// 524288 is only the fallback for a checkpoint that lacks it), our
+    /// meta.txt stores geometry only, and LRs are scaled against the batch
+    /// size at pretrain time (base_train.py:288-294). A default would let a
+    /// forgotten flag train the pasted LRs at half the tokens per step they
+    /// were scaled for, with nothing in the output to show it.
+    #[arg(long)]
     total_batch: usize,
     /// Optimizer steps. Omit to train exactly one epoch over the packed
     /// mixture; a value may only shorten that, never extend it.
@@ -864,6 +872,8 @@ mod tests {
             "0.01131",
             "--matrix-lr",
             "0.003",
+            "--total-batch",
+            "1048576",
         ]
     }
 
@@ -948,14 +958,22 @@ mod tests {
         assert_eq!(cfg.validate(), Ok(()));
     }
 
-    /// The three LRs are `required`, not defaulted. Defaulting them to
-    /// pretrain's CLI values would let a forgotten flag finetune a d24
-    /// checkpoint at roughly half the embedding LR it was pretrained with, and
-    /// nothing in the output would say so.
+    /// The flags SFT refuses to guess. All four describe the *pretraining* run
+    /// rather than this one, none is recoverable from our `meta.txt`, and a
+    /// wrong value for any of them produces a plausible-looking finetune at the
+    /// wrong LR/batch relationship — a forgotten `--embedding-lr` would default
+    /// a d24 finetune to roughly half the LR it was pretrained with, and a
+    /// defaulted `--total-batch` to half its tokens per step, with nothing in
+    /// the output to say so.
     #[test]
-    fn sft_requires_each_learning_rate() {
+    fn sft_requires_the_flags_it_cannot_infer() {
         assert!(Cli::try_parse_from(minimal_sft_argv()).is_ok());
-        for flag in ["--embedding-lr", "--unembedding-lr", "--matrix-lr"] {
+        for flag in [
+            "--embedding-lr",
+            "--unembedding-lr",
+            "--matrix-lr",
+            "--total-batch",
+        ] {
             let argv = minimal_sft_argv();
             let at = argv.iter().position(|a| *a == flag).expect("flag present");
             let without: Vec<&str> = argv
@@ -979,7 +997,6 @@ mod tests {
         assert_eq!(cfg.out, PathBuf::from("out-sft"));
         assert_eq!(cfg.gpus, 1);
         assert_eq!(cfg.device_batch, 8);
-        assert_eq!(cfg.total_batch, 524_288);
         assert_eq!(cfg.num_iters, None, "absent means the whole epoch");
         assert_eq!(cfg.init_lr_frac, 0.8);
         assert_eq!(cfg.warmup_steps, 0);

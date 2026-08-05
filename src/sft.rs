@@ -26,6 +26,7 @@
 //! stride of it (`crate::tasks::pack`). Step 7 of [`run`] is the one collective
 //! that checks that premise actually held.
 
+use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -39,7 +40,7 @@ use crate::checkpoint;
 use crate::data::{Batch, BatchSource};
 use crate::metrics::{MetricsLogger, RunMeta, SftRunMeta, unique_run_dir, write_run_json};
 use crate::tasks::mixture::{Source, render_mixture};
-use crate::tasks::pack::pack_epoch;
+use crate::tasks::pack::{PackedEpoch, pack_epoch};
 // `tasks::Split` names train/test *files*; `data::Split` is the pretraining
 // shard-position split. Only the former is wanted here, so it is imported by
 // name rather than reached through a glob.
@@ -64,12 +65,12 @@ const NANOCHAT_VAL_CAPS: (usize, usize, usize) = (24_000, 5_200, 420);
 /// Conversations to render per val micro-batch row, so the capped mixture packs
 /// to at least `eval_steps · device_batch` rows.
 ///
-/// **Empirical**, and the one number here that no test can validate: it assumes
-/// conversations average about a quarter of a row, which the formula never
-/// measures. With a trained vocab and an MMLU-heavy mixture the average could
-/// approach the break-even. Only a box run settles it; if [`val_batches`]'s
-/// hard error proves brittle in practice, the fix is one retry at an uncapped
-/// mixture before erroring.
+/// **Empirical**, and the one number here that no test can validate. One row
+/// per 16 conversations puts the break-even at `row_capacity / 16` — 128 tokens
+/// at seq 2048 — against an assumed quarter-row average, so ~4× headroom. The
+/// formula never measures that average, and with a trained vocab and an
+/// MMLU-heavy mixture it could approach the break-even; only a box run settles
+/// it. [`val_batches`] rebuilds once at an uncapped mixture when it does.
 const VAL_HEADROOM: usize = 16;
 
 /// Resolved SFT inputs — the CLI's flags after mapping, which is the struct
@@ -256,6 +257,21 @@ fn shuffled_cap(mut convs: Vec<Conversation>, cap: usize, seed: u64) -> Vec<Conv
     convs
 }
 
+/// The nanochat caps of the sources this staging actually loads: the budget's
+/// denominator, and equally the budget at or above which capping stops binding
+/// at all (`f` clamps to 1.0). [`val_batches`] needs the second reading.
+fn active_val_denominator(mmlu_epochs: usize, gsm8k_epochs: usize) -> usize {
+    let (smoltalk_cap, mmlu_cap, gsm8k_cap) = NANOCHAT_VAL_CAPS;
+    let mut denominator = smoltalk_cap;
+    if mmlu_epochs > 0 {
+        denominator += mmlu_cap;
+    }
+    if gsm8k_epochs > 0 {
+        denominator += gsm8k_cap;
+    }
+    denominator
+}
+
 /// nanochat's cap scaled by `f`, floored at one conversation and clamped to
 /// what the file actually holds.
 fn scaled_cap(nanochat_cap: usize, f: f64, available: usize) -> usize {
@@ -292,14 +308,8 @@ pub fn val_sources(
     seed: u64,
 ) -> io::Result<Vec<Source>> {
     let (smoltalk_cap, mmlu_cap, gsm8k_cap) = NANOCHAT_VAL_CAPS;
-    let mut denominator = smoltalk_cap;
-    if mmlu_epochs > 0 {
-        denominator += mmlu_cap;
-    }
-    if gsm8k_epochs > 0 {
-        denominator += gsm8k_cap;
-    }
-    let f = (conversation_budget as f64 / denominator as f64).min(1.0);
+    let f = (conversation_budget as f64 / active_val_denominator(mmlu_epochs, gsm8k_epochs) as f64)
+        .min(1.0);
 
     let mut out = Vec::new();
     let add = |out: &mut Vec<Source>,
@@ -328,8 +338,11 @@ pub fn val_sources(
     Ok(out)
 }
 
-/// The eval snapshot: `cfg.eval_steps` micro-batches off a capped, packed val
+/// The eval snapshot: `cfg.eval_steps` micro-batches off the packed val
 /// mixture, plus the row count the pack produced.
+///
+/// The mixture is capped to the snapshot's budget, then rebuilt uncapped if
+/// that cap made it too small to serve — see the retry below.
 ///
 /// Built at **rank 0, world 1** on every rank: the snapshot is shared and
 /// `evaluate_shard_sums` shards it itself (`crate::eval::evaluate_shard_sums`),
@@ -343,23 +356,60 @@ fn val_batches(
     seq_len: usize,
     device: &Device,
 ) -> Result<(Vec<Batch>, usize)> {
-    let budget = VAL_HEADROOM * cfg.eval_steps * cfg.device_batch;
-    let sources = val_sources(
-        &cfg.data,
-        cfg.mmlu_epochs,
-        cfg.gsm8k_epochs,
-        budget,
-        cfg.seed,
-    )?;
-    let rendered = render_mixture(tok, sources, seq_len + 1, cfg.seed)?;
-    let epoch = pack_epoch(rendered, seq_len + 1, tok.bos_id());
+    // `saturating_mul`: two of the three factors are user-supplied, and a
+    // wrapped budget in a release build would silently cap the mixture to
+    // almost nothing instead of failing.
+    let budget = VAL_HEADROOM
+        .saturating_mul(cfg.eval_steps)
+        .saturating_mul(cfg.device_batch);
+    let mut epoch = pack_val(cfg, tok, seq_len, budget)?;
 
+    // The capped budget is proportional to `eval_steps · device_batch`, so the
+    // rows it produces are too, and the shortfall test below cancels both out:
+    // `num_batches ≈ VAL_HEADROOM · eval_steps · rows_per_conversation`, so
+    // `num_batches >= eval_steps` reduces to `rows_per_conversation >= 1 /
+    // VAL_HEADROOM` — true or false regardless of either flag. Lowering
+    // --eval-steps would shrink the mixture by exactly the same factor and fail
+    // again, so telling the user to do that would send them in a circle.
+    //
+    // The retry is [`VAL_HEADROOM`]'s documented escape hatch: rebuild once at
+    // nanochat's full caps (`f = 1.0`, the budget no longer binding). That
+    // mixture is *fixed*, so the check finally depends on --eval-steps and the
+    // error below can give advice that works. Only reached when the run would
+    // otherwise abort, so the render+pack it costs is never on the happy path.
+    //
+    // Gated on the budget actually binding: past the denominator `f` is already
+    // clamped to 1.0, so the "retry" would re-parse, re-render and re-pack the
+    // identical mixture. That is the *likely* way this error fires (an
+    // --eval-steps set far too high), which is exactly where the retry cannot
+    // help.
+    if budget < active_val_denominator(cfg.mmlu_epochs, cfg.gsm8k_epochs)
+        && epoch.num_batches(1, cfg.device_batch) < cfg.eval_steps
+    {
+        epoch = pack_val(cfg, tok, seq_len, usize::MAX)?;
+    }
+
+    // Either branch above leaves `epoch` holding the uncapped mixture, so both
+    // messages below describe a mixture no *snapshot-sizing* flag can widen
+    // further. (`--mmlu-epochs`/`--gsm8k-epochs` still would, by adding sources
+    // — but they are tied to the train mixture, so advising them here would
+    // trade one wrong run for another.)
     let mut view = epoch.view(0, 1, cfg.device_batch);
+    if view.num_batches() == 0 {
+        // --eval-steps cannot fix this one: the message below would read "lower
+        // --eval-steps to <= 0", which `SftConfig::validate` rejects.
+        bail!(
+            "the val mixture packs to {} rows, fewer than one micro-batch of --device-batch \
+             {}; lower --device-batch, or check that --data holds the test split you expect",
+            epoch.stats.rows,
+            cfg.device_batch
+        );
+    }
     if view.num_batches() < cfg.eval_steps {
         bail!(
-            "val mixture packs to {} micro-batches at device_batch {}, fewer than \
-             --eval-steps {}; lower --eval-steps to <= {} (or raise --mmlu-epochs / \
-             --gsm8k-epochs to widen the val mixture)",
+            "the val mixture packs to {} micro-batches at --device-batch {}, fewer than \
+             --eval-steps {}; lower --eval-steps to <= {} (or lower --device-batch, which \
+             splits the same rows into more micro-batches)",
             view.num_batches(),
             cfg.device_batch,
             cfg.eval_steps,
@@ -370,6 +420,42 @@ fn val_batches(
         .map(|_| view.next_batch(device))
         .collect::<Result<Vec<_>>>()?;
     Ok((batches, epoch.stats.rows))
+}
+
+/// Removes the run directory if [`run`] bails before writing anything into it.
+///
+/// The dir is claimed at step 4b so a bad `--out` fails in seconds, which puts
+/// the val snapshot, both renders, the pack and the cross-rank check between
+/// the claim and `run.json` — seven ways to exit leaving an empty directory in
+/// `out-sft/`. `remove_dir` refuses a *non-empty* directory, so this can never
+/// touch a run that reached `run.json`, `metrics.jsonl` or `best/`; on the
+/// success path it is a no-op whose failure is the intended outcome.
+struct RemoveIfEmpty<'a>(Option<&'a Path>);
+
+impl Drop for RemoveIfEmpty<'_> {
+    fn drop(&mut self) {
+        if let Some(dir) = self.0 {
+            let _ = fs::remove_dir(dir);
+        }
+    }
+}
+
+/// Build and pack the val mixture at a given conversation budget.
+fn pack_val(
+    cfg: &SftConfig,
+    tok: &BpeTokenizer,
+    seq_len: usize,
+    budget: usize,
+) -> Result<PackedEpoch> {
+    let sources = val_sources(
+        &cfg.data,
+        cfg.mmlu_epochs,
+        cfg.gsm8k_epochs,
+        budget,
+        cfg.seed,
+    )?;
+    let rendered = render_mixture(tok, sources, seq_len + 1, cfg.seed)?;
+    Ok(pack_epoch(rendered, seq_len + 1, tok.bos_id()))
 }
 
 /// Every rank built the same pack, or the run is silently training on
@@ -406,6 +492,22 @@ pub fn run(cfg: &SftConfig, device: &Device, dist: &DistCtx) -> Result<()> {
     // without this a malformed config would sail past every range check into
     // the geometry math below.
     cfg.validate().map_err(candle_core::Error::msg)?;
+
+    // The world size is read from two places below — `cfg.gpus` drives the
+    // batch geometry, `run.json` and the per-rank token share, while `dist`
+    // drives the epoch stride, the gradient reduce and `ignore_rescale`'s world
+    // factor — so they have to be the same number. Nothing else catches a
+    // disagreement: at `gpus: 8` under a single-process `DistCtx` every check
+    // below still passes (both sides of the shape assertion are divided by 8),
+    // the view serves every row, and the run trains at an eighth of the
+    // intended global batch while `run.json` claims eight ranks.
+    if cfg.gpus != dist.world_size() {
+        bail!(
+            "--gpus {} disagrees with the distributed world size {}",
+            cfg.gpus,
+            dist.world_size()
+        );
+    }
 
     // 1-3. Everything cheap, before the safetensors read and long before the
     // ~300 M-token render.
@@ -445,8 +547,32 @@ pub fn run(cfg: &SftConfig, device: &Device, dist: &DistCtx) -> Result<()> {
     let (model, varmap, _) = checkpoint::load(&cfg.checkpoint, device)?;
     let n_params: usize = varmap.all_vars().iter().map(|v| v.elem_count()).sum();
 
+    // 4b. Claim the run dir before the renders, for the same reason step 5 runs
+    // before step 6: an unwritable, misspelled or full `--out` is a
+    // purely-CLI-driven mistake, and it should surface in seconds rather than
+    // after ~800 K renders and a ~300 M-token pack on every rank. `run.json`
+    // still waits for step 9 — it reports pack stats that do not exist yet, but
+    // the *directory* does not depend on them.
+    //
+    // Master-only: no other rank ever writes here, so one dir per rank would
+    // only race their timestamps into separate directories.
+    let started_at_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let run_dir = if dist.is_master() {
+        let dir = unique_run_dir(&cfg.out, &started_at_unix.to_string())?;
+        println!("run dir: {}", dir.display());
+        dir
+    } else {
+        cfg.out.clone()
+    };
+    // Everything from here to step 9 can still bail; none of it writes into the
+    // run dir. Declared after `run_dir` so it drops first.
+    let _cleanup = RemoveIfEmpty(dist.is_master().then_some(run_dir.as_path()));
+
     // 5. Val snapshot *first*, and in its own scope. First because a mis-sized
-    // --eval-steps is the one thing here a purely CLI-driven mistake can break,
+    // --eval-steps is the costliest thing a purely CLI-driven mistake can break,
     // and the user should hear about it in seconds. Scoped so the val pack and
     // its rendered input are freed before the train render allocates, instead
     // of the two host-memory peaks overlapping.
@@ -534,17 +660,10 @@ pub fn run(cfg: &SftConfig, device: &Device, dist: &DistCtx) -> Result<()> {
         matrix: cfg.lrs.matrix * cfg.init_lr_frac,
     };
 
-    // 9. Run dir, run.json and metrics.jsonl are master-only side effects; the
-    // other ranks get a discard sink and a path train() never writes to
-    // (checkpointing is master-gated). This also avoids per-rank timestamp
-    // races into different run dirs.
-    let started_at_unix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let (run_dir, metrics) = if dist.is_master() {
-        let run_dir = unique_run_dir(&cfg.out, &started_at_unix.to_string())?;
-        println!("run dir: {}", run_dir.display());
+    // 9. run.json and metrics.jsonl, master-only like the run dir claimed in
+    // step 4b. Here rather than there because `SftRunMeta` reports the pack
+    // stats, which only exist once step 6 has run.
+    let metrics = if dist.is_master() {
         let run_meta = RunMeta {
             phase: "sft",
             device: format!("{device:?}"),
@@ -589,10 +708,9 @@ pub fn run(cfg: &SftConfig, device: &Device, dist: &DistCtx) -> Result<()> {
             }),
         };
         write_run_json(&run_dir.join("run.json"), &run_meta)?;
-        let metrics = MetricsLogger::create(&run_dir.join("metrics.jsonl"))?;
-        (run_dir, metrics)
+        MetricsLogger::create(&run_dir.join("metrics.jsonl"))?
     } else {
-        (cfg.out.clone(), MetricsLogger::null())
+        MetricsLogger::null()
     };
 
     // 10-12.
@@ -845,6 +963,29 @@ mod tests {
         // f = 1.0 (a budget at or above the full mixture) is capped by supply.
         assert_eq!(scaled_cap(24_000, 1.0, 40), 40);
         assert_eq!(scaled_cap(24_000, 1.0, usize::MAX), 24_000);
+    }
+
+    /// `val_batches`'s retry premise: `usize::MAX` really does mean "uncapped".
+    ///
+    /// The budget reaches `f` as `budget as f64 / denominator`, so a saturated
+    /// budget has to land on `f = 1.0` (nanochat's own caps, clamped to supply)
+    /// rather than overflowing into something small. Without this the retry
+    /// would be a second identical attempt.
+    #[test]
+    fn the_retry_budget_uncaps_the_val_mixture() {
+        let dir = data_dir(200);
+
+        // The capstone's shape: eval_steps 1, device_batch 2 => budget 32, all
+        // of it smoltalk's, so `round(24 000 · 32/24 000)` caps at 32 of 200.
+        let tight = val_sources(dir.path(), 0, 0, VAL_HEADROOM * 2, 42).unwrap();
+        let uncapped = val_sources(dir.path(), 0, 0, usize::MAX, 42).unwrap();
+
+        assert_eq!(names_and_counts(&tight), [("smoltalk", 32)]);
+        assert_eq!(
+            names_and_counts(&uncapped),
+            [("smoltalk", 200)],
+            "an uncapped budget must take everything the file holds"
+        );
     }
 
     /// Only active sources claim budget, so a staging run spends all of it on
@@ -1103,6 +1244,52 @@ mod tests {
         Ok(())
     }
 
+    /// The retry's *success* path: the cap makes the mixture too small to
+    /// serve, the rebuild at `f = 1.0` rescues the run.
+    ///
+    /// The other two paths are already covered — no retry needed (the capstone,
+    /// `the_val_snapshot_covers_every_packed_val_row`) and retry-then-still-fail
+    /// (`too_few_val_batches_fails_before_the_train_render`) — but this is the
+    /// only one where the retry changes an outcome. Without it, reverting to
+    /// the pre-fix behaviour would leave every other test green.
+    ///
+    /// Trigger: conversations shorter than `row_capacity / VAL_HEADROOM`. The
+    /// byte vocab renders `data_dir`'s rows to ~15 tokens, so at `seq_len 1024`
+    /// the capped budget of 32 conversations packs to under one micro-batch
+    /// while all 200 pack to more than one.
+    #[test]
+    fn the_retry_rescues_a_val_mixture_the_cap_made_too_small() -> Result<()> {
+        let dev = Device::Cpu;
+        let dir = data_dir(200);
+        let vocab = dir.path().join("vocab.txt");
+        crate::test_support::write_byte_vocab(&vocab);
+        let tok = BpeTokenizer::from_file(&vocab)?;
+
+        let mut cfg = valid_config();
+        cfg.data = dir.path().to_path_buf();
+        cfg.vocab = vocab;
+        cfg.device_batch = 2;
+        cfg.eval_steps = 1;
+        cfg.mmlu_epochs = 0;
+        cfg.gsm8k_epochs = 0;
+        let seq_len = 1024;
+
+        let budget = VAL_HEADROOM * cfg.eval_steps * cfg.device_batch;
+        let capped_rows = pack_val(&cfg, &tok, seq_len, budget)?.stats.rows;
+        assert!(
+            capped_rows / cfg.device_batch < cfg.eval_steps,
+            "fixture does not reach the retry: the capped mixture already packs {capped_rows} rows"
+        );
+
+        let (batches, val_rows) = val_batches(&cfg, &tok, seq_len, &dev)?;
+        assert_eq!(batches.len(), cfg.eval_steps);
+        assert!(
+            val_rows > capped_rows,
+            "the retry must have uncapped the mixture: got {val_rows} rows, capped is {capped_rows}"
+        );
+        Ok(())
+    }
+
     /// The horizon is the packed epoch's, and `--num-iters` may only shorten
     /// it: the mixture is packed once and never repeated, so asking for more
     /// steps than it holds is a mistake, not a wrap-around.
@@ -1118,6 +1305,16 @@ mod tests {
         assert!(
             msg.contains("--num-iters 10000") && msg.contains("steps this epoch holds"),
             "unhelpful message: {msg}"
+        );
+
+        // The run dir is claimed at step 4b, well before this bail at step 8.
+        // `RemoveIfEmpty` takes it back, so a retried invocation does not leave
+        // `out-sft/` filling with empty directories that no run.json describes.
+        assert_eq!(
+            std::fs::read_dir(&cfg.out).unwrap().count(),
+            0,
+            "a failed run must not orphan its run dir in {}",
+            cfg.out.display()
         );
     }
 
@@ -1135,6 +1332,33 @@ mod tests {
         assert!(
             msg.contains("--eval-steps") && msg.contains("lower"),
             "unhelpful message: {msg}"
+        );
+    }
+
+    /// `run()` reads the world size from `cfg.gpus` *and* from `dist`; a
+    /// disagreement between them is silent everywhere else.
+    ///
+    /// `gpus: 2` under a single-process `DistCtx` passes every other check —
+    /// the geometry divides through, the view serves every row — and trains at
+    /// half the intended global batch while `run.json` claims two ranks. The
+    /// guard runs before the geometry check, so the message must be this one
+    /// and not a divisibility complaint.
+    #[test]
+    fn gpus_disagreeing_with_the_world_size_is_rejected() {
+        let dev = Device::Cpu;
+        let (_root, mut cfg) = capstone_fixture();
+        cfg.gpus = 2;
+
+        // `total_batch` is left at the fixture's value, which is *not* a
+        // multiple of `gpus · device_batch · seq_len` at gpus 2. That is what
+        // gives the assertion teeth: a guard placed after the geometry check
+        // would report a divisibility failure for what is really a world-size
+        // bug, and the test would still see an error.
+        let err = run(&cfg, &dev, &DistCtx::single()).expect_err("a world-size mismatch must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("world size") && !msg.contains("multiple of"),
+            "the world-size guard must run before the geometry check: {msg}"
         );
     }
 

@@ -64,6 +64,9 @@ pub struct SftRunMeta {
     pub rows: usize,
     pub pad_fraction: f64,
     pub scored_fraction: f64,
+    /// Rows the val mixture packed to — *not* the number evaluated, which is
+    /// `eval_steps · device_batch` of them. The two differ because the mixture
+    /// is capped with headroom, and differ more when that cap had to be lifted.
     pub val_rows: usize,
 }
 
