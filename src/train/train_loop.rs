@@ -40,6 +40,53 @@ pub struct TrainConfig {
     pub log_every: usize,
 }
 
+/// Gradient accumulation from the batch geometry: the global `total_batch` is
+/// reached by whole micro-batches on every rank, so
+/// `grad_accum = total_batch / (gpus · device_batch · sequence_len)`.
+///
+/// Shared by both training phases so their arithmetic and error text cannot
+/// drift. `sequence_len` is a CLI flag for pretraining and comes from the
+/// checkpoint meta for SFT, which is why it is a parameter rather than read
+/// off a config here.
+///
+/// Rejects a zero `gpus` / `device_batch` / `sequence_len` **itself** rather
+/// than trusting the caller to have checked: `usize::is_multiple_of(0)` is
+/// `true` for `0`, so the divisibility test would pass and the division below
+/// would panic. Pretraining happens to check those flags earlier, but SFT calls
+/// this straight after reading the checkpoint meta.
+pub fn validate_batch_geometry(
+    gpus: usize,
+    device_batch: usize,
+    sequence_len: usize,
+    total_batch: usize,
+) -> std::result::Result<usize, String> {
+    if gpus == 0 {
+        return Err("gpus must be >= 1".into());
+    }
+    if device_batch == 0 {
+        return Err("device_batch must be >= 1".into());
+    }
+    if sequence_len == 0 {
+        return Err("sequence_len must be >= 1".into());
+    }
+
+    let per_step = gpus * device_batch * sequence_len;
+    if !total_batch.is_multiple_of(per_step) {
+        return Err(format!(
+            "--total-batch ({total_batch}) must be a multiple of \
+             gpus*device_batch*seq_len ({per_step})"
+        ));
+    }
+    let grad_accum = total_batch / per_step;
+    if grad_accum == 0 {
+        return Err(format!(
+            "--total-batch ({total_batch}) must be at least \
+             gpus*device_batch*seq_len ({per_step})"
+        ));
+    }
+    Ok(grad_accum)
+}
+
 pub struct EvalContext<'a> {
     pub val_batches: &'a [Batch],
     pub tokenizer: &'a BpeTokenizer,
@@ -976,6 +1023,39 @@ mod tests {
         }
         assert!(last < first, "loss did not decrease: {first} -> {last}");
         Ok(())
+    }
+
+    /// The geometry both phases share: accepts the pretrain defaults, and
+    /// `grad_accum` is the whole-micro-batch quotient, so it scales with every
+    /// factor of the denominator.
+    #[test]
+    fn validate_batch_geometry_computes_grad_accum() {
+        // 32 · 512 = 16384 per rank-step ⇒ grad_accum 1 at one GPU.
+        assert_eq!(validate_batch_geometry(1, 32, 512, 16384), Ok(1));
+        assert_eq!(validate_batch_geometry(1, 32, 512, 4 * 16384), Ok(4));
+        // Adding ranks divides the per-rank work, not the global batch.
+        assert_eq!(validate_batch_geometry(8, 32, 512, 8 * 16384), Ok(1));
+        assert_eq!(validate_batch_geometry(8, 32, 512, 32 * 16384), Ok(4));
+    }
+
+    /// The zeros this rejects itself. `is_multiple_of(0)` is `true` for `0`, so
+    /// without these the divisibility test passes and the division panics —
+    /// reachable from SFT, which calls this straight after `load_meta`.
+    #[test]
+    fn validate_batch_geometry_rejects_zero_factors_before_dividing() {
+        assert!(validate_batch_geometry(0, 32, 512, 16384).is_err());
+        assert!(validate_batch_geometry(1, 0, 512, 16384).is_err());
+        assert!(validate_batch_geometry(1, 32, 0, 16384).is_err());
+    }
+
+    #[test]
+    fn validate_batch_geometry_rejects_a_total_batch_that_does_not_fit() {
+        // Not a whole number of micro-batches.
+        assert!(validate_batch_geometry(1, 32, 512, 16384 + 1).is_err());
+        // A multiple of the per-step size, but less than one of them.
+        assert!(validate_batch_geometry(1, 32, 512, 0).is_err());
+        // Enough for one rank's micro-batch, but not for two ranks'.
+        assert!(validate_batch_geometry(2, 32, 512, 16384).is_err());
     }
 
     #[test]
