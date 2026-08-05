@@ -99,6 +99,11 @@ pub struct EvalContext<'a> {
     pub sample_every: usize,
     pub sample_tokens: usize,
     pub sample_temperature: f64,
+    /// Render the sample prompts as chat turns and stop on
+    /// `<|assistant_end|>`. False for pretraining (bare completion stems, no
+    /// stop token); true for SFT, where the model is being taught a turn
+    /// format that base-format prompts would not show.
+    pub sample_chat: bool,
 }
 
 const SAMPLE_PROMPTS: &[&str] = &[
@@ -106,6 +111,15 @@ const SAMPLE_PROMPTS: &[&str] = &[
     "The capital of France is",
     "The opposite of hot is",
     "My favorite color is",
+];
+
+/// Questions rather than completion stems: a finetuned model asked to finish
+/// "The opposite of hot is" is being scored on the wrong task.
+const CHAT_SAMPLE_PROMPTS: &[&str] = &[
+    "What is the capital of France?",
+    "Explain gravity in one sentence.",
+    "What is 2 + 2?",
+    "Write a haiku about the sea.",
 ];
 
 /// The prefix an in-loop sample conditions on: a bare completion stem in base
@@ -388,9 +402,18 @@ pub fn train(
                 top_k: 0,
                 seed: step as u64,
             };
-            for p in SAMPLE_PROMPTS {
-                let prefix = sample_prefix(eval.tokenizer, p, false);
-                let ids = generate_ids(model, &prefix, opts, &[], device, |_| Ok(()))?;
+            // The chat branch stops on the trained stop token, and decodes it
+            // *with* the reply: `<|assistant_end|>` in the log is the visible
+            // evidence that stop-token supervision took.
+            let stops = eval.tokenizer.assistant_stop_ids();
+            let (prompts, stop): (_, &[TokenId]) = if eval.sample_chat {
+                (CHAT_SAMPLE_PROMPTS, &stops[..])
+            } else {
+                (SAMPLE_PROMPTS, &[])
+            };
+            for p in prompts {
+                let prefix = sample_prefix(eval.tokenizer, p, eval.sample_chat);
+                let ids = generate_ids(model, &prefix, opts, stop, device, |_| Ok(()))?;
                 // decode_lossy, not decode: a token budget cuts a byte-level
                 // vocab mid-character routinely, and decode's panic would kill
                 // a multi-hour run from inside the training loop.
@@ -1226,6 +1249,7 @@ mod tests {
             sample_every: 0, // sampling off: output is noise on a 4-step run
             sample_tokens: 8,
             sample_temperature: 0.0,
+            sample_chat: false,
         };
 
         train(

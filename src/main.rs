@@ -545,6 +545,7 @@ fn run_pretrain(
         sample_every: args.sample_every,
         sample_tokens: args.sample_tokens,
         sample_temperature: args.sample_temperature,
+        sample_chat: false,
     };
     train(
         &model,
@@ -631,6 +632,18 @@ struct SftArgs {
     /// Val micro-batches to snapshot. Also sizes the val mixture's cap.
     #[arg(long, default_value_t = 100)]
     eval_steps: usize,
+    /// Print chat-format sample replies every N steps (0 disables). Unlike
+    /// --eval-every, 0 is fine: samples are a diagnostic, not an output.
+    #[arg(long, default_value_t = 200)]
+    sample_every: usize,
+    /// Tokens to generate per sample.
+    #[arg(long, default_value_t = 128)]
+    sample_tokens: usize,
+    /// Sampling temperature; 0 = greedy. Greedy is the fastest read on whether
+    /// the chat *format* has been learned, which is what these samples are for;
+    /// judge reply quality with the `chat` subcommand instead.
+    #[arg(long, default_value_t = 0.0)]
+    sample_temperature: f64,
     /// Copies of MMLU auxiliary_train in the mixture (0 omits it entirely).
     #[arg(long, default_value_t = 3)]
     mmlu_epochs: usize,
@@ -675,6 +688,9 @@ fn sft_config(args: SftArgs) -> SftConfig {
         mmlu_epochs: args.mmlu_epochs,
         gsm8k_epochs: args.gsm8k_epochs,
         seed: args.seed,
+        sample_every: args.sample_every,
+        sample_tokens: args.sample_tokens,
+        sample_temperature: args.sample_temperature,
     }
 }
 
@@ -931,6 +947,12 @@ mod tests {
             "6",
             "--seed",
             "1234",
+            "--sample-every",
+            "400",
+            "--sample-tokens",
+            "64",
+            "--sample-temperature",
+            "0.7",
         ]);
 
         assert_eq!(cfg.checkpoint, PathBuf::from("out-d24/run/best"));
@@ -954,6 +976,9 @@ mod tests {
         assert_eq!(cfg.mmlu_epochs, 2);
         assert_eq!(cfg.gsm8k_epochs, 6);
         assert_eq!(cfg.seed, 1234);
+        assert_eq!(cfg.sample_every, 400);
+        assert_eq!(cfg.sample_tokens, 64);
+        assert_eq!(cfg.sample_temperature, 0.7);
         // The mapped config is one `sft::run` would accept.
         assert_eq!(cfg.validate(), Ok(()));
     }
@@ -1008,6 +1033,9 @@ mod tests {
         assert_eq!(cfg.mmlu_epochs, 3);
         assert_eq!(cfg.gsm8k_epochs, 4);
         assert_eq!(cfg.seed, 42);
+        assert_eq!(cfg.sample_every, 200);
+        assert_eq!(cfg.sample_tokens, 128);
+        assert_eq!(cfg.sample_temperature, 0.0);
         assert_eq!(cfg.validate(), Ok(()));
     }
 

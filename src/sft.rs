@@ -115,6 +115,17 @@ pub struct SftConfig {
     pub mmlu_epochs: usize,
     pub gsm8k_epochs: usize,
     pub seed: u64,
+    /// Print sample replies every N steps (0 disables). Unlike `eval_every`,
+    /// turning this off costs nothing — samples are a diagnostic, not an
+    /// output.
+    pub sample_every: usize,
+    pub sample_tokens: usize,
+    /// Greedy by default. Greedy is the fastest read on whether the model has
+    /// learned the chat *format* — turn structure, stopping — which is what an
+    /// in-loop sample is for; it is a poor read on reply *quality*, since
+    /// greedy decoding from a partly-finetuned model is the classic
+    /// degenerate-repetition regime. Judge quality with `chat`.
+    pub sample_temperature: f64,
 }
 
 impl SftConfig {
@@ -174,6 +185,17 @@ impl SftConfig {
         // disabling eval would train for an hour and save nothing.
         if self.eval_every == 0 {
             return Err("--eval-every must be >= 1 (it is what saves <run>/best)".into());
+        }
+        // `--sample-every 0` *is* legal, unlike `--eval-every 0`: a sample is a
+        // diagnostic, so switching it off loses nothing.
+        if self.sample_every > 0 && self.sample_tokens == 0 {
+            return Err("--sample-tokens must be >= 1 when --sample-every > 0".into());
+        }
+        if self.sample_temperature < 0.0 {
+            return Err(format!(
+                "--sample-temperature must be >= 0, got {}",
+                self.sample_temperature
+            ));
         }
         Ok(())
     }
@@ -694,7 +716,7 @@ pub fn run(cfg: &SftConfig, device: &Device, dist: &DistCtx) -> Result<()> {
             log_every: cfg.log_every,
             eval_every: cfg.eval_every,
             eval_steps: cfg.eval_steps,
-            sample_every: 0,
+            sample_every: cfg.sample_every,
             sft: Some(SftRunMeta {
                 base_checkpoint: cfg.checkpoint.display().to_string(),
                 seed: cfg.seed,
@@ -742,12 +764,13 @@ pub fn run(cfg: &SftConfig, device: &Device, dist: &DistCtx) -> Result<()> {
         ckpt_root: &run_dir,
         metrics: &metrics,
         eval_every: cfg.eval_every,
-        // Sampling off until phase 5: `SAMPLE_PROMPTS` are base-format
-        // completions, so they would show the finetuned model doing the wrong
-        // task, and `generate` has no chat prompt or stop token yet.
-        sample_every: 0,
-        sample_tokens: 0,
-        sample_temperature: 0.0,
+        sample_every: cfg.sample_every,
+        sample_tokens: cfg.sample_tokens,
+        sample_temperature: cfg.sample_temperature,
+        // Chat-format prompts and the `<|assistant_end|>` stop set: the whole
+        // point of an in-loop sample here is to show the turn format being
+        // learned, which base-format completion stems would not.
+        sample_chat: true,
     };
     train(&model, &varmap, &mut train_view, &tcfg, &eval, dist, device)
 }
@@ -786,6 +809,13 @@ mod tests {
             mmlu_epochs: 3,
             gsm8k_epochs: 4,
             seed: 42,
+            // The CLI defaults, which this fixture mirrors — and the value
+            // matters: the `sample_tokens >= 1` rule is *conditional* on
+            // `sample_every > 0`, so at `sample_every: 0` the mutation below
+            // would be legal and the test would fail on the wrong side.
+            sample_every: 200,
+            sample_tokens: 128,
+            sample_temperature: 0.0,
         }
     }
 
@@ -820,6 +850,13 @@ mod tests {
         // Unlike pretrain: <run>/best is the only output, so no-eval means the
         // run produces nothing.
         rejects(|c| c.eval_every = 0);
+        rejects(|c| c.sample_tokens = 0);
+        rejects(|c| c.sample_temperature = -0.1);
+        // ...but sampling off entirely is fine, and then sample_tokens is moot.
+        let mut off = valid_config();
+        off.sample_every = 0;
+        off.sample_tokens = 0;
+        assert_eq!(off.validate(), Ok(()));
     }
 
     /// Each LR is checked separately — a typo'd zero on any one of the three
@@ -1118,6 +1155,15 @@ mod tests {
             mmlu_epochs: 0,
             gsm8k_epochs: 0,
             seed: 42,
+            // The capstone deliberately samples: this is the only place
+            // `sample_chat: true` + `push_user_turn` + `generate_ids` +
+            // `assistant_stop_ids` + `decode_lossy` run together on a real
+            // training loop. It costs 4 forwards — `cadence_fires` fires once
+            // on a 2-step run (at `step == num_iters`), and `sample_tokens: 1`
+            // is what keeps each one to a single token.
+            sample_every: 5,
+            sample_tokens: 1,
+            sample_temperature: 0.0,
         };
         (root, cfg)
     }
@@ -1173,7 +1219,9 @@ mod tests {
         assert_eq!(json["num_iters"], 2);
         assert_eq!(json["grad_accum"], 1);
         assert_eq!(json["tokens_per_step"], cfg.total_batch); // global, as pretrain records it
-        assert_eq!(json["sample_every"], 0); // sampling stays off until phase 5
+        // Non-zero in the fixture on purpose: pinned at 0 this would still pass
+        // if `RunMeta.sample_every` went back to a hardcoded literal.
+        assert_eq!(json["sample_every"], 5);
 
         // The one place `init_lr_frac` becomes observable: dropping the
         // multiplication is a silent 25% LR error at the default 0.8.
