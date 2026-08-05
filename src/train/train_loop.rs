@@ -10,10 +10,11 @@ use super::mem::MemProbe;
 use super::{GroupLrs, GroupWeightDecay, GroupedAdamW, lr_mult};
 use crate::checkpoint::{self, CheckpointMeta};
 use crate::data::{Batch, BatchSource};
-use crate::eval::{BpbAccumulator, evaluate_shard_sums, generate};
+use crate::eval::sample::{SampleOptions, generate_ids};
+use crate::eval::{BpbAccumulator, evaluate_shard_sums};
 use crate::metrics::{MetricRecord, MetricsLogger, Throughput};
 use crate::model::{Gpt, cross_entropy_sum_count};
-use crate::tokenizer::BpeTokenizer;
+use crate::tokenizer::{BpeTokenizer, TokenId};
 
 #[derive(Debug, Clone)]
 pub struct TrainConfig {
@@ -106,6 +107,22 @@ const SAMPLE_PROMPTS: &[&str] = &[
     "The opposite of hot is",
     "My favorite color is",
 ];
+
+/// The prefix an in-loop sample conditions on: a bare completion stem in base
+/// mode, a primed chat turn (`<|user_start|>…<|assistant_start|>`) in chat
+/// mode, which is what a finetuned model was actually trained to continue.
+///
+/// A named function because the sampling hook inside [`train`] cannot run in a
+/// unit test — the same reason [`ignore_rescale`] is one.
+fn sample_prefix(tok: &BpeTokenizer, prompt: &str, chat: bool) -> Vec<TokenId> {
+    let mut ids = vec![tok.bos_id()];
+    if chat {
+        tok.push_user_turn(&mut ids, prompt);
+    } else {
+        ids.extend(tok.encode(prompt));
+    }
+    ids
+}
 
 /// Whether a hook on cadence `every` fires at `step` of a `0..=num_iters` loop.
 fn cadence_fires(step: usize, num_iters: usize, every: usize) -> bool {
@@ -364,17 +381,23 @@ pub fn train(
         }
 
         if dist.is_master() && cadence_fires(step, cfg.num_iters, eval.sample_every) {
+            let opts = SampleOptions {
+                max_tokens: eval.sample_tokens,
+                temperature: eval.sample_temperature,
+                // Greedy here, so the top-k restriction would do nothing.
+                top_k: 0,
+                seed: step as u64,
+            };
             for p in SAMPLE_PROMPTS {
-                let s = generate(
-                    model,
-                    eval.tokenizer,
-                    p,
-                    eval.sample_tokens,
-                    eval.sample_temperature,
-                    step as u64,
-                    device,
-                )?;
-                println!("sample: {s:?}");
+                let prefix = sample_prefix(eval.tokenizer, p, false);
+                let ids = generate_ids(model, &prefix, opts, &[], device, |_| Ok(()))?;
+                // decode_lossy, not decode: a token budget cuts a byte-level
+                // vocab mid-character routinely, and decode's panic would kill
+                // a multi-hour run from inside the training loop.
+                let out = eval.tokenizer.decode_lossy(&ids);
+                // The prompt too — `generate_ids` returns the continuation
+                // alone, and one of the prompts is "".
+                println!("sample {p:?} -> {out:?}");
             }
         }
 
@@ -1072,6 +1095,18 @@ mod tests {
         // every == 0 disables the cadence entirely, including the final step.
         assert!(!cadence_fires(0, n, 0));
         assert!(!cadence_fires(n, n, 0));
+    }
+
+    /// byte_tokenizer: byte value b = token id b, bos=256, user_start=257,
+    /// user_end=258, assistant_start=259.
+    #[test]
+    fn sample_prefix_switches_format() {
+        let tok = crate::test_support::byte_tokenizer();
+        assert_eq!(sample_prefix(&tok, "hi", false), [256, 104, 105]);
+        assert_eq!(
+            sample_prefix(&tok, "hi", true),
+            [256, 257, 104, 105, 258, 259]
+        );
     }
 
     #[test]
