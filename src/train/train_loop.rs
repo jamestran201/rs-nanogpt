@@ -7,9 +7,9 @@ use candle_nn::VarMap;
 
 use super::dist::{DistCtx, canonical_vars};
 use super::mem::MemProbe;
-use super::{GroupLrs, GroupedAdamW, lr_mult};
+use super::{GroupLrs, GroupWeightDecay, GroupedAdamW, lr_mult};
 use crate::checkpoint::{self, CheckpointMeta};
-use crate::data::{Batch, DataLoader};
+use crate::data::{Batch, BatchSource};
 use crate::eval::{BpbAccumulator, evaluate_shard_sums, generate};
 use crate::metrics::{MetricRecord, MetricsLogger, Throughput};
 use crate::model::{Gpt, cross_entropy_sum_count};
@@ -31,10 +31,60 @@ pub struct TrainConfig {
     /// saves a full per-parameter multiply each step.
     pub targets_may_be_ignored: bool,
     pub lrs: GroupLrs,
+    /// Per-group AdamW weight decay. `Default::default()` is pretraining's
+    /// (and the historical) setting; SFT zeroes the matrix group.
+    pub weight_decays: GroupWeightDecay,
     pub warmup_steps: usize,
     pub warmdown_ratio: f64,
     pub final_lr_frac: f64,
     pub log_every: usize,
+}
+
+/// Gradient accumulation from the batch geometry: the global `total_batch` is
+/// reached by whole micro-batches on every rank, so
+/// `grad_accum = total_batch / (gpus · device_batch · sequence_len)`.
+///
+/// Shared by both training phases so their arithmetic and error text cannot
+/// drift. `sequence_len` is a CLI flag for pretraining and comes from the
+/// checkpoint meta for SFT, which is why it is a parameter rather than read
+/// off a config here.
+///
+/// Rejects a zero `gpus` / `device_batch` / `sequence_len` **itself** rather
+/// than trusting the caller to have checked: `usize::is_multiple_of(0)` is
+/// `true` for `0`, so the divisibility test would pass and the division below
+/// would panic. Pretraining happens to check those flags earlier, but SFT calls
+/// this straight after reading the checkpoint meta.
+pub fn validate_batch_geometry(
+    gpus: usize,
+    device_batch: usize,
+    sequence_len: usize,
+    total_batch: usize,
+) -> std::result::Result<usize, String> {
+    if gpus == 0 {
+        return Err("gpus must be >= 1".into());
+    }
+    if device_batch == 0 {
+        return Err("device_batch must be >= 1".into());
+    }
+    if sequence_len == 0 {
+        return Err("sequence_len must be >= 1".into());
+    }
+
+    let per_step = gpus * device_batch * sequence_len;
+    if !total_batch.is_multiple_of(per_step) {
+        return Err(format!(
+            "--total-batch ({total_batch}) must be a multiple of \
+             gpus*device_batch*seq_len ({per_step})"
+        ));
+    }
+    let grad_accum = total_batch / per_step;
+    if grad_accum == 0 {
+        return Err(format!(
+            "--total-batch ({total_batch}) must be at least \
+             gpus*device_batch*seq_len ({per_step})"
+        ));
+    }
+    Ok(grad_accum)
 }
 
 pub struct EvalContext<'a> {
@@ -176,6 +226,25 @@ fn accumulate(acc: &mut GradStore, src: &GradStore, vars: &[Var]) -> Result<()> 
     Ok(())
 }
 
+/// `expected · world / global_count` — the correction from `micro_backward`'s
+/// fixed 1/expected pre-scale to the step's true **global** per-token mean.
+///
+/// With `E` = per-rank expected tokens (`cfg.tokens_per_step`), `W` = world and
+/// `C = Σ_r C_r` the global valid count, each rank enters the gradient `Avg`
+/// holding `g_r = ∇(Σ_r nll)/E`, and the `Avg` supplies a 1/W. For the step
+/// gradient to come out as `∇(Σ_all nll)/C`, each rank must pre-multiply by
+/// `E·W/C` — and `E·W` is just the global `--total-batch`.
+///
+/// At `W = 1` this collapses to today's `E/C_0` bit for bit: candle's
+/// `Tensor * f64` is `affine(1.0, 0.0)`, which is exact.
+///
+/// A named function rather than an expression inlined in the loop: the `W > 1`
+/// branch of [`train`] cannot run on a dev machine, so the test has to be able
+/// to call the real thing (`two_rank_rescale_matches_the_global_per_token_mean`).
+fn ignore_rescale(expected_tokens: &Tensor, world: usize, global_count: &Tensor) -> Result<Tensor> {
+    &(expected_tokens * world as f64)? / global_count
+}
+
 /// Multiply every accumulated grad by the scalar tensor `scale` (on-device,
 /// no host sync). This corrects `micro_backward`'s fixed 1/expected pre-scale
 /// to the step's actual valid-token count — the step gradient becomes the
@@ -192,16 +261,19 @@ fn rescale_grads(grads: &mut GradStore, vars: &[Var], scale: &Tensor) -> Result<
     Ok(())
 }
 
+/// `&mut dyn`, not a generic: `next_batch` is called once per micro-batch,
+/// next to a full forward/backward, so the vtable dispatch is free — and
+/// `train()` stays a single instantiation instead of one per source type.
 pub fn train(
     model: &Gpt,
     varmap: &VarMap,
-    loader: &mut DataLoader,
+    batches: &mut dyn BatchSource,
     cfg: &TrainConfig,
     eval: &EvalContext,
     dist: &DistCtx,
     device: &Device,
 ) -> Result<()> {
-    let mut opt = GroupedAdamW::new(varmap, cfg.lrs, model.config().n_embd)?;
+    let mut opt = GroupedAdamW::new(varmap, cfg.lrs, model.config().n_embd, cfg.weight_decays)?;
     // Canonical (name-sorted) order: NCCL matches collectives across ranks by
     // call order alone, so every per-var walk below uses this one list. The
     // local uses (accumulate/rescale/norm) are order-insensitive anyway.
@@ -315,7 +387,7 @@ pub fn train(
         let mut step_sum = Tensor::zeros((), DType::F32, device)?; // Σ nll over the step
         let mut step_count = Tensor::zeros((), DType::F32, device)?; // Σ valid tokens
         for micro in 0..cfg.grad_accum {
-            let batch = loader.next_batch(device)?;
+            let batch = batches.next_batch(device)?;
             let (b, t) = batch.inputs.dims2()?;
             assert_eq!(
                 cfg.grad_accum * b * t,
@@ -364,20 +436,28 @@ pub fn train(
         let mut grads = accum.expect("grad_accum >= 1 guarantees one micro-batch ran");
 
         if cfg.targets_may_be_ignored {
-            // scale = expected/actual valid tokens, correcting the fixed
-            // 1/expected pre-scale to the step's true count when ignored
-            // targets make micro-batch counts unequal. Exactly 1.0 when they
-            // don't (f32 counts are exact to 2^24, and IEEE guarantees
-            // N/N == 1); with the flag off that holds for every step, so the
-            // whole rescale is skipped.
+            // Correct the fixed 1/expected pre-scale to the step's true count
+            // when ignored targets make micro-batch counts unequal. At world 1
+            // with nothing ignored the scale is exactly 1.0 (f32 counts are
+            // exact to 2^24, and IEEE guarantees N/N == 1); with the flag off
+            // that holds for every step, so the whole rescale is skipped.
             //
-            // Multi-GPU note: this rescale uses the *per-rank* count, so with
-            // ranks seeing different ignored-token counts the reduced result
-            // is an average of per-rank means, not the exact global per-token
-            // mean (that would need the count all-reduced with Sum first).
-            // Pretraining never ignores targets, so the flag stays false and
-            // the distinction is moot; revisit before enabling it under DDP.
-            let scale = (&expected_tokens / &step_count)?;
+            // The count is `Sum`-reduced across ranks *first*, so the scale is
+            // built from the **global** valid count: the step gradient is then
+            // the exact global per-token mean rather than a mean of per-rank
+            // means (see `ignore_rescale`). It is also what keeps a rank whose
+            // micro-batches happen to score nothing from producing
+            // `scale = inf` and spreading `0 × inf = NaN` to every replica
+            // through the gradient Avg — with a global count it simply
+            // contributes zero.
+            //
+            // Exactness: the counts are integers bounded by --total-batch and
+            // f32 is exact to 2^24 = 16.7 M, so both the per-rank counts and
+            // their cross-rank sum are exact for any plausible batch size.
+            // The reduce runs on-device, so it adds no host sync (the loop
+            // syncs only on logging steps, below).
+            let global_count = dist.all_reduce_sum_tensor(&step_count)?;
+            let scale = ignore_rescale(&expected_tokens, dist.world_size(), &global_count)?;
             rescale_grads(&mut grads, &vars, &scale)?;
         }
 
@@ -483,6 +563,7 @@ pub fn train(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::DataLoader;
     use crate::model::{GptConfig, Reduction, cross_entropy};
     use candle_core::DType;
     use candle_nn::VarBuilder;
@@ -515,7 +596,8 @@ mod tests {
             unembedding: 0.01,
             matrix: 0.01,
         };
-        let mut warm = GroupedAdamW::new(vm, lrs, model.config().n_embd)?;
+        let mut warm =
+            GroupedAdamW::new(vm, lrs, model.config().n_embd, GroupWeightDecay::default())?;
         let (g, _, _) = micro_backward(model, inputs, targets, inv, &vm.all_vars())?;
         warm.set_lr_mult(1.0);
         warm.step(&g)?;
@@ -797,6 +879,95 @@ mod tests {
         Ok(())
     }
 
+    /// The DDP form of the rescale, simulated without NCCL: two ranks with
+    /// *different* valid-token counts must compose into the gradient of the
+    /// **global** per-token mean, not a mean of per-rank means.
+    ///
+    /// `train()` performs exactly this composition — `micro_backward` per rank,
+    /// one `ignore_rescale`, then the cross-rank `Avg` — so running it by hand
+    /// covers the `world > 1` branch that neither dev machine can execute.
+    /// Calling `ignore_rescale` (rather than writing `16/13` here) is what makes
+    /// a dropped `world` factor in the implementation fail this test.
+    #[test]
+    fn two_rank_rescale_matches_the_global_per_token_mean() -> Result<()> {
+        let dev = Device::Cpu;
+        let vm = VarMap::new();
+        let model = Gpt::new(tiny_cfg(), VarBuilder::from_varmap(&vm, DType::F32, &dev))?;
+        let vars = vm.all_vars();
+
+        let inputs = Tensor::new(
+            &[
+                [1u32, 2, 3, 4],
+                [5, 6, 7, 8],
+                [9, 10, 11, 12],
+                [13, 14, 15, 16],
+            ],
+            &dev,
+        )?;
+        // Rank A (rows 0-1) scores 5 tokens; rank B (rows 2-3) scores 8.
+        let targets = Tensor::new(
+            &[
+                [2i64, 3, 4, 5],
+                [6, -1, -1, -1],
+                [10, 11, 12, 13],
+                [14, 15, 16, 17],
+            ],
+            &dev,
+        )?;
+
+        // Must come first: at strict init the zeroed c_proj leaves
+        // c_q/c_k/c_v/c_fc with exactly zero gradient and candle stores
+        // nothing, so a scale error would be invisible on those params.
+        warm_one_step(&vm, &model, &inputs, &targets, 1.0 / 16.0)?;
+
+        // Ground truth: autograd through the global valid-token mean (13).
+        let logits = model.forward(&inputs)?;
+        let want = cross_entropy(&logits, &targets, -1, Reduction::Mean)?.backward()?;
+
+        // E = grad_accum(1) · B(2) · T(4) = 8 expected tokens *per rank*.
+        let inv = 1.0 / 8.0;
+        let (mut g_a, _, count_a) = micro_backward(
+            &model,
+            &inputs.narrow(0, 0, 2)?,
+            &targets.narrow(0, 0, 2)?,
+            inv,
+            &vars,
+        )?;
+        let (mut g_b, _, count_b) = micro_backward(
+            &model,
+            &inputs.narrow(0, 2, 2)?,
+            &targets.narrow(0, 2, 2)?,
+            inv,
+            &vars,
+        )?;
+
+        // The global count an `all_reduce_sum_tensor` would produce.
+        let global_count = (count_a + count_b)?;
+        assert_eq!(global_count.to_scalar::<f32>()?, 13.0);
+        let scale = ignore_rescale(&Tensor::full(8f32, (), &dev)?, 2, &global_count)?;
+        rescale_grads(&mut g_a, &vars, &scale)?;
+        rescale_grads(&mut g_b, &vars, &scale)?;
+
+        // The cross-rank `Avg` (1/world), by hand.
+        let mut got = GradStore::default();
+        for v in &vars {
+            let t = v.as_tensor();
+            if let (Some(a), Some(b)) = (g_a.get(t), g_b.get(t)) {
+                got.insert(t, ((a + b)? * 0.5)?);
+            }
+        }
+
+        // ∇Σ_A · 16/(8·13) + ∇Σ_B · 16/(8·13), halved, is ∇Σ_all/13 — exactly
+        // what Reduction::Mean divides by. A per-rank scale would give
+        // 0.5(∇Σ_A/5 + ∇Σ_B/8); a missing world factor, ∇Σ_all/26.
+        let compared = compare_grads(&want, &got, &vars, "global-mean vs two-rank")?;
+        assert!(
+            compared >= 8,
+            "expected several params compared, got {compared}"
+        );
+        Ok(())
+    }
+
     /// The stepping loop (micro_backward → schedule → grouped step) drives the
     /// loss down over many steps, finite throughout (grad_accum = 1).
     #[test]
@@ -820,12 +991,13 @@ mod tests {
                 unembedding: 0.004,
                 matrix: 0.01,
             },
+            weight_decays: GroupWeightDecay::default(),
             warmup_steps: 10,
             warmdown_ratio: 0.65,
             final_lr_frac: 0.05,
             log_every: 1000,
         };
-        let mut opt = GroupedAdamW::new(&vm, tcfg.lrs, n_embd)?;
+        let mut opt = GroupedAdamW::new(&vm, tcfg.lrs, n_embd, tcfg.weight_decays)?;
 
         let mut last = f32::NAN;
         let mut first = f32::NAN;
@@ -851,6 +1023,39 @@ mod tests {
         }
         assert!(last < first, "loss did not decrease: {first} -> {last}");
         Ok(())
+    }
+
+    /// The geometry both phases share: accepts the pretrain defaults, and
+    /// `grad_accum` is the whole-micro-batch quotient, so it scales with every
+    /// factor of the denominator.
+    #[test]
+    fn validate_batch_geometry_computes_grad_accum() {
+        // 32 · 512 = 16384 per rank-step ⇒ grad_accum 1 at one GPU.
+        assert_eq!(validate_batch_geometry(1, 32, 512, 16384), Ok(1));
+        assert_eq!(validate_batch_geometry(1, 32, 512, 4 * 16384), Ok(4));
+        // Adding ranks divides the per-rank work, not the global batch.
+        assert_eq!(validate_batch_geometry(8, 32, 512, 8 * 16384), Ok(1));
+        assert_eq!(validate_batch_geometry(8, 32, 512, 32 * 16384), Ok(4));
+    }
+
+    /// The zeros this rejects itself. `is_multiple_of(0)` is `true` for `0`, so
+    /// without these the divisibility test passes and the division panics —
+    /// reachable from SFT, which calls this straight after `load_meta`.
+    #[test]
+    fn validate_batch_geometry_rejects_zero_factors_before_dividing() {
+        assert!(validate_batch_geometry(0, 32, 512, 16384).is_err());
+        assert!(validate_batch_geometry(1, 0, 512, 16384).is_err());
+        assert!(validate_batch_geometry(1, 32, 0, 16384).is_err());
+    }
+
+    #[test]
+    fn validate_batch_geometry_rejects_a_total_batch_that_does_not_fit() {
+        // Not a whole number of micro-batches.
+        assert!(validate_batch_geometry(1, 32, 512, 16384 + 1).is_err());
+        // A multiple of the per-step size, but less than one of them.
+        assert!(validate_batch_geometry(1, 32, 512, 0).is_err());
+        // Enough for one rank's micro-batch, but not for two ranks'.
+        assert!(validate_batch_geometry(2, 32, 512, 16384).is_err());
     }
 
     #[test]
@@ -969,6 +1174,7 @@ mod tests {
                 unembedding: 0.004,
                 matrix: 0.01,
             },
+            weight_decays: GroupWeightDecay::default(),
             warmup_steps: 1,
             warmdown_ratio: 0.5,
             final_lr_frac: 0.05,

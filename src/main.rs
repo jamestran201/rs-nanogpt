@@ -1,24 +1,25 @@
-use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use candle_core::DType;
 use candle_nn::{VarBuilder, VarMap};
 use clap::{Parser, Subcommand};
+use rs_nanogpt::checkpoint;
 use rs_nanogpt::data::{BASE_URL, DataLoader, MAX_SHARD, Split, download_shards};
 use rs_nanogpt::eval::tokenizer as tokenizer_eval;
-use rs_nanogpt::metrics::{MetricsLogger, RunMeta, write_run_json};
+use rs_nanogpt::metrics::{MetricsLogger, RunMeta, unique_run_dir, write_run_json};
 use rs_nanogpt::model::{
     DEFAULT_N_EMBD, DEFAULT_N_HEAD, DEFAULT_N_LAYER, DEFAULT_NORM_EPS, DEFAULT_ROPE_BASE,
     DEFAULT_SEQUENCE_LEN, Gpt, GptConfig, compute_dtype, default_device,
 };
+use rs_nanogpt::sft::{self, SftConfig};
 use rs_nanogpt::tasks::download_sft_data;
 use rs_nanogpt::tokenizer::{BpeTokenizer, BpeTokenizerTrainer};
 use rs_nanogpt::train::dist::{self, ChildEnv};
 use rs_nanogpt::train::{
     DEFAULT_FINAL_LR_FRAC, DEFAULT_WARMDOWN_RATIO, DEFAULT_WARMUP_STEPS, DistCtx, EvalContext,
-    GroupLrs, TrainConfig, train,
+    GroupLrs, GroupWeightDecay, TrainConfig, train, validate_batch_geometry,
 };
 
 #[derive(Parser)]
@@ -58,6 +59,8 @@ enum Command {
     },
     /// Pretrain a GPT model.
     Pretrain(PretrainArgs),
+    /// Chat-finetune a pretrained checkpoint on the SFT mixture.
+    Sft(SftArgs),
     /// Download pretraining dataset shards into a local directory.
     DownloadData(DownloadArgs),
     /// Download the SFT datasets (SmolTalk, MMLU, GSM8K, identity conversations).
@@ -92,11 +95,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // single-process run (everything else).
             let result: Result<(), Box<dyn std::error::Error>> = match dist::child_env() {
                 Err(e) => Err(e.into()),
-                Ok(None) if args.gpus > 1 => run_launcher(&args),
+                Ok(None) if args.gpus > 1 => {
+                    // Validate before spawning, so N processes do not start
+                    // only to hit the same bad flag.
+                    validate_pretrain_args(&args).and_then(|()| run_launcher(args.gpus))
+                }
                 Ok(child) => run_pretrain(args, child),
             };
             if let Err(err) = result {
                 eprintln!("pretrain failed: {err}");
+                process::exit(1);
+            }
+        }
+        Command::Sft(args) => {
+            // The same three roles as Pretrain: launcher parent, spawned rank,
+            // plain single-process run.
+            let result: Result<(), Box<dyn std::error::Error>> = match dist::child_env() {
+                Err(e) => Err(e.into()),
+                Ok(None) if args.gpus > 1 => launch_sft(args),
+                Ok(child) => run_sft(args, child),
+            };
+            if let Err(err) = result {
+                eprintln!("sft failed: {err}");
                 process::exit(1);
             }
         }
@@ -235,25 +255,15 @@ fn validate_pretrain_args(args: &PretrainArgs) -> Result<(), Box<dyn std::error:
         return Err("--gpus must be >= 1".into());
     }
 
-    // Gradient accumulation: the global total_batch is reached by whole
-    // micro-batches on every rank: grad_accum = total_batch / (gpus · micro).
-    let micro = args.device_batch * args.sequence_len;
-    let per_step = args.gpus * micro;
-    if !args.total_batch.is_multiple_of(per_step) {
-        return Err(format!(
-            "--total-batch ({}) must be a multiple of gpus*device_batch*seq_len ({per_step})",
-            args.total_batch
-        )
-        .into());
-    }
-    let grad_accum = args.total_batch / per_step;
-    if grad_accum == 0 {
-        return Err(format!(
-            "--total-batch ({}) must be at least gpus*device_batch*seq_len ({per_step})",
-            args.total_batch
-        )
-        .into());
-    }
+    // The divisibility math, shared with `sft` so the two cannot drift. The
+    // zero checks above are now redundant with its own, but they carry
+    // flag-specific messages, so they stay.
+    validate_batch_geometry(
+        args.gpus,
+        args.device_batch,
+        args.sequence_len,
+        args.total_batch,
+    )?;
 
     if args.eval_every > 0 && args.eval_steps == 0 {
         return Err("--eval-steps must be >= 1 when --eval-every > 0".into());
@@ -271,51 +281,75 @@ fn validate_pretrain_args(args: &PretrainArgs) -> Result<(), Box<dyn std::error:
     Ok(())
 }
 
-fn unique_run_dir(root: &Path, id: &str) -> io::Result<PathBuf> {
-    std::fs::create_dir_all(root)?;
-    let names = std::iter::once(String::new()).chain((2u32..).map(|n| format!("-{n}")));
-    for suffix in names {
-        let candidate = root.join(format!("{id}{suffix}"));
-        match std::fs::create_dir(&candidate) {
-            Ok(()) => return Ok(candidate),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e),
-        }
-    }
-    unreachable!("u32 run-dir suffixes exhausted")
-}
-
 /// The `--gpus N` parent: generate the NCCL rendezvous id, re-execute this
 /// binary once per GPU with the rank identity in env vars, and supervise.
-fn run_launcher(args: &PretrainArgs) -> Result<(), Box<dyn std::error::Error>> {
-    // Fail fast on bad args before N processes get spawned to hit the same error.
-    validate_pretrain_args(args)?;
+///
+/// The caller validates first — spawning N processes only for all of them to
+/// hit the same bad flag is the failure this ordering avoids — and the two
+/// subcommands validate differently (SFT has to read the checkpoint meta for
+/// its sequence length), which is why this takes only `gpus`.
+fn run_launcher(gpus: usize) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(not(feature = "nccl"))]
     {
-        Err(format!(
-            "--gpus {} needs multi-GPU support; rebuild with --features nccl",
-            args.gpus
-        )
-        .into())
+        Err(format!("--gpus {gpus} needs multi-GPU support; rebuild with --features nccl").into())
     }
     #[cfg(feature = "nccl")]
     {
         let id_hex = dist::generate_nccl_id_hex()?;
         let exe = std::env::current_exe()?;
         let argv: Vec<String> = std::env::args().skip(1).collect();
-        println!("spawning {} ranks (one process per GPU)", args.gpus);
-        let mut children = Vec::with_capacity(args.gpus);
-        for rank in 0..args.gpus {
+        println!("spawning {gpus} ranks (one process per GPU)");
+        let mut children = Vec::with_capacity(gpus);
+        for rank in 0..gpus {
             let child = process::Command::new(&exe)
                 .args(&argv)
                 .env(dist::ENV_RANK, rank.to_string())
-                .env(dist::ENV_WORLD_SIZE, args.gpus.to_string())
+                .env(dist::ENV_WORLD_SIZE, gpus.to_string())
                 .env(dist::ENV_NCCL_ID, &id_hex)
                 .spawn()
                 .map_err(|e| format!("failed to spawn rank {rank}: {e}"))?;
             children.push(child);
         }
         supervise_ranks(children)
+    }
+}
+
+/// The compute device and distributed context for one process.
+///
+/// Single process: today's device selection, no communicator. Spawned rank:
+/// bind to this rank's GPU and join the NCCL world (nccl builds only — the
+/// launcher refuses to spawn without the feature, so reaching the `Some` arm
+/// without it means hand-set env vars).
+fn init_device(
+    child: Option<ChildEnv>,
+    gpus: usize,
+) -> Result<(candle_core::Device, DistCtx), Box<dyn std::error::Error>> {
+    match child {
+        None => Ok((default_device()?, DistCtx::single())),
+        #[cfg(feature = "nccl")]
+        Some(env) => {
+            if env.world_size != gpus {
+                return Err(format!(
+                    "{} ({}) disagrees with --gpus ({gpus}); the env vars are launcher-internal",
+                    dist::ENV_WORLD_SIZE,
+                    env.world_size,
+                )
+                .into());
+            }
+            let device = candle_core::Device::new_cuda(env.rank)?;
+            let dist = DistCtx::new_nccl(&device, &env)?;
+            Ok((device, dist))
+        }
+        #[cfg(not(feature = "nccl"))]
+        Some(env) => {
+            let _ = gpus;
+            Err(format!(
+                "{} is set (rank {}) but this binary was built without the nccl feature",
+                dist::ENV_RANK,
+                env.rank
+            )
+            .into())
+        }
     }
 }
 
@@ -364,41 +398,14 @@ fn run_pretrain(
     child: Option<ChildEnv>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     validate_pretrain_args(&args)?;
+    let (device, dist) = init_device(child, args.gpus)?;
 
-    // Single process: today's device selection, no communicator. Spawned
-    // rank: bind to this rank's GPU and join the NCCL world (nccl builds
-    // only — the launcher refuses to spawn without the feature, so reaching
-    // here without it means hand-set env vars).
-    let (device, dist) = match child {
-        None => (default_device()?, DistCtx::single()),
-        #[cfg(feature = "nccl")]
-        Some(env) => {
-            if env.world_size != args.gpus {
-                return Err(format!(
-                    "{} ({}) disagrees with --gpus ({}); the env vars are launcher-internal",
-                    dist::ENV_WORLD_SIZE,
-                    env.world_size,
-                    args.gpus
-                )
-                .into());
-            }
-            let device = candle_core::Device::new_cuda(env.rank)?;
-            let dist = DistCtx::new_nccl(&device, &env)?;
-            (device, dist)
-        }
-        #[cfg(not(feature = "nccl"))]
-        Some(env) => {
-            return Err(format!(
-                "{} is set (rank {}) but this binary was built without the nccl feature",
-                dist::ENV_RANK,
-                env.rank
-            )
-            .into());
-        }
-    };
-
-    let micro = args.device_batch * args.sequence_len;
-    let grad_accum = args.total_batch / (args.gpus * micro);
+    let grad_accum = validate_batch_geometry(
+        args.gpus,
+        args.device_batch,
+        args.sequence_len,
+        args.total_batch,
+    )?;
     let train_cfg = TrainConfig {
         num_iters: args.num_iters,
         grad_accum,
@@ -413,6 +420,9 @@ fn run_pretrain(
             unembedding: args.unembedding_lr,
             matrix: args.matrix_lr,
         },
+        // Pretraining keeps the decays that were hardcoded before the knob
+        // existed; only SFT deviates.
+        weight_decays: GroupWeightDecay::default(),
         warmup_steps: args.warmup_steps,
         warmdown_ratio: args.warmdown_ratio,
         final_lr_frac: args.final_lr_frac,
@@ -484,6 +494,7 @@ fn run_pretrain(
         println!("run dir: {}", run_dir.display());
 
         let run_meta = RunMeta {
+            phase: "pretrain",
             device: format!("{device:?}"),
             dtype: "f32",
             started_at_unix,
@@ -515,6 +526,7 @@ fn run_pretrain(
             eval_every: args.eval_every,
             eval_steps: args.eval_steps,
             sample_every: args.sample_every,
+            sft: None,
         };
         write_run_json(&run_dir.join("run.json"), &run_meta)?;
         let metrics = MetricsLogger::create(&run_dir.join("metrics.jsonl"))?;
@@ -543,6 +555,154 @@ fn run_pretrain(
         &dist,
         &device,
     )?;
+    Ok(())
+}
+
+#[derive(clap::Args)]
+struct SftArgs {
+    /// Pretrained checkpoint to finetune, e.g. out-d24/<run>/best.
+    #[arg(long)]
+    checkpoint: PathBuf,
+    /// Directory holding the downloaded SFT datasets (run download-sft-data).
+    #[arg(long)]
+    data: PathBuf,
+    /// Tiktoken-format vocabulary. Must be the one the checkpoint was
+    /// pretrained with — a mismatch loads fine and scores garbage.
+    #[arg(long)]
+    vocab: PathBuf,
+    /// AdamW LR for the token embedding (wte), before --init-lr-frac. Required:
+    /// pass the value your pretraining run used.
+    #[arg(long)]
+    embedding_lr: f64,
+    /// AdamW LR for the unembedding (lm_head), before --init-lr-frac.
+    #[arg(long)]
+    unembedding_lr: f64,
+    /// AdamW LR for the block matrices, before --init-lr-frac.
+    #[arg(long)]
+    matrix_lr: f64,
+    /// Runs root; each run writes to <out>/<unix-timestamp>/ (run.json,
+    /// metrics.jsonl, best/).
+    #[arg(long, default_value = "out-sft")]
+    out: PathBuf,
+    /// Number of GPUs (data-parallel ranks). With N > 1 this process becomes a
+    /// launcher, as `pretrain --gpus N` does.
+    #[arg(long, default_value_t = 1)]
+    gpus: usize,
+    /// Rows per forward pass (B). Memory-limited; reduce if you OOM.
+    #[arg(long, default_value_t = 8)]
+    device_batch: usize,
+    /// Global tokens per optimizer step (summed over all GPUs). Must be a
+    /// multiple of gpus*device_batch*seq_len, where seq_len comes from the
+    /// checkpoint. Required: pass the value your pretraining run used.
+    ///
+    /// Not defaulted, for the reason the three LRs are not: nanochat's SFT
+    /// inherits this from the checkpoint meta (chat_sft.py:100-113, where
+    /// 524288 is only the fallback for a checkpoint that lacks it), our
+    /// meta.txt stores geometry only, and LRs are scaled against the batch
+    /// size at pretrain time (base_train.py:288-294). A default would let a
+    /// forgotten flag train the pasted LRs at half the tokens per step they
+    /// were scaled for, with nothing in the output to show it.
+    #[arg(long)]
+    total_batch: usize,
+    /// Optimizer steps. Omit to train exactly one epoch over the packed
+    /// mixture; a value may only shorten that, never extend it.
+    #[arg(long)]
+    num_iters: Option<usize>,
+    /// Scales all three LRs at the start of the finetune (nanochat's SFT
+    /// scaling). run.json records the post-scaling values.
+    #[arg(long, default_value_t = 0.8)]
+    init_lr_frac: f64,
+    /// Linear LR warmup steps.
+    #[arg(long, default_value_t = 0)]
+    warmup_steps: usize,
+    /// Fraction of the run spent in linear LR warmdown.
+    #[arg(long, default_value_t = 0.5)]
+    warmdown_ratio: f64,
+    /// Final LR as a fraction of base LR (warmdown floor).
+    #[arg(long, default_value_t = 0.0)]
+    final_lr_frac: f64,
+    /// Log loss every N steps.
+    #[arg(long, default_value_t = 10)]
+    log_every: usize,
+    /// Compute val loss/bpb every N steps. Must be >= 1: unlike pretrain, the
+    /// best-bpb checkpoint is this run's only output.
+    #[arg(long, default_value_t = 200)]
+    eval_every: usize,
+    /// Val micro-batches to snapshot. Also sizes the val mixture's cap.
+    #[arg(long, default_value_t = 100)]
+    eval_steps: usize,
+    /// Copies of MMLU auxiliary_train in the mixture (0 omits it entirely).
+    #[arg(long, default_value_t = 3)]
+    mmlu_epochs: usize,
+    /// Copies of GSM8K train in the mixture (0 omits it entirely).
+    #[arg(long, default_value_t = 4)]
+    gsm8k_epochs: usize,
+    /// Seed for the mixture shuffle and the val caps. Every rank must use the
+    /// same one — they build identical packs without communicating.
+    #[arg(long, default_value_t = 42)]
+    seed: u64,
+}
+
+/// Map the parsed flags onto the library's config. Consumes `args` so the
+/// paths move rather than clone.
+///
+/// Mechanical, but not free of risk: several destination fields are same-typed
+/// and adjacent in meaning, so a crossed line here would type-check and pass
+/// `SftConfig::validate`. `sft_flags_map_to_the_right_config_fields` is what
+/// pins it.
+fn sft_config(args: SftArgs) -> SftConfig {
+    SftConfig {
+        checkpoint: args.checkpoint,
+        data: args.data,
+        vocab: args.vocab,
+        out: args.out,
+        device_batch: args.device_batch,
+        total_batch: args.total_batch,
+        gpus: args.gpus,
+        num_iters: args.num_iters,
+        lrs: GroupLrs {
+            embedding: args.embedding_lr,
+            unembedding: args.unembedding_lr,
+            matrix: args.matrix_lr,
+        },
+        init_lr_frac: args.init_lr_frac,
+        warmup_steps: args.warmup_steps,
+        warmdown_ratio: args.warmdown_ratio,
+        final_lr_frac: args.final_lr_frac,
+        log_every: args.log_every,
+        eval_every: args.eval_every,
+        eval_steps: args.eval_steps,
+        mmlu_epochs: args.mmlu_epochs,
+        gsm8k_epochs: args.gsm8k_epochs,
+        seed: args.seed,
+    }
+}
+
+/// The `sft --gpus N` parent. Unlike pretrain's, it has to read the checkpoint
+/// meta first: `sequence_len` is not a flag here, and the batch geometry cannot
+/// be checked without it. `load_meta`, not `load` — the parent never
+/// materializes weights.
+fn launch_sft(args: SftArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let cfg = sft_config(args);
+    cfg.validate()?;
+    let meta = checkpoint::load_meta(&cfg.checkpoint)?;
+    validate_batch_geometry(
+        cfg.gpus,
+        cfg.device_batch,
+        meta.config.sequence_len,
+        cfg.total_batch,
+    )?;
+    run_launcher(cfg.gpus)
+}
+
+fn run_sft(args: SftArgs, child: Option<ChildEnv>) -> Result<(), Box<dyn std::error::Error>> {
+    let cfg = sft_config(args);
+    // Before `init_device`, so a typo'd flag does not first initialize CUDA and
+    // join an NCCL world. `sft::run` re-checks — it is a library entry point
+    // with its own callers — but this is where the *CLI* error surfaces.
+    cfg.validate()?;
+    let (device, dist) = init_device(child, cfg.gpus)?;
+    sft::run(&cfg, &device, &dist)?;
     Ok(())
 }
 
@@ -671,28 +831,184 @@ fn run_download_sft(args: DownloadSftArgs) -> Result<(), Box<dyn std::error::Err
 mod tests {
     use super::*;
 
-    /// First call claims `root/<id>`; each subsequent call with the same id walks
-    /// to the next `-N` suffix, and every returned path is a real, distinct dir.
+    /// clap's own consistency check over the whole derive: duplicate long
+    /// names, conflicting flags, defaults that do not parse as their type. It
+    /// covers every subcommand at once, and catches these at test time rather
+    /// than on first invocation on the box.
     #[test]
-    fn unique_run_dir_walks_suffixes_on_collision() {
-        let root = tempfile::tempdir().unwrap();
-        let a = unique_run_dir(root.path(), "run").unwrap();
-        let b = unique_run_dir(root.path(), "run").unwrap();
-        let c = unique_run_dir(root.path(), "run").unwrap();
-        assert_eq!(a, root.path().join("run"));
-        assert_eq!(b, root.path().join("run-2"));
-        assert_eq!(c, root.path().join("run-3"));
-        assert!(a.is_dir() && b.is_dir() && c.is_dir());
+    fn cli_is_well_formed() {
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
     }
 
-    /// The root is created on demand, so a not-yet-existing `--out` just works.
+    /// Parse an `sft` argv and return the mapped config, panicking on a parse
+    /// error. Goes through `try_parse_from` rather than a struct literal so the
+    /// real flag names and `required`/default attributes are exercised.
+    fn parse_sft(argv: &[&str]) -> SftConfig {
+        match Cli::try_parse_from(argv)
+            .expect("argv should parse")
+            .command
+        {
+            Command::Sft(args) => sft_config(args),
+            _ => panic!("expected the sft subcommand"),
+        }
+    }
+
+    /// The minimum viable invocation: the four paths plus the three required
+    /// LRs.
+    fn minimal_sft_argv() -> Vec<&'static str> {
+        vec![
+            "rs-nanogpt",
+            "sft",
+            "--checkpoint",
+            "ckpt",
+            "--data",
+            "sft-data",
+            "--vocab",
+            "vocab.txt",
+            "--embedding-lr",
+            "0.4243",
+            "--unembedding-lr",
+            "0.01131",
+            "--matrix-lr",
+            "0.003",
+            "--total-batch",
+            "1048576",
+        ]
+    }
+
+    /// Every flag lands in its own config field.
+    ///
+    /// Each same-typed group gets a *distinct* value — `eval_every`/`eval_steps`,
+    /// `mmlu_epochs`/`gsm8k_epochs`, `warmdown_ratio`/`final_lr_frac`/`init_lr_frac`,
+    /// `warmup_steps`/`log_every`, and the three LRs — because a crossed line
+    /// in ~20 lines of hand mapping type-checks and passes `validate`. Distinct
+    /// values are what make the crossing observable.
     #[test]
-    fn unique_run_dir_creates_missing_root() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("does/not/exist/yet");
-        let dir = unique_run_dir(&root, "1752192000").unwrap();
-        assert_eq!(dir, root.join("1752192000"));
-        assert!(dir.is_dir());
+    fn sft_flags_map_to_the_right_config_fields() {
+        let cfg = parse_sft(&[
+            "rs-nanogpt",
+            "sft",
+            "--checkpoint",
+            "out-d24/run/best",
+            "--data",
+            "my-sft-data",
+            "--vocab",
+            "my-vocab.txt",
+            "--out",
+            "my-runs",
+            "--embedding-lr",
+            "0.11",
+            "--unembedding-lr",
+            "0.22",
+            "--matrix-lr",
+            "0.33",
+            "--gpus",
+            "8",
+            "--device-batch",
+            "4",
+            "--total-batch",
+            "262144",
+            "--num-iters",
+            "77",
+            "--init-lr-frac",
+            "0.6",
+            "--warmup-steps",
+            "5",
+            "--warmdown-ratio",
+            "0.4",
+            "--final-lr-frac",
+            "0.2",
+            "--log-every",
+            "9",
+            "--eval-every",
+            "300",
+            "--eval-steps",
+            "50",
+            "--mmlu-epochs",
+            "2",
+            "--gsm8k-epochs",
+            "6",
+            "--seed",
+            "1234",
+        ]);
+
+        assert_eq!(cfg.checkpoint, PathBuf::from("out-d24/run/best"));
+        assert_eq!(cfg.data, PathBuf::from("my-sft-data"));
+        assert_eq!(cfg.vocab, PathBuf::from("my-vocab.txt"));
+        assert_eq!(cfg.out, PathBuf::from("my-runs"));
+        assert_eq!(cfg.lrs.embedding, 0.11);
+        assert_eq!(cfg.lrs.unembedding, 0.22);
+        assert_eq!(cfg.lrs.matrix, 0.33);
+        assert_eq!(cfg.gpus, 8);
+        assert_eq!(cfg.device_batch, 4);
+        assert_eq!(cfg.total_batch, 262_144);
+        assert_eq!(cfg.num_iters, Some(77));
+        assert_eq!(cfg.init_lr_frac, 0.6);
+        assert_eq!(cfg.warmup_steps, 5);
+        assert_eq!(cfg.warmdown_ratio, 0.4);
+        assert_eq!(cfg.final_lr_frac, 0.2);
+        assert_eq!(cfg.log_every, 9);
+        assert_eq!(cfg.eval_every, 300);
+        assert_eq!(cfg.eval_steps, 50);
+        assert_eq!(cfg.mmlu_epochs, 2);
+        assert_eq!(cfg.gsm8k_epochs, 6);
+        assert_eq!(cfg.seed, 1234);
+        // The mapped config is one `sft::run` would accept.
+        assert_eq!(cfg.validate(), Ok(()));
+    }
+
+    /// The flags SFT refuses to guess. All four describe the *pretraining* run
+    /// rather than this one, none is recoverable from our `meta.txt`, and a
+    /// wrong value for any of them produces a plausible-looking finetune at the
+    /// wrong LR/batch relationship — a forgotten `--embedding-lr` would default
+    /// a d24 finetune to roughly half the LR it was pretrained with, and a
+    /// defaulted `--total-batch` to half its tokens per step, with nothing in
+    /// the output to say so.
+    #[test]
+    fn sft_requires_the_flags_it_cannot_infer() {
+        assert!(Cli::try_parse_from(minimal_sft_argv()).is_ok());
+        for flag in [
+            "--embedding-lr",
+            "--unembedding-lr",
+            "--matrix-lr",
+            "--total-batch",
+        ] {
+            let argv = minimal_sft_argv();
+            let at = argv.iter().position(|a| *a == flag).expect("flag present");
+            let without: Vec<&str> = argv
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != at && *i != at + 1)
+                .map(|(_, a)| *a)
+                .collect();
+            assert!(
+                Cli::try_parse_from(&without).is_err(),
+                "{flag} must be required"
+            );
+        }
+    }
+
+    /// The defaults the runbook documents, so a bare invocation is the
+    /// intended run rather than whatever clap fell back to.
+    #[test]
+    fn sft_defaults_match_the_documented_cli() {
+        let cfg = parse_sft(&minimal_sft_argv());
+        assert_eq!(cfg.out, PathBuf::from("out-sft"));
+        assert_eq!(cfg.gpus, 1);
+        assert_eq!(cfg.device_batch, 8);
+        assert_eq!(cfg.num_iters, None, "absent means the whole epoch");
+        assert_eq!(cfg.init_lr_frac, 0.8);
+        assert_eq!(cfg.warmup_steps, 0);
+        assert_eq!(cfg.warmdown_ratio, 0.5);
+        assert_eq!(cfg.final_lr_frac, 0.0);
+        assert_eq!(cfg.log_every, 10);
+        assert_eq!(cfg.eval_every, 200);
+        assert_eq!(cfg.eval_steps, 100);
+        assert_eq!(cfg.mmlu_epochs, 3);
+        assert_eq!(cfg.gsm8k_epochs, 4);
+        assert_eq!(cfg.seed, 42);
+        assert_eq!(cfg.validate(), Ok(()));
     }
 
     /// A known-good set of args; tests mutate one field to probe a single rule.

@@ -31,9 +31,7 @@ pub fn save(dir: &Path, varmap: &VarMap, meta: &CheckpointMeta) -> Result<()> {
 /// `meta.config.vocab_size` against its own tokenizer (a real footgun — a
 /// checkpoint built with a different vocab would load but score garbage).
 pub fn load(dir: &Path, device: &Device) -> Result<(Gpt, VarMap, CheckpointMeta)> {
-    let contents = fs::read_to_string(dir.join(META_FILE))?;
-    let meta = parse_meta(&contents)?;
-    meta.config.validate()?;
+    let meta = load_meta(dir)?;
 
     let mut varmap = VarMap::new();
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, device);
@@ -41,6 +39,31 @@ pub fn load(dir: &Path, device: &Device) -> Result<(Gpt, VarMap, CheckpointMeta)
     varmap.load(dir.join(MODEL_FILE))?;
 
     Ok((model, varmap, meta))
+}
+
+/// The meta-only half of [`load`]: geometry and provenance without touching
+/// `model.safetensors`.
+///
+/// For callers that need the model's `sequence_len` / `vocab_size` *before*
+/// materializing weights — a finetune has to size its batch geometry and
+/// cross-check its tokenizer first, and a multi-GPU launcher has to do that in
+/// the parent before spawning N processes that would all hit the same error.
+///
+/// Keeps [`load`]'s `config.validate()`: that is what rejects
+/// `sequence_len == 0`, and every caller feeds `sequence_len` straight into
+/// batch arithmetic.
+pub fn load_meta(dir: &Path) -> Result<CheckpointMeta> {
+    // Name the file. A mistyped `--checkpoint` is the likeliest first error of
+    // any run that takes one, and a bare "No such file or directory" does not
+    // say whether the directory, the meta file, or the path spelling is wrong.
+    // The `ErrorKind` is preserved, so `NotFound` stays matchable.
+    let path = dir.join(META_FILE);
+    let contents = fs::read_to_string(&path).map_err(|e| {
+        std::io::Error::new(e.kind(), format!("checkpoint {}: {e}", path.display()))
+    })?;
+    let meta = parse_meta(&contents)?;
+    meta.config.validate()?;
+    Ok(meta)
 }
 
 fn write_meta(meta: &CheckpointMeta) -> String {
@@ -208,6 +231,52 @@ mod tests {
         .map(|l| format!("{l}\n"))
         .collect();
         assert!(parse_meta(&without_n_head).is_err());
+    }
+
+    /// `load_meta` reads the same meta `load` does without needing (or reading)
+    /// the weights, and still validates the config.
+    #[test]
+    fn load_meta_reads_geometry_without_the_weights() -> Result<()> {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = CheckpointMeta {
+            config: tiny_cfg(),
+            step: 1234,
+            val_bpb: 0.875,
+        };
+        fs::write(dir.path().join(META_FILE), write_meta(&meta))?;
+
+        // No model.safetensors written: the point is that this path never
+        // touches it.
+        assert!(!dir.path().join(MODEL_FILE).exists());
+        meta_eq(&meta, &load_meta(dir.path())?);
+
+        // The validate() that load() performs is still in force.
+        let mut bad = tiny_cfg();
+        bad.sequence_len = 0;
+        fs::write(
+            dir.path().join(META_FILE),
+            write_meta(&CheckpointMeta {
+                config: bad,
+                step: 0,
+                val_bpb: 1.0,
+            }),
+        )?;
+        assert!(load_meta(dir.path()).is_err());
+        Ok(())
+    }
+
+    /// A missing checkpoint names the path it looked for. `--checkpoint`
+    /// pointing at a run dir instead of its `best/` subdir is the common slip,
+    /// and "No such file or directory" alone does not locate it.
+    #[test]
+    fn a_missing_checkpoint_names_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("not-a-run");
+        let err = load_meta(&missing).unwrap_err().to_string();
+        assert!(
+            err.contains(&missing.join(META_FILE).display().to_string()),
+            "error should name the meta path, got {err:?}"
+        );
     }
 
     #[test]

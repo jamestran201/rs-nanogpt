@@ -12,14 +12,23 @@ use candle_nn::{VarBuilder, VarMap};
 use crate::model::{Block, CausalSelfAttention, Gpt, GptConfig, Rope, build_causal_mask};
 use crate::tokenizer::BpeTokenizer;
 
+/// Write [`byte_tokenizer`]'s vocabulary to `path`, for tests that hand a
+/// *path* to code that opens the file itself (`sft::run` takes `vocab:
+/// PathBuf`) — `byte_tokenizer`'s own file is a `NamedTempFile` that drops when
+/// it returns.
+pub(crate) fn write_byte_vocab(path: &Path) {
+    let mut file = std::fs::File::create(path).unwrap();
+    for b in 0u32..256 {
+        writeln!(file, "{} {}", STANDARD.encode([b as u8]), b).unwrap();
+    }
+    file.flush().unwrap();
+}
+
 /// A byte-level tokenizer: one token per byte value, no merges.
 /// `from_file` reads eagerly, so the backing tempfile can be dropped on return.
 pub(crate) fn byte_tokenizer() -> BpeTokenizer {
-    let mut vocab_file = tempfile::NamedTempFile::new().unwrap();
-    for b in 0u32..256 {
-        writeln!(vocab_file, "{} {}", STANDARD.encode([b as u8]), b).unwrap();
-    }
-    vocab_file.flush().unwrap();
+    let vocab_file = tempfile::NamedTempFile::new().unwrap();
+    write_byte_vocab(vocab_file.path());
     BpeTokenizer::from_file(vocab_file.path()).unwrap()
 }
 

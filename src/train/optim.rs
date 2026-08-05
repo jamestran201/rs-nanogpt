@@ -9,6 +9,33 @@ pub struct GroupLrs {
     pub matrix: f64,
 }
 
+/// Per-group AdamW weight decay. A phase-level policy knob: pretraining keeps
+/// the defaults, SFT zeroes the matrix group.
+///
+/// Why only the matrix group for SFT: nanochat's chat finetune passes
+/// `weight_decay=0.0` (`chat_sft.py:134`), which — traced through its optimizer
+/// construction (`gpt.py:393-408`) — reaches only the Muon (matrix) param
+/// groups; the AdamW embedding/unembedding decays are hardcoded at 0.001/0.01
+/// in both phases. So the faithful port zeroes the matrix group alone.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GroupWeightDecay {
+    pub embedding: f64,
+    pub unembedding: f64,
+    pub matrix: f64,
+}
+
+impl Default for GroupWeightDecay {
+    /// The values `GroupedAdamW` hardcoded before this became configurable;
+    /// pretraining keeps them.
+    fn default() -> Self {
+        Self {
+            embedding: 0.001,
+            unembedding: 0.01,
+            matrix: 0.1,
+        }
+    }
+}
+
 enum Group {
     Embedding,
     Unembedding,
@@ -63,7 +90,12 @@ pub struct GroupedAdamW {
 }
 
 impl GroupedAdamW {
-    pub fn new(varmap: &VarMap, lrs: GroupLrs, n_embd: usize) -> Result<Self> {
+    pub fn new(
+        varmap: &VarMap,
+        lrs: GroupLrs,
+        n_embd: usize,
+        wd: GroupWeightDecay,
+    ) -> Result<Self> {
         let g = partition(varmap)?;
         let scale = mup_lr_scale(n_embd);
         let base_lrs = GroupLrs {
@@ -79,7 +111,7 @@ impl GroupedAdamW {
                 beta1: 0.8,
                 beta2: 0.995,
                 eps: 1e-10,
-                weight_decay: 0.001,
+                weight_decay: wd.embedding,
             },
         )?;
         let unembedding = AdamW::new(
@@ -89,7 +121,7 @@ impl GroupedAdamW {
                 beta1: 0.8,
                 beta2: 0.96,
                 eps: 1e-10,
-                weight_decay: 0.01,
+                weight_decay: wd.unembedding,
             },
         )?;
         let matrix = AdamW::new(
@@ -99,7 +131,7 @@ impl GroupedAdamW {
                 beta1: 0.9,
                 beta2: 0.95,
                 eps: 1e-8,
-                weight_decay: 0.1,
+                weight_decay: wd.matrix,
             },
         )?;
 
@@ -136,7 +168,7 @@ impl GroupedAdamW {
 
 #[cfg(test)]
 mod tests {
-    use super::{Group, GroupLrs, GroupedAdamW, classify, partition};
+    use super::{Group, GroupLrs, GroupWeightDecay, GroupedAdamW, classify, partition};
     use crate::model::{Gpt, GptConfig, Reduction, cross_entropy};
     use candle_core::{DType, Device, Result, Tensor};
     use candle_nn::{AdamW, Optimizer, ParamsAdamW, VarBuilder, VarMap};
@@ -262,7 +294,7 @@ mod tests {
             unembedding: 0.004,
             matrix: 0.02,
         };
-        let mut opt = GroupedAdamW::new(&vm, lrs, n_embd)?;
+        let mut opt = GroupedAdamW::new(&vm, lrs, n_embd, GroupWeightDecay::default())?;
         let loss = cross_entropy(&model.forward(&inputs)?, &targets, -1, Reduction::Mean)?;
         let grads = loss.backward()?;
         opt.step(&grads)?;
@@ -275,6 +307,106 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    /// The whole content of the weight-decay seam is **per-group routing**, so
+    /// that is what this pins: three distinct decays, and a crossed wire cannot
+    /// hide behind a shared value.
+    ///
+    /// Mechanism: with a **zero** gradient candle's AdamW leaves only the
+    /// decoupled decay term `θ·(1 − lr·wd)` — `m̂ = 0`, `v̂ = 0`, and
+    /// `0/(0 + eps) = 0` kill the update (`candle-nn/src/optim.rs`). So each
+    /// group's params shrink by exactly its own `1 − lr_g·wd_g`, where `lr_g` is
+    /// the muP-scaled base LR.
+    #[test]
+    fn weight_decay_routes_to_the_right_group() -> Result<()> {
+        let dev = Device::Cpu;
+        let vm = VarMap::new();
+        let cfg = tiny_cfg();
+        let n_embd = cfg.n_embd;
+        let _model = Gpt::new(cfg, VarBuilder::from_varmap(&vm, DType::F32, &dev))?;
+
+        let lrs = GroupLrs {
+            embedding: 0.2,
+            unembedding: 0.004,
+            matrix: 0.02,
+        };
+        let wd = GroupWeightDecay {
+            embedding: 0.1,
+            unembedding: 0.2,
+            matrix: 0.3,
+        };
+        // The lr·wd *products* must stay distinct — equal ones would collapse
+        // two factors and let a crossing pass.
+        let scale = (n_embd as f64 / 768.0).powf(-0.5); // √96 ≈ 9.798
+        let factor = |lr: f64, d: f64| (1.0 - lr * scale * d) as f32;
+        let names = [
+            ("wte.weight", factor(lrs.embedding, wd.embedding)),
+            ("lm_head.weight", factor(lrs.unembedding, wd.unembedding)),
+            ("blocks.0.attn.c_proj.weight", factor(lrs.matrix, wd.matrix)),
+        ];
+        for (i, (n, f)) in names.iter().enumerate() {
+            for (m, g) in names.iter().skip(i + 1) {
+                assert!(
+                    (f - g).abs() > 1e-3,
+                    "{n} and {m} share a decay factor ({f} vs {g}); the test cannot \
+                     detect a crossed wire"
+                );
+            }
+        }
+
+        let snapshot = |name: &str| -> Result<Vec<f32>> {
+            let data = vm.data().lock().unwrap();
+            data[name].as_tensor().flatten_all()?.to_vec1::<f32>()
+        };
+        let before: Vec<Vec<f32>> = names
+            .iter()
+            .map(|(n, _)| snapshot(n))
+            .collect::<Result<_>>()?;
+
+        // A zero gradient for one var per group.
+        let mut grads = candle_core::backprop::GradStore::default();
+        {
+            let data = vm.data().lock().unwrap();
+            for (n, _) in &names {
+                let t = data[*n].as_tensor();
+                grads.insert(t, t.zeros_like()?);
+            }
+        }
+        let mut opt = GroupedAdamW::new(&vm, lrs, n_embd, wd)?;
+        opt.set_lr_mult(1.0);
+        opt.step(&grads)?;
+
+        for ((n, f), b) in names.iter().zip(&before) {
+            for (after, &orig) in snapshot(n)?.iter().zip(b) {
+                // Bit-exact: candle's `affine` casts the f64 factor to f32 and
+                // multiplies, so this is the same arithmetic the step did —
+                // asserting a computed ratio instead would need a tolerance.
+                assert_eq!(
+                    *after,
+                    orig * f,
+                    "group param {n} decayed by the wrong factor"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// The SFT policy literal spells out to "pretraining's AdamW decays, matrix
+    /// group off" — the whole of what nanochat's `weight_decay=0.0` does.
+    #[test]
+    fn sft_decay_literal_zeroes_only_the_matrix_group() {
+        assert_eq!(
+            GroupWeightDecay {
+                matrix: 0.0,
+                ..Default::default()
+            },
+            GroupWeightDecay {
+                embedding: 0.001,
+                unembedding: 0.01,
+                matrix: 0.0,
+            }
+        );
     }
 
     #[test]
@@ -290,7 +422,7 @@ mod tests {
             unembedding: 0.004,
             matrix: 0.02,
         };
-        let mut opt = GroupedAdamW::new(&vm, lrs, n_embd)?;
+        let mut opt = GroupedAdamW::new(&vm, lrs, n_embd, GroupWeightDecay::default())?;
 
         // Expected uses the muP scale to the *first* power; a double-applied
         // width factor would fail this, pinning the double-count risk.
