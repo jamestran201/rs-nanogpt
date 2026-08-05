@@ -271,6 +271,32 @@ impl BpeTokenizer {
 
         Ok(r.finish(max_tokens))
     }
+
+    /// Append one user turn plus the `<|assistant_start|>` that primes the
+    /// reply: `<|user_start|>{text}<|user_end|><|assistant_start|>`. The
+    /// incremental, inference-time counterpart of
+    /// [`render_conversation`](Self::render_conversation), for callers that
+    /// build a conversation turn by turn (`chat_cli.py:72-77`) rather than
+    /// re-rendering a message list.
+    ///
+    /// The wire format has one owner: this must agree with
+    /// `render_conversation` on the prefill shape, which
+    /// `push_user_turn_matches_render_conversation` pins.
+    pub fn push_user_turn(&self, ids: &mut Vec<TokenId>, text: &str) {
+        let sp = ChatSpecials::resolve(self);
+        ids.push(sp.user_start);
+        ids.extend(self.encode(text));
+        ids.push(sp.user_end);
+        ids.push(sp.assistant_start);
+    }
+
+    /// The ids that end an assistant turn at inference: `<|assistant_end|>`
+    /// (the trained stop token) and `<|bos|>` (a document boundary the model
+    /// should never emit mid-reply; nanochat treats it as terminal too,
+    /// `engine.py:254`).
+    pub fn assistant_stop_ids(&self) -> [TokenId; 2] {
+        [ChatSpecials::resolve(self).assistant_end, self.bos_id()]
+    }
 }
 
 #[cfg(test)]
@@ -410,6 +436,37 @@ mod tests {
         let r = render(&conv(vec![user("Hi")]));
         assert_eq!(r.ids, [256, 257, 72, 105, 258]);
         assert!(r.mask.iter().all(|&m| !m));
+    }
+
+    /// The incremental builder must agree with the whole-conversation
+    /// renderer: `[bos] ++ push_user_turn(t)` is the render of a
+    /// conversation ending on that user turn, plus the `<|assistant_start|>`
+    /// that primes the reply. Checked after an assistant turn too, since a
+    /// REPL keeps appending to the same id stream.
+    #[test]
+    fn push_user_turn_matches_render_conversation() {
+        let tok = byte_tokenizer();
+        let assistant_start = tok.special_id("<|assistant_start|>").unwrap();
+
+        let mut ids = vec![tok.bos_id()];
+        tok.push_user_turn(&mut ids, "Hi");
+        let mut want = render(&conv(vec![user("Hi")])).ids;
+        want.push(assistant_start);
+        assert_eq!(ids, want);
+
+        // The model's reply enters the stream as ids; the next push must then
+        // match a full re-render of all three messages.
+        ids.extend(tok.encode("Yo"));
+        ids.push(tok.special_id("<|assistant_end|>").unwrap());
+        tok.push_user_turn(&mut ids, "Bye");
+        let mut want = render(&conv(vec![user("Hi"), assistant("Yo"), user("Bye")])).ids;
+        want.push(assistant_start);
+        assert_eq!(ids, want);
+    }
+
+    #[test]
+    fn assistant_stop_ids_are_assistant_end_and_bos() {
+        assert_eq!(byte_tokenizer().assistant_stop_ids(), [260, 256]);
     }
 
     /// `decode` renders specials as literal strings, so the round trip shows
