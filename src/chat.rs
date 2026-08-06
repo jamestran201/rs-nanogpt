@@ -52,9 +52,14 @@ impl ChatConfig {
         // `SampleOptions` treats `<= 0` as greedy, which is the cheap library
         // contract; without this rule `--temperature -1` would be silently
         // greedy here while `sft --sample-temperature -1` errors.
-        if self.temperature < 0.0 {
+        // `is_finite` first, as `--init-lr-frac` does: `x < 0.0` alone is false
+        // for NaN, and `f64: FromStr` yields `inf` on overflow rather than an
+        // error. Both slip past the greedy branch into `sample`, where NaN
+        // weights make `draw` fall through to the last vocab id for *every*
+        // token and `inf` flattens the softmax to uniform — silently, either way.
+        if !self.temperature.is_finite() || self.temperature < 0.0 {
             return Err(format!(
-                "--temperature must be >= 0, got {}",
+                "--temperature must be a finite value >= 0, got {}",
                 self.temperature
             ));
         }
@@ -64,6 +69,10 @@ impl ChatConfig {
 
 /// Load the checkpoint and talk to it on stdin/stdout.
 pub fn run(cfg: &ChatConfig, device: &Device) -> Result<()> {
+    // Defend against our own callers, as `sft::run` does: this is a library
+    // entry point, and `main`'s check only covers the CLI path.
+    cfg.validate().map_err(candle_core::Error::msg)?;
+
     // Cheap checks before the safetensors read, as `sft::run` does.
     let meta = checkpoint::load_meta(&cfg.checkpoint)?;
     let tok = BpeTokenizer::from_file(&cfg.vocab)?;
@@ -130,6 +139,7 @@ pub fn repl(
         };
 
         if text.eq_ignore_ascii_case("quit") || text.eq_ignore_ascii_case("exit") {
+            writeln!(out, "Goodbye!")?;
             return Ok(());
         } else if text.eq_ignore_ascii_case("clear") {
             ids = vec![tok.bos_id()];
@@ -195,7 +205,8 @@ fn chat_turn(
     // The decoder holds back a partial UTF-8 sequence rather than printing
     // U+FFFD in the middle of every multi-byte character.
     let mut dec = tok.decode_stream();
-    let mut generated = generate_ids(model, ids, opts, &tok.assistant_stop_ids(), device, |id| {
+    let stop = tok.assistant_stop_ids();
+    let mut generated = generate_ids(model, ids, opts, &stop, device, |id| {
         out.write_all(dec.push(id).as_bytes())?;
         out.flush()?;
         Ok(())
@@ -203,9 +214,18 @@ fn chat_turn(
     out.write_all(dec.finish().as_bytes())?;
     writeln!(out)?;
 
+    // A reply may terminate on either stop id. `<|bos|>` is the pretraining
+    // *document* delimiter — `render_conversation` only ever emits it at
+    // position 0 — so leaving it in the history would tell the model a new
+    // document started, off-distribution conditioning for every later turn.
+    // Drop it. (`chat_cli.py:92-95` keeps it, but `engine.py:286` states the
+    // intended rule: "Terminal tokens (assistant_end, bos) are not included".)
+    let [assistant_end, bos] = stop;
+    if generated.last() == Some(&bos) {
+        generated.pop();
+    }
     // Budget exhaustion leaves the turn unterminated. Appending the stop token
     // keeps the next turn's history well-formed (`chat_cli.py:92-95`).
-    let assistant_end = tok.assistant_stop_ids()[0];
     if generated.last() != Some(&assistant_end) {
         generated.push(assistant_end);
     }
@@ -317,7 +337,8 @@ mod tests {
     /// (`us h i ue as`) to the `[bos]` already there, so turn 1 always has
     /// `room == 6`; the shortest possible post-turn history is 7 (`max_tokens
     /// >= 1` and `room >= 1` force at least one generated token, and the
-    /// cheapest is that token being `<|assistant_end|>` itself), so a second
+    /// cheapest is that token being `<|assistant_end|>` itself, or a `<|bos|>`
+    /// the fixup pops and replaces with one), so a second
     /// push of 5 always leaves `room == 0`. The refusal case is the point —
     /// without it, "post-`clear` succeeds" proves nothing about `clear`.
     #[test]
@@ -358,6 +379,32 @@ mod tests {
         Ok(())
     }
 
+    /// The middle of the three budget outcomes — the one where the `min` could
+    /// be inverted or the count misreported with nothing else noticing.
+    /// `sequence_len: 12` forces it: `[bos]` plus the 5 ids `push_user_turn`
+    /// appends leaves `room == 6`, below `max_tokens == 8`.
+    #[test]
+    fn chat_turn_warns_when_the_budget_truncates_the_reply() -> Result<()> {
+        let dev = Device::Cpu;
+        let tok = byte_tokenizer();
+        let (_vm, model) = tiny_gpt(tok.vocab_size(), 12);
+        let cfg = chat_cfg(8);
+
+        let mut ids = vec![tok.bos_id()];
+        let mut out: Vec<u8> = Vec::new();
+        chat_turn(&model, &tok, &cfg, &dev, &mut ids, "hi", &mut out)?;
+
+        let printed = text_of(&out);
+        assert!(
+            printed.contains("only 6 of the 12-token context"),
+            "got {printed:?}"
+        );
+        // Warned, not refused: the turn still runs.
+        assert!(printed.contains("Assistant:"));
+        assert_user_span(&tok, &ids, 1, "hi");
+        Ok(())
+    }
+
     #[test]
     fn repl_prompt_mode_runs_exactly_one_turn() -> Result<()> {
         let dev = Device::Cpu;
@@ -391,5 +438,9 @@ mod tests {
         assert_eq!(chat_cfg(256).validate(), Ok(()));
         rejects(|c| c.max_tokens = 0);
         rejects(|c| c.temperature = -0.1);
+        // Both slip past `< 0.0` and degenerate sampling silently: NaN pins
+        // every draw to the last vocab id, inf flattens it to uniform.
+        rejects(|c| c.temperature = f64::NAN);
+        rejects(|c| c.temperature = f64::INFINITY);
     }
 }

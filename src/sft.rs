@@ -191,9 +191,12 @@ impl SftConfig {
         if self.sample_every > 0 && self.sample_tokens == 0 {
             return Err("--sample-tokens must be >= 1 when --sample-every > 0".into());
         }
-        if self.sample_temperature < 0.0 {
+        // `is_finite` first, for the reason `--init-lr-frac` gives above: NaN
+        // and inf both slip past `< 0.0` and past `sample`'s greedy branch,
+        // then degenerate sampling without erroring.
+        if !self.sample_temperature.is_finite() || self.sample_temperature < 0.0 {
             return Err(format!(
-                "--sample-temperature must be >= 0, got {}",
+                "--sample-temperature must be a finite value >= 0, got {}",
                 self.sample_temperature
             ));
         }
@@ -852,6 +855,10 @@ mod tests {
         rejects(|c| c.eval_every = 0);
         rejects(|c| c.sample_tokens = 0);
         rejects(|c| c.sample_temperature = -0.1);
+        // `-0.1` alone would pass against a bare `< 0.0`, leaving the
+        // finiteness guard unpinned and free to be "simplified" away.
+        rejects(|c| c.sample_temperature = f64::NAN);
+        rejects(|c| c.sample_temperature = f64::INFINITY);
         // ...but sampling off entirely is fine, and then sample_tokens is moot.
         let mut off = valid_config();
         off.sample_every = 0;

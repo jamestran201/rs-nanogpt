@@ -20,8 +20,9 @@ pub struct SampleOptions {
 }
 
 /// Continue `prefix` (a non-empty, already-rendered token sequence), one token
-/// at a time. Batch size 1, no KV cache: each step re-forwards the whole
-/// context, cropped to the model's `sequence_len`.
+/// at a time. An empty `prefix` is an `Err`, not a panic. Batch size 1, no KV
+/// cache: each step re-forwards the whole context, cropped to the model's
+/// `sequence_len`.
 ///
 /// Returns the *generated* ids only (never the prefix). Generation ends at
 /// `max_tokens` or on the first id in `stop`; a stop id **is** in the return
@@ -35,6 +36,11 @@ pub fn generate_ids(
     device: &Device,
     mut on_token: impl FnMut(TokenId) -> Result<()>,
 ) -> Result<Vec<TokenId>> {
+    // The doc'd precondition, enforced: an empty prefix would underflow
+    // `ctx.len() - 1` below rather than returning the `Result` we promise.
+    if prefix.is_empty() {
+        candle_core::bail!("generate_ids: prefix must be non-empty");
+    }
     let seq_len = model.config().sequence_len;
 
     let mut ids = Vec::with_capacity(prefix.len() + opts.max_tokens);
@@ -253,6 +259,39 @@ mod tests {
         assert!(
             !fired,
             "the callback must not fire when nothing is generated"
+        );
+    }
+
+    #[test]
+    fn empty_prefix_is_an_error_not_an_underflow() {
+        let (_vm, model) = tiny_gpt(byte_tokenizer().vocab_size(), 64);
+        let e = generate_ids(&model, &[], opts(4, 0.0, 0), &[], &Device::Cpu, |_| Ok(()))
+            .expect_err("an empty prefix has no last position to read logits from");
+        assert!(e.to_string().contains("must be non-empty"), "{e}");
+    }
+
+    /// `top_k_one_is_greedy` pins the comparator's direction but can only catch
+    /// an off-by-one in `truncate` probabilistically. Crafted logits make the
+    /// boundary exact: with `k == 2`, ids 0 and 3 must never be drawn.
+    ///
+    /// The four logits are deliberately *near-competitive*. Spreading them out
+    /// would make the test vacuous against the very mutant it advertises: at
+    /// `[0, 10, 9, -5]` a `truncate(top_k + 1)` bug leaks id 0 with probability
+    /// 3e-5, so 200 draws would miss it ~99% of the time. Within half a nat,
+    /// the leak is 0.24 per draw and cannot hide.
+    #[test]
+    fn top_k_restricts_to_exactly_the_k_largest() {
+        // Descending: 1 (10.0), 2 (9.9), then 0 (9.5), 3 (9.4).
+        let logits = [9.5f32, 10.0, 9.9, 9.4];
+        let mut rng = ChaCha8Rng::seed_from_u64(0);
+        let mut seen = [false; 4];
+        for _ in 0..200 {
+            seen[sample(&logits, 1.0, 2, &mut rng)] = true;
+        }
+        assert_eq!(
+            seen,
+            [false, true, true, false],
+            "only the top 2 logits are reachable, and both are"
         );
     }
 }

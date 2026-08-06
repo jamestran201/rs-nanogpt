@@ -280,9 +280,11 @@ fn validate_pretrain_args(args: &PretrainArgs) -> Result<(), Box<dyn std::error:
     if args.sample_every > 0 && args.sample_tokens == 0 {
         return Err("--sample-tokens must be >= 1 when --sample-every > 0".into());
     }
-    if args.sample_temperature < 0.0 {
+    // `is_finite` first: NaN and inf both slip past `< 0.0`, then degenerate
+    // sampling silently rather than erroring.
+    if !args.sample_temperature.is_finite() || args.sample_temperature < 0.0 {
         return Err(format!(
-            "--sample-temperature must be >= 0, got {}",
+            "--sample-temperature must be a finite value >= 0, got {}",
             args.sample_temperature
         )
         .into());
@@ -1138,7 +1140,7 @@ mod tests {
         assert_eq!(cfg.seed, 1234);
         assert_eq!(cfg.validate(), Ok(()));
 
-        // nanochat's chat defaults (chat_cli.py:17-19, :81), and no prompt
+        // nanochat's chat defaults (chat_cli.py:17-19, :80), and no prompt
         // means the REPL rather than a single shot.
         let bare = match Cli::try_parse_from([
             "rs-nanogpt",
@@ -1291,8 +1293,12 @@ mod tests {
     }
 
     #[test]
-    fn rejects_negative_sample_temperature() {
+    fn rejects_non_finite_or_negative_sample_temperature() {
         rejects(|a| a.sample_temperature = -0.1);
+        // `-0.1` alone would pass against a bare `< 0.0`, leaving the
+        // finiteness guard unpinned and free to be "simplified" away.
+        rejects(|a| a.sample_temperature = f64::NAN);
+        rejects(|a| a.sample_temperature = f64::INFINITY);
     }
 
     /// A known-good set of download args; tests mutate one field to probe a rule.
