@@ -2,7 +2,7 @@ use candle_core::{DType, Device, IndexOp, Result, Tensor};
 use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
-use crate::model::Gpt;
+use crate::model::{Gpt, KvCache};
 use crate::tokenizer::TokenId;
 
 #[derive(Debug, Clone, Copy)]
@@ -20,9 +20,11 @@ pub struct SampleOptions {
 }
 
 /// Continue `prefix` (a non-empty, already-rendered token sequence), one token
-/// at a time. An empty `prefix` is an `Err`, not a panic. Batch size 1, no KV
-/// cache: each step re-forwards the whole context, cropped to the model's
-/// `sequence_len`.
+/// at a time. An empty `prefix` is an `Err`, not a panic. Batch size 1, over a
+/// KV cache: the prefix is forwarded once and each step afterwards forwards
+/// only the token it just sampled — until the history outgrows the model's
+/// `sequence_len`, past which the window slides and each step re-forwards the
+/// whole cropped window.
 ///
 /// Returns the *generated* ids only (never the prefix). Generation ends at
 /// `max_tokens` or on the first id in `stop`; a stop id **is** in the return
@@ -46,17 +48,43 @@ pub fn generate_ids(
     let mut ids = Vec::with_capacity(prefix.len() + opts.max_tokens);
     ids.extend_from_slice(prefix);
 
+    // One allocation for the whole call, not one per token — sized to the
+    // longest context this call can actually reach. `reset` below keeps it.
+    let capacity = seq_len.min(prefix.len() + opts.max_tokens);
+    let mut cache = KvCache::new(model.config(), capacity)?;
+
     let mut rng = ChaCha8Rng::seed_from_u64(opts.seed);
     for _ in 0..opts.max_tokens {
-        // No KV-cache: re-forward the whole (cropped) context each step.
+        // The cache holds `ids[..cache.pos()]`. Normally that is everything but
+        // the token just sampled, so exactly one token is fed. Once the history
+        // outgrows the context the window slides, every cached key's RoPE angle
+        // shifts, and the cache has to be rebuilt from the cropped window —
+        // which is the same full re-forward the pre-cache loop did every step,
+        // so no step gets asymptotically slower and the logits stay comparable.
         let start = ids.len().saturating_sub(seq_len);
-        let ctx = &ids[start..];
-        let input = Tensor::from_vec(ctx.to_vec(), (1, ctx.len()), device)?;
-        let logits = model.forward(&input)?;
+        if start > 0 {
+            cache.reset();
+        }
+        // Covers both branches: after a reset `pos == 0` so `start` wins; with
+        // no crop `start == 0` so `pos` wins. Never empty — with no crop
+        // `ids.len() == pos + 1` by induction (`start` never decreases, since
+        // `ids` only grows, so a crop step is never *followed* by a non-crop
+        // one and the invariant is never re-entered after a reset breaks it),
+        // or `prefix.len()` on the first step; and after a crop
+        // `start < ids.len()` since `seq_len >= 1`. That non-emptiness is what
+        // protects the `n - 1` below.
+        let feed = &ids[start.max(cache.pos())..];
+
+        // `n` before the tensor: `feed` borrows `ids`, which `ids.push(next)`
+        // needs back. NLL ends the borrow here either way, but binding the
+        // length keeps a later reorder from breaking the build obscurely.
+        let n = feed.len();
+        let input = Tensor::from_vec(feed.to_vec(), (1, n), device)?;
+        let logits = model.forward_with_cache(&input, &mut cache)?;
         // Upcast before the host read: `to_vec1::<f32>` requires an exact
         // dtype match and errors on the bf16 logits a CUDA forward produces.
         let last = logits
-            .i((0, ctx.len() - 1))?
+            .i((0, n - 1))?
             .to_dtype(DType::F32)?
             .to_vec1::<f32>()?;
 
@@ -131,8 +159,53 @@ fn draw(weights: &[f64], rng: &mut ChaCha8Rng) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{byte_tokenizer, tiny_gpt};
+    use crate::test_support::{byte_tokenizer, detie, tiny_gpt};
     use crate::tokenizer::BpeTokenizer;
+
+    /// The pre-KV-cache loop, kept as the parity oracle for the cached one:
+    /// re-forward the whole cropped context every step. Deliberately a copy
+    /// rather than a refactor — an oracle sharing code with what it checks
+    /// would move along with it. No stop handling; the callers pass none.
+    fn generate_ids_uncached(
+        model: &Gpt,
+        prefix: &[TokenId],
+        opts: SampleOptions,
+        device: &Device,
+    ) -> Result<Vec<TokenId>> {
+        let seq_len = model.config().sequence_len;
+        let mut ids = Vec::with_capacity(prefix.len() + opts.max_tokens);
+        ids.extend_from_slice(prefix);
+
+        let mut rng = ChaCha8Rng::seed_from_u64(opts.seed);
+        for _ in 0..opts.max_tokens {
+            let start = ids.len().saturating_sub(seq_len);
+            let ctx = &ids[start..];
+            let input = Tensor::from_vec(ctx.to_vec(), (1, ctx.len()), device)?;
+            let logits = model.forward(&input)?;
+            let last = logits
+                .i((0, ctx.len() - 1))?
+                .to_dtype(DType::F32)?
+                .to_vec1::<f32>()?;
+            let next = if opts.temperature <= 0.0 {
+                argmax(&last)
+            } else {
+                sample(&last, opts.temperature, opts.top_k, &mut rng)
+            } as TokenId;
+            ids.push(next);
+        }
+        Ok(ids.split_off(prefix.len()))
+    }
+
+    /// `tiny_gpt`, de-tied. Both are needed for a token-equality test: at init
+    /// every block is the identity, so the logits are position-independent and
+    /// a cache that ignored its own contents would pass; and `lm_head` is
+    /// tiny-init, so top-2 logit gaps are the same order as the
+    /// cached-vs-uncached numerical difference and argmax would be a coin flip.
+    fn detied_gpt(vocab: usize, seq_len: usize) -> Gpt {
+        let (mut vm, model) = tiny_gpt(vocab, seq_len);
+        detie(&mut vm, model.config(), &Device::Cpu).unwrap();
+        model
+    }
 
     /// The base-format prefix a pretraining sample conditions on.
     fn prefix(tok: &BpeTokenizer, text: &str) -> Vec<TokenId> {
@@ -192,6 +265,52 @@ mod tests {
 
         let out = generate_ids(&model, &p, opts(30, 1.0, 5), &[], &dev, |_| Ok(())).unwrap();
         assert_eq!(out.len(), 30);
+    }
+
+    /// **The Part E gate.** Everything below this exercises the sampling
+    /// contract; this is the only test that exercises what the cache added —
+    /// the `start` / `cache.pos()` / `reset` / `capacity` bookkeeping at the
+    /// loop head. A hand-rolled cache loop in the test would re-test the model
+    /// instead, which `gpt.rs` already covers.
+    ///
+    /// It pins *what* the loop computes, not *how much* it forwards. A
+    /// regression to re-prefilling the whole context every step — an
+    /// unconditional `cache.reset()`, say — is still correct and still fits
+    /// `capacity`, so it would pass here — and no *value-level* test can catch
+    /// it: the returned ids are identical, and `capacity` is derived from
+    /// exactly the quantities a re-prefill is bounded by, so it cannot fire
+    /// either. Only cost is observable, which is why the one-token-per-step
+    /// property is gated by the timed `chat --max-tokens 200` run in the plan's
+    /// Verification section rather than here.
+    #[test]
+    fn cached_generation_matches_the_uncached_reference() {
+        let dev = Device::Cpu;
+        let tok = byte_tokenizer();
+        let model = detied_gpt(tok.vocab_size(), 64);
+        let p = prefix(&tok, "hello");
+        let o = opts(20, 0.0, 0);
+
+        let cached = generate_ids(&model, &p, o, &[], &dev, |_| Ok(())).unwrap();
+        let uncached = generate_ids_uncached(&model, &p, o, &dev).unwrap();
+        assert_eq!(cached.len(), 20);
+        assert_eq!(cached, uncached);
+    }
+
+    #[test]
+    fn generation_past_seq_len_matches_the_uncached_reference() {
+        // The crop/reset branch, which the config above never enters: 8-token
+        // context, 12 generated, so every step past the 8th rebuilds the cache
+        // from the slid window.
+        let dev = Device::Cpu;
+        let tok = byte_tokenizer();
+        let model = detied_gpt(tok.vocab_size(), 8);
+        let p = prefix(&tok, "context");
+        let o = opts(12, 0.0, 0);
+
+        let cached = generate_ids(&model, &p, o, &[], &dev, |_| Ok(())).unwrap();
+        let uncached = generate_ids_uncached(&model, &p, o, &dev).unwrap();
+        assert_eq!(cached.len(), 12);
+        assert_eq!(cached, uncached);
     }
 
     /// Self-calibrating: the stop id is taken from an unrestricted run, so the

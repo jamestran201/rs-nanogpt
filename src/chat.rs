@@ -171,12 +171,13 @@ fn chat_turn(
     let base = ids.len();
     tok.push_user_turn(ids, text);
 
-    // Without a KV cache and with `sequence_len` fixed by RoPE, a long chat
-    // eventually outgrows the context. `generate_ids` would crop to the last
-    // `seq_len` ids — dropping BOS and starting mid-turn, which reads as
-    // confident nonsense — so the budget is checked here instead, and the crop
-    // path is closed rather than merely avoided: with `room >= 1`, the longest
-    // context any forward sees is `seq_len - 1`.
+    // With `sequence_len` fixed by RoPE, a long chat eventually outgrows the
+    // context — the KV cache makes generation cheap, not the window longer.
+    // `generate_ids` would crop to the last `seq_len` ids — dropping BOS and
+    // starting mid-turn, which reads as confident nonsense — so the budget is
+    // checked here instead, and the crop path is closed rather than merely
+    // avoided: with `room >= 1`, the longest context any forward sees is
+    // `seq_len - 1`.
     let room = seq_len.saturating_sub(ids.len());
     if room == 0 {
         ids.truncate(base);
