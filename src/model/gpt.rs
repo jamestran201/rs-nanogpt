@@ -6,6 +6,7 @@ use super::block::Block;
 use super::config::GptConfig;
 use super::device::compute_dtype;
 use super::embedding::TokenEmbedding;
+use super::kv_cache::KvCache;
 use super::linear::Linear;
 use super::rms_norm::rms_norm;
 use super::rope::Rope;
@@ -55,10 +56,53 @@ impl Gpt {
 
     /// Map token ids `idx: (B, T)` to logits `(B, T, vocab_size)`.
     pub fn forward(&self, idx: &Tensor) -> Result<Tensor> {
+        self.forward_inner(idx, None)
+    }
+
+    /// Incremental forward over a KV cache: `idx` is the **new span only**, and
+    /// the returned logits `(B, T_new, vocab_size)` cover only that span. The
+    /// span is taken to start at `cache.pos()`, so the caller feeds the prompt
+    /// once and then one token per step.
+    ///
+    /// The cache lives with the caller rather than inside the model: `forward`
+    /// takes `&self` and is called from eight places, none of which want a
+    /// cache, so owning one here would mean either `&mut self` everywhere or a
+    /// mutex bought for nothing.
+    pub fn forward_with_cache(&self, idx: &Tensor, cache: &mut KvCache) -> Result<Tensor> {
+        self.forward_inner(idx, Some(cache))
+    }
+
+    fn forward_inner(&self, idx: &Tensor, mut cache: Option<&mut KvCache>) -> Result<Tensor> {
+        // One read of T for both cache calls: they sit on opposite sides of the
+        // block loop and `advance` cannot fail, so disagreeing values would not
+        // surface until a much later `slice_set` bail.
+        let (_b, t) = idx.dims2()?;
+        // The span's absolute start, read once and threaded to every layer —
+        // *not* a length per layer. `check_room` runs before any layer writes,
+        // and `advance` after every layer has, so a failure mid-loop leaves the
+        // position untouched and the next forward simply rewrites the same
+        // offsets. Per-layer lengths would instead desync silently, rotating
+        // every later key in the lagging layers to the wrong position.
+        let t0 = match cache.as_deref() {
+            Some(c) => {
+                c.check_room(t)?;
+                c.pos()
+            }
+            None => 0,
+        };
+
         let mut x = self.wte.forward(idx)?.to_dtype(self.compute_dtype)?;
-        for block in &self.blocks {
-            x = block.forward(&x)?;
+        for (i, block) in self.blocks.iter().enumerate() {
+            // `as_deref_mut` reborrows the option each iteration; moving it in
+            // would consume it on the first block.
+            let kv = cache.as_deref_mut().map(|c| c.layer_mut(i));
+            x = block.forward_inner(&x, kv, t0)?;
         }
+        // Moves the option — this is its last use, and the block loop is done.
+        if let Some(c) = cache {
+            c.advance(t);
+        }
+
         let x = rms_norm(&x, self.config.norm_eps)?;
         self.lm_head.forward(&x)
     }
@@ -171,6 +215,78 @@ mod tests {
             "expected near-zero init logits, got max {:?}",
             logits.iter().cloned().fold(0.0f32, |m, v| m.max(v.abs()))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn forward_with_cache_matches_forward() -> Result<()> {
+        // The whole-model parity gate: any split of a sequence into cached
+        // spans must reproduce the one-shot forward's logits for those rows.
+        // Two layers, because a 1-layer model cannot catch per-layer cache
+        // mis-indexing (`test_support::tiny_gpt` is 1 layer, hence the local
+        // config). `detie` first, or every block is the identity and the logits
+        // are position-independent — a broken cache would pass.
+        use crate::model::KvCache;
+        use crate::test_support::{assert_close, detie};
+        let dev = Device::Cpu;
+        let mut vm = VarMap::new();
+        let cfg = tiny_cfg();
+        assert_eq!(cfg.n_layer, 2, "parity needs more than one layer");
+        let model = Gpt::new(cfg, builder(&vm, &dev))?;
+        detie(&mut vm, &cfg, &dev)?;
+
+        let ids = [3u32, 1, 4, 1, 5, 9, 2, 6];
+        let idx = Tensor::from_slice(&ids, (1, ids.len()), &dev)?;
+        let want = model.forward(&idx)?;
+
+        for spans in [vec![ids.len()], vec![5usize, 3], vec![1; ids.len()]] {
+            let mut cache = KvCache::new(&cfg, ids.len())?;
+            let mut t0 = 0;
+            let mut got = Vec::new();
+            for len in &spans {
+                let span = idx.narrow(1, t0, *len)?;
+                got.push(model.forward_with_cache(&span, &mut cache)?);
+                assert_eq!(cache.pos(), t0 + len, "pos after span at {t0}");
+                t0 += len;
+            }
+            let got = Tensor::cat(&got, 1)?;
+            assert_close(&got, &want, 1e-5, &format!("spans {spans:?}"))?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn forward_with_cache_rejects_overflow() -> Result<()> {
+        // The bail must land before any layer writes, so a rejected call leaves
+        // both the buffers and the position untouched and the next call still
+        // sees a consistent cache.
+        use crate::model::KvCache;
+        let dev = Device::Cpu;
+        let vm = VarMap::new();
+        let cfg = tiny_cfg();
+        let model = Gpt::new(cfg, builder(&vm, &dev))?;
+        let mut cache = KvCache::new(&cfg, 4)?;
+
+        let idx = Tensor::new(&[[1u32, 2, 3]], &dev)?;
+        model.forward_with_cache(&idx, &mut cache)?;
+        assert_eq!(cache.pos(), 3);
+
+        // 3 cached + 3 new > capacity 4. Assert on the *message*, not just
+        // `is_err`: without `check_room` the first layer's `slice_set` bails on
+        // its own, which is also an error that leaves `pos` at 3 — so error-ness
+        // alone would not distinguish the cache's guard from candle's, and the
+        // guard exists precisely because candle's message never mentions a cache.
+        let err = model
+            .forward_with_cache(&idx, &mut cache)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("kv-cache overflow"), "wrong error: {err}");
+        assert_eq!(cache.pos(), 3, "a rejected call must not advance");
+
+        // Still usable: one more token fits.
+        let one = Tensor::new(&[[7u32]], &dev)?;
+        model.forward_with_cache(&one, &mut cache)?;
+        assert_eq!(cache.pos(), 4);
         Ok(())
     }
 

@@ -28,22 +28,30 @@ use candle_core::{
 /// last (widest) chunk at d24 (H=12, T=2048, B=16) peaks around ~0.8 GB.
 /// Raising this trades memory for fewer, larger kernel launches; the
 /// `FLASH_CHUNK` env var overrides it at startup for benchmarking (see
-/// `flash_attention`).
+/// `flash_chunk`, which resolves it for both the training and the cached
+/// entry point).
 pub(crate) const FLASH_CHUNK: usize = 128;
 
 /// Forward pass, chunked over query rows.
 ///
-/// `q`/`k`/`v`: `(B, n_head, T, head_dim)`, `mask`: additive causal mask slice
-/// `(T, T)` (`0` on/below the diagonal, `-inf` above; any dtype — upcast to
-/// fp32 here). Returns `O (B, n_head, T, head_dim)` in the input dtype and
-/// `LSE (B, n_head, T)` fp32, the per-row softmax log-normalizer the backward
+/// `q`: `(B, n_head, T_q, head_dim)`; `k`/`v`: `(B, n_head, T_kv, head_dim)`
+/// with `T_kv == kv_offset + T_q`; `mask`: additive causal mask slice
+/// `(T_q, T_kv)` (`0` on/below the diagonal, `-inf` above; any dtype — upcast
+/// to fp32 here). Returns `O (B, n_head, T_q, head_dim)` in the input dtype and
+/// `LSE (B, n_head, T_q)` fp32, the per-row softmax log-normalizer the backward
 /// needs to reconstruct the softmax without storing it.
+///
+/// `kv_offset` is the absolute position of `q`'s first row: on the KV-cache
+/// decode path the keys are the whole cached prefix while the queries are only
+/// the new span, so a query row's causal prefix is `kv_offset` keys wider than
+/// its index within `q`. It is `0` on the training path, where the two coincide.
 fn flash_attn_fwd(
     q: &Tensor,
     k: &Tensor,
     v: &Tensor,
     mask: &Tensor,
     scale: f64,
+    kv_offset: usize,
     chunk: usize,
 ) -> Result<(Tensor, Tensor)> {
     let (_b, _h, t, _hd) = q.dims4()?;
@@ -67,7 +75,9 @@ fn flash_attn_fwd(
     let mut c0 = 0;
     while c0 < t {
         let len = chunk.min(t - c0);
-        let w = c0 + len; // rows [c0, c0+len) attend keys [0, w) only
+        // Rows [c0, c0+len) sit at absolute positions [kv_offset+c0, kv_offset+c0+len),
+        // so the widest key any of them may see is kv_offset+c0+len-1.
+        let w = kv_offset + c0 + len;
         let q_c = q.narrow(2, c0, len)?; // (B,H,len,hd)
 
         // Masked scores for this row block, fp32: (B,H,len,w) — narrowed to
@@ -121,6 +131,11 @@ fn flash_attn_fwd(
 /// columns are exact zeros. `dK`/`dV` accumulate in fp32 prefix accumulators
 /// that grow with the chunks (see `accum_prefix`); all grads return in the
 /// input dtype.
+///
+/// Deliberately takes no `kv_offset`: training never uses a KV cache and the
+/// cached path never backprops, so this only ever runs the `kv_offset == 0`
+/// case — which keeps its prefix width `w = c0 + len` bit-for-bit aligned with
+/// the forward whose softmax it reconstructs.
 #[allow(clippy::too_many_arguments)]
 fn flash_attn_bwd(
     q: &Tensor,
@@ -233,18 +248,67 @@ pub(crate) fn flash_attention(
     mask: &Tensor,
     scale: f64,
 ) -> Result<Tensor> {
-    // Read once per process: lets chunk-size benchmarks run without a
-    // rebuild (`FLASH_CHUNK=256 ... pretrain ...`). Absent, unparsable, or
-    // zero values fall back to the compiled default.
+    flash_attention_chunked(q, k, v, mask, scale, flash_chunk())
+}
+
+/// The chunk size both entry points run at. Read once per process: lets
+/// chunk-size benchmarks run without a rebuild (`FLASH_CHUNK=256 ... pretrain
+/// ...`). Absent, unparsable, or zero values fall back to the compiled default.
+fn flash_chunk() -> usize {
     static CHUNK: OnceLock<usize> = OnceLock::new();
-    let chunk = *CHUNK.get_or_init(|| {
+    *CHUNK.get_or_init(|| {
         std::env::var("FLASH_CHUNK")
             .ok()
             .and_then(|v| v.parse().ok())
             .filter(|&c| c > 0)
             .unwrap_or(FLASH_CHUNK)
-    });
-    flash_attention_chunked(q, k, v, mask, scale, chunk)
+    })
+}
+
+/// Inference attention over a KV cache: same math as [`flash_attention`], but
+/// with no autograd node, no LSE stash, and query rows starting at absolute
+/// position `kv_offset`.
+///
+/// `q` is the new span `(B, n_head, T_q, head_dim)`; `k`/`v` are the whole
+/// cached prefix `(B, n_head, kv_offset + T_q, head_dim)`; `mask` is the
+/// `(T_q, T_kv)` rectangle of the causal mask starting at row `kv_offset`.
+///
+/// The `CustomOp3` wrapper is bypassed entirely — there is no backward to
+/// serve, so there is nothing to stash and no `storage.try_clone` round-trip on
+/// the output. `detach` shares storage and only clears the graph identity, so it
+/// allocates nothing; what it buys is that the `T_q × T_kv` chunk transients
+/// inside the kernel are untracked and free as the loop advances, instead of
+/// being retained by an autograd graph that would only ever be dropped.
+pub(crate) fn flash_attention_no_grad(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    mask: &Tensor,
+    scale: f64,
+    kv_offset: usize,
+) -> Result<Tensor> {
+    // K/V must be exactly the causal prefix of q's rows: the kernel derives each
+    // chunk's key width from `kv_offset` alone, so a mismatch would silently
+    // attend over the wrong prefix rather than fail a shape check.
+    let t_q = q.dim(2)?;
+    let want = kv_offset + t_q;
+    if k.dim(2)? != want || v.dim(2)? != want {
+        bail!(
+            "flash-attn no-grad: k/v length {}/{} must equal kv_offset ({kv_offset}) + T_q ({t_q}) = {want}",
+            k.dim(2)?,
+            v.dim(2)?
+        );
+    }
+    let (o, _lse) = flash_attn_fwd(
+        &q.detach(),
+        &k.detach(),
+        &v.detach(),
+        mask,
+        scale,
+        kv_offset,
+        flash_chunk(),
+    )?;
+    Ok(o)
 }
 
 fn flash_attention_chunked(
@@ -293,8 +357,10 @@ struct FlashAttnOp {
 
 impl FlashAttnOp {
     fn fwd(&self) -> Result<(Storage, Shape)> {
+        // kv_offset 0: this is the training path, which never caches — keeping
+        // it explicit so the backward's matching omission reads as a decision.
         let (o, lse) = flash_attn_fwd(
-            &self.q, &self.k, &self.v, &self.mask, self.scale, self.chunk,
+            &self.q, &self.k, &self.v, &self.mask, self.scale, 0, self.chunk,
         )?;
         *self.lse.lock().expect("flash-attn lse mutex poisoned") = Some(lse);
         let o = o.contiguous()?;
@@ -393,7 +459,7 @@ mod tests {
     use super::*;
     use crate::model::attention::{build_causal_mask, naive_attention};
     use crate::test_support::assert_close;
-    use candle_core::{Device, Var};
+    use candle_core::{Device, IndexOp, Var};
 
     fn qkv_mask(
         b: usize,
@@ -424,11 +490,73 @@ mod tests {
             let (q, k, v, mask) = qkv_mask(b, h, t, hd)?;
             let scale = 1.0 / (hd as f64).sqrt();
             let want = naive_attention(&q, &k, &v, &mask, scale)?;
-            let (got, lse) = flash_attn_fwd(&q, &k, &v, &mask, scale, chunk)?;
+            let (got, lse) = flash_attn_fwd(&q, &k, &v, &mask, scale, 0, chunk)?;
             assert_close(&got, &want, 1e-5, &format!("fwd t={t} chunk={chunk}"))?;
             assert_eq!(lse.dims(), &[b, h, t]);
             assert_eq!(lse.dtype(), DType::F32);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn fwd_with_kv_offset_matches_naive() -> Result<()> {
+        // The prefix-width arithmetic is the one place an off-by-one hides, so
+        // sweep ragged (t0, t_q) against chunk sizes above, below and equal to
+        // t_q. Queries are the span at [t0, t0+t_q); keys/values are the whole
+        // prefix [0, t0+t_q); the mask is the same rectangle attention slices.
+        let dev = Device::Cpu;
+        let (b, h, hd) = (2usize, 3, 4);
+        let scale = 1.0 / (hd as f64).sqrt();
+        for (t0, t_q) in [(0usize, 4usize), (3, 1), (5, 3), (7, 1)] {
+            let t_kv = t0 + t_q;
+            let q = Tensor::randn(0f32, 1.0, (b, h, t_q, hd), &dev)?;
+            let k = Tensor::randn(0f32, 1.0, (b, h, t_kv, hd), &dev)?;
+            let v = Tensor::randn(0f32, 1.0, (b, h, t_kv, hd), &dev)?;
+            let mask = build_causal_mask(t_kv, &dev)?.i((t0..t_kv, ..t_kv))?;
+            let want = naive_attention(&q, &k, &v, &mask, scale)?;
+            for chunk in [1usize, 2, 128] {
+                let what = format!("t0={t0} t_q={t_q} chunk={chunk}");
+                let (got, lse) = flash_attn_fwd(&q, &k, &v, &mask, scale, t0, chunk)?;
+                assert_close(&got, &want, 1e-5, &what)?;
+                assert_eq!(lse.dims(), &[b, h, t_q], "lse dims {what}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn no_grad_entry_rejects_a_kv_length_mismatch() -> Result<()> {
+        // A wrong K/V length must bail rather than silently attend over the
+        // wrong prefix — the kernel takes the width from kv_offset, not from K.
+        let dev = Device::Cpu;
+        let (b, h, hd, t0, t_q) = (1usize, 2, 4, 3, 2);
+        let scale = 1.0 / (hd as f64).sqrt();
+        let q = Tensor::randn(0f32, 1.0, (b, h, t_q, hd), &dev)?;
+        let mask = build_causal_mask(t0 + t_q, &dev)?.i((t0..t0 + t_q, ..t0 + t_q))?;
+        let ok = Tensor::randn(0f32, 1.0, (b, h, t0 + t_q, hd), &dev)?;
+        let short = Tensor::randn(0f32, 1.0, (b, h, t0 + t_q - 1, hd), &dev)?;
+
+        assert!(flash_attention_no_grad(&q, &ok, &ok, &mask, scale, t0).is_ok());
+        assert!(flash_attention_no_grad(&q, &short, &ok, &mask, scale, t0).is_err());
+        assert!(flash_attention_no_grad(&q, &ok, &short, &mask, scale, t0).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn no_grad_output_carries_no_gradient() -> Result<()> {
+        // Pins the `detach`, which is the memory property: the T² interior must
+        // not be retained by a graph the inference path will never back through.
+        let dev = Device::Cpu;
+        let (b, h, t, hd) = (1usize, 2, 4, 4);
+        let scale = 1.0 / (hd as f64).sqrt();
+        let q = Var::from_tensor(&Tensor::randn(0f32, 1.0, (b, h, t, hd), &dev)?)?;
+        let k = Tensor::randn(0f32, 1.0, (b, h, t, hd), &dev)?;
+        let v = Tensor::randn(0f32, 1.0, (b, h, t, hd), &dev)?;
+        let mask = build_causal_mask(t, &dev)?;
+
+        let out = flash_attention_no_grad(q.as_tensor(), &k, &v, &mask, scale, 0)?;
+        let grads = out.sum_all()?.backward()?;
+        assert!(grads.get(q.as_tensor()).is_none(), "q kept a gradient");
         Ok(())
     }
 
@@ -565,7 +693,7 @@ mod tests {
             let loss = (&out * &w)?.sum_all()?;
             let grads = loss.backward()?;
 
-            let (o, lse) = flash_attn_fwd(&q0, &k0, &v0, &mask, scale, chunk)?;
+            let (o, lse) = flash_attn_fwd(&q0, &k0, &v0, &mask, scale, 0, chunk)?;
             let (dq, dk, dv) = flash_attn_bwd(&q0, &k0, &v0, &o, &lse, &w, &mask, scale, chunk)?;
 
             let what = format!("t={t} chunk={chunk}");

@@ -193,6 +193,43 @@ pub(crate) fn new_block(cfg: &GptConfig, vm: &VarMap, dev: &Device) -> Result<Bl
     Block::new(cfg, vb, &rope, &mask)
 }
 
+/// Break a freshly built [`Gpt`] out of its degenerate init, in place, so that
+/// parity tests against it are not vacuous. Two separate traps:
+///
+/// *Vacuity.* Both residual projections are zero-init, so every block is the
+/// identity at init and the logits reduce to `lm_head(rmsnorm(embed(idx)))` —
+/// which is *position-independent*. A KV cache that ignored its own contents
+/// entirely would pass any parity test on such a model, so both `c_proj`
+/// families have to be randomized before the model depends on position at all.
+///
+/// *Argmax ties.* `lm_head` is tiny-init (`Linear::normal(.., 0.001)`), so a
+/// fresh model's logits sit within ~3e-3 across the whole vocab and typical
+/// top-2 gaps are O(1e-5) — the same order as the cached-vs-uncached numerical
+/// difference, which would make any greedy token-equality test a coin flip.
+/// Overwriting `lm_head` at `std = 1.0` makes the gaps O(1). Do not raise that
+/// `std`: `assert_close` compares *absolute* differences, so a larger scale
+/// eats the tolerance margin silently.
+///
+/// That same amplification is why the `lm_head` line is needed by the
+/// `assert_close` parity tests too, not only the greedy ones: at the stock
+/// tiny-init the logits are ~1e-3-scaled, so a real cache bug perturbing the
+/// hidden state by O(1e-3) would reach the logits at ~1e-6 and slip under the
+/// fixed 1e-5 threshold.
+///
+/// `VarMap::set_one` writes in place into the `Var` storage the model already
+/// holds a handle on, so this works after construction.
+pub(crate) fn detie(vm: &mut VarMap, cfg: &GptConfig, dev: &Device) -> Result<()> {
+    let c = cfg.n_embd;
+    for i in 0..cfg.n_layer {
+        let attn = Tensor::randn(0.0f32, 0.5, (c, c), dev)?;
+        vm.set_one(format!("blocks.{i}.attn.c_proj.weight"), attn)?;
+        let mlp = Tensor::randn(0.0f32, 0.5, (c, 4 * c), dev)?;
+        vm.set_one(format!("blocks.{i}.mlp.c_proj.weight"), mlp)?;
+    }
+    let head = Tensor::randn(0.0f32, 1.0, (cfg.vocab_size, c), dev)?;
+    vm.set_one("lm_head.weight", head)
+}
+
 /// Elementwise `|got − want| ≤ tol` on the flattened f32 views; shapes must match.
 pub(crate) fn assert_close(got: &Tensor, want: &Tensor, tol: f64, what: &str) -> Result<()> {
     assert_eq!(got.dims(), want.dims(), "{what}: shape mismatch");

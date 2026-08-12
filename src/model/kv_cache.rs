@@ -85,7 +85,6 @@ pub(crate) struct LayerKv {
 impl LayerKv {
     /// Append this span's keys and values at time index `at`, returning the
     /// running `(K, V)` prefixes to attend over.
-    #[cfg_attr(not(test), allow(dead_code))] // consumed by Part D (attention).
     pub(crate) fn append(&mut self, k: &Tensor, v: &Tensor, at: usize) -> Result<(Tensor, Tensor)> {
         Ok((self.k.append(k, at)?, self.v.append(v, at)?))
     }
@@ -143,7 +142,6 @@ impl KvCache {
 
     /// Bail unless `t` more tokens fit. Called once per forward, before any
     /// layer writes, so a rejected call leaves every buffer untouched.
-    #[cfg_attr(not(test), allow(dead_code))] // consumed by Part D (Gpt::forward_inner).
     pub(crate) fn check_room(&self, t: usize) -> Result<()> {
         if self.len + t > self.capacity {
             bail!(
@@ -156,12 +154,10 @@ impl KvCache {
     }
 
     /// Called once, after every layer has written.
-    #[cfg_attr(not(test), allow(dead_code))] // consumed by Part D (Gpt::forward_inner).
     pub(crate) fn advance(&mut self, t: usize) {
         self.len += t;
     }
 
-    #[cfg_attr(not(test), allow(dead_code))] // consumed by Part D (Gpt::forward_inner).
     pub(crate) fn layer_mut(&mut self, i: usize) -> &mut LayerKv {
         &mut self.layers[i]
     }
@@ -185,9 +181,16 @@ mod tests {
         }
     }
 
-    /// `(1, 2, t, 4)` filled with `fill`, so a row's value identifies it.
+    /// A `(2, 2, t, 4)` span whose every element is distinct: `fill` identifies
+    /// the span, the ramp identifies the slot. B=2 so `slice_set`'s batch
+    /// striding — which must step by the *allocated* capacity, not the written
+    /// width — is pinned rather than merely argued, and a permutation of rows,
+    /// heads or batches inside the copy cannot pass as a constant fill would.
     fn span(t: usize, fill: f32, dev: &Device) -> Result<Tensor> {
-        Tensor::full(fill, (1, 2, t, 4), dev)
+        let shape = (2usize, 2, t, 4);
+        let n = 2 * 2 * t * 4;
+        let vals: Vec<f32> = (0..n).map(|i| fill * 1000.0 + i as f32).collect();
+        Tensor::from_vec(vals, shape, dev)
     }
 
     #[test]
@@ -237,10 +240,10 @@ mod tests {
         let one = span(1, 9.0, &dev)?;
         layer.append(&one, &one, 0)?;
 
-        // The whole buffer, both heads: row 0 rewritten, rows 1.. still holding
-        // the pre-reset pattern — which they cannot if `reset` reallocated.
+        // The whole buffer: row 0 rewritten, rows 1.. still holding `full`'s own
+        // tail — which they cannot if `reset` reallocated.
         let buf = layer.k.buf.as_ref().expect("buffer allocated");
-        let want = Tensor::cat(&[one, span(capacity - 1, 7.0, &dev)?], 2)?;
+        let want = Tensor::cat(&[one, full.narrow(2, 1, capacity - 1)?], 2)?;
         assert_close(buf, &want, 0.0, "buffer after reset + append")?;
         Ok(())
     }
