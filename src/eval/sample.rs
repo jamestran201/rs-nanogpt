@@ -55,25 +55,7 @@ pub fn generate_ids(
 
     let mut rng = ChaCha8Rng::seed_from_u64(opts.seed);
     for _ in 0..opts.max_tokens {
-        // The cache holds `ids[..cache.pos()]`. Normally that is everything but
-        // the token just sampled, so exactly one token is fed. Once the history
-        // outgrows the context the window slides, every cached key's RoPE angle
-        // shifts, and the cache has to be rebuilt from the cropped window —
-        // which is the same full re-forward the pre-cache loop did every step,
-        // so no step gets asymptotically slower and the logits stay comparable.
-        let start = ids.len().saturating_sub(seq_len);
-        if start > 0 {
-            cache.reset();
-        }
-        // Covers both branches: after a reset `pos == 0` so `start` wins; with
-        // no crop `start == 0` so `pos` wins. Never empty — with no crop
-        // `ids.len() == pos + 1` by induction (`start` never decreases, since
-        // `ids` only grows, so a crop step is never *followed* by a non-crop
-        // one and the invariant is never re-entered after a reset breaks it),
-        // or `prefix.len()` on the first step; and after a crop
-        // `start < ids.len()` since `seq_len >= 1`. That non-emptiness is what
-        // protects the `n - 1` below.
-        let feed = &ids[start.max(cache.pos())..];
+        let feed = &ids[feed_start(&mut cache, ids.len(), seq_len)..];
 
         // `n` before the tensor: `feed` borrows `ids`, which `ids.push(next)`
         // needs back. NLL ends the borrow here either way, but binding the
@@ -101,6 +83,41 @@ pub fn generate_ids(
     }
 
     Ok(ids.split_off(prefix.len()))
+}
+
+/// Ready `cache` for one decode step over `n_ids` tokens of history and return
+/// the index the fed span starts at, so the caller feeds `ids[start..]`.
+///
+/// The whole of Part E is this decision, so it is one seam rather than a pure
+/// helper plus a `reset` at the call site — the property that matters is *how
+/// much* each step forwards, and splitting the reset out would leave half of it
+/// untested. No parity test can cover it: re-prefilling the whole context every
+/// step stays numerically correct and still fits `capacity`, so the returned ids
+/// are identical. `feed_start_decodes_one_token_at_a_time` covers it here, over
+/// the feed lengths.
+///
+/// Never returns `n_ids`, so the caller's span is never empty:
+/// - No crop. `pos == n_ids - 1` by induction (each step feeds `ids[pos..]` then
+///   pushes one token), or `pos == 0` with `n_ids == prefix.len() >= 1` on the
+///   first step.
+/// - Crop. `pos` has just been reset to 0 and `start = n_ids - seq_len < n_ids`
+///   since `seq_len >= 1`.
+///
+/// The two branches need separate arguments because a crop breaks that induction
+/// hypothesis — but never re-enters it: `n_ids` only grows, so `start` never
+/// decreases and a crop step is never followed by a non-crop one.
+fn feed_start(cache: &mut KvCache, n_ids: usize, seq_len: usize) -> usize {
+    // Once the history outgrows the context the window slides, which shifts
+    // every cached key's RoPE angle and so invalidates the whole cache. The
+    // rebuild is the same full re-forward the pre-cache loop did on *every*
+    // step, so no step gets asymptotically slower.
+    let crop = n_ids.saturating_sub(seq_len);
+    if crop > 0 {
+        cache.reset();
+        return crop;
+    }
+    // The cache already holds `ids[..pos]` — feed only what it is missing.
+    cache.pos()
 }
 
 fn argmax(logits: &[f32]) -> usize {
@@ -276,12 +293,11 @@ mod tests {
     /// It pins *what* the loop computes, not *how much* it forwards. A
     /// regression to re-prefilling the whole context every step — an
     /// unconditional `cache.reset()`, say — is still correct and still fits
-    /// `capacity`, so it would pass here — and no *value-level* test can catch
-    /// it: the returned ids are identical, and `capacity` is derived from
-    /// exactly the quantities a re-prefill is bounded by, so it cannot fire
-    /// either. Only cost is observable, which is why the one-token-per-step
-    /// property is gated by the timed `chat --max-tokens 200` run in the plan's
-    /// Verification section rather than here.
+    /// `capacity`, so it passes here, and no *value-level* test can catch it:
+    /// the returned ids are identical, and `capacity` is derived from exactly
+    /// the quantities a re-prefill is bounded by, so it cannot fire either.
+    /// `feed_start_decodes_one_token_at_a_time` covers that separately, over
+    /// the feed lengths rather than the logits.
     #[test]
     fn cached_generation_matches_the_uncached_reference() {
         let dev = Device::Cpu;
@@ -294,6 +310,51 @@ mod tests {
         let uncached = generate_ids_uncached(&model, &p, o, &dev).unwrap();
         assert_eq!(cached.len(), 20);
         assert_eq!(cached, uncached);
+    }
+
+    /// Replays `generate_ids`'s loop head against a **real** `KvCache` — no
+    /// model, since no forward is needed to decide how much to feed — and
+    /// returns the fed length per step. `advance` is what `forward_with_cache`
+    /// would call, and `ids` grows by one per step, so this is the real state
+    /// machine with only the model elided.
+    fn replay_feed_lengths(prompt: usize, seq_len: usize, steps: usize) -> Vec<usize> {
+        let (_vm, model) = tiny_gpt(32, seq_len);
+        let capacity = seq_len.min(prompt + steps);
+        let mut cache = KvCache::new(model.config(), capacity).unwrap();
+
+        let mut n_ids = prompt;
+        (0..steps)
+            .map(|_| {
+                let n = n_ids - feed_start(&mut cache, n_ids, seq_len);
+                assert!(n > 0, "feed must never be empty");
+                // The bound `capacity` is chosen for. In the real loop a breach
+                // surfaces as an `Err` out of `forward_with_cache`; here it is a
+                // test failure, which is the point of replaying it.
+                cache.check_room(n).expect("feed must fit the cache");
+                cache.advance(n);
+                n_ids += 1;
+                n
+            })
+            .collect()
+    }
+
+    /// The *cost* property, which the parity tests structurally cannot see:
+    /// prefill the prompt once, then one token per step. An unconditional
+    /// `cache.reset()`, or dropping the `pos` term, turns these lengths into
+    /// `P, P+1, P+2, …` — the whole pre-cache cost back — while leaving every
+    /// value-level test in this file green.
+    #[test]
+    fn feed_start_decodes_one_token_at_a_time() {
+        // Inside the context: one prefill of the whole prompt, then singles.
+        assert_eq!(replay_feed_lengths(5, 64, 6), [5, 1, 1, 1, 1, 1]);
+        // A one-token prompt still prefills as itself, not as nothing.
+        assert_eq!(replay_feed_lengths(1, 64, 3), [1, 1, 1]);
+        // Crossing seq_len: singles until the history outgrows the context, then
+        // the window slides and each step re-prefills the full cropped window —
+        // the pre-cache cost, and no worse.
+        assert_eq!(replay_feed_lengths(6, 8, 5), [6, 1, 1, 8, 8]);
+        // A prompt longer than the context is cropped from the first step on.
+        assert_eq!(replay_feed_lengths(12, 8, 3), [8, 8, 8]);
     }
 
     #[test]

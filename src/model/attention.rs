@@ -149,7 +149,7 @@ pub(crate) fn naive_attention(
     let mask = mask.to_dtype(scores.dtype())?;
     let att = softmax(&scores.broadcast_add(&mask)?, D::Minus1)?;
 
-    // Mix values: (B, n_head, T, head_dim).
+    // Mix values: (B, n_head, T_q, head_dim).
     att.matmul(v)
 }
 

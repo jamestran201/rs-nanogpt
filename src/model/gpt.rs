@@ -68,6 +68,11 @@ impl Gpt {
     /// takes `&self` and is called from eight places, none of which want a
     /// cache, so owning one here would mean either `&mut self` everywhere or a
     /// mutex bought for nothing.
+    ///
+    /// **Inference only:** the returned logits carry no gradient into the blocks
+    /// or the embedding (`lm_head`, which sits after the last cut, still gets
+    /// one). A cached step never backprops, so the graph is cut per block to
+    /// bound what the forward retains — see `forward_inner`. Train via `forward`.
     pub fn forward_with_cache(&self, idx: &Tensor, cache: &mut KvCache) -> Result<Tensor> {
         self.forward_inner(idx, Some(cache))
     }
@@ -91,12 +96,30 @@ impl Gpt {
             None => 0,
         };
 
+        // A cached forward never backprops, so the residual stream carries no
+        // gradient worth keeping — see the `detach` in the loop.
+        let cached = cache.is_some();
+
         let mut x = self.wte.forward(idx)?.to_dtype(self.compute_dtype)?;
         for (i, block) in self.blocks.iter().enumerate() {
             // `as_deref_mut` reborrows the option each iteration; moving it in
             // would consume it on the first block.
             let kv = cache.as_deref_mut().map(|c| c.layer_mut(i));
             x = block.forward_inner(&x, kv, t0)?;
+            // Cut the graph at the block boundary. Every op node holds its
+            // inputs alive, so without this the chain `x_{i+1} = f(x_i)` keeps
+            // all `n_layer` layers' interiors live until the logits drop — and
+            // the big items there are `Linear::forward`'s per-call weight cast
+            // (`linear.rs:46-49`), a full copy of each matrix. At d24 that is
+            // `9·n_embd²` retained per layer — `c_proj` plus both MLP matrices;
+            // 9 and not 12 because q/k/v's casts already free at the attention
+            // boundary — so ~1 GB across 24. Detaching bounds it to one block;
+            // it shares storage, so it allocates nothing.
+            // Part C's `flash_attention_no_grad` does the same for the `T²`
+            // attention interior — this is the rest of the forward.
+            if cached {
+                x = x.detach();
+            }
         }
         // Moves the option — this is its last use, and the block loop is done.
         if let Some(c) = cache {
@@ -287,6 +310,58 @@ mod tests {
         let one = Tensor::new(&[[7u32]], &dev)?;
         model.forward_with_cache(&one, &mut cache)?;
         assert_eq!(cache.pos(), 4);
+        Ok(())
+    }
+
+    /// The memory property of the cached path, and the direct analogue of
+    /// `no_grad_output_carries_no_gradient` (`flash_attention.rs`) for Part C's
+    /// detach: the per-block `detach` must actually cut the graph, so no block's
+    /// interior — above all `Linear::forward`'s per-call weight copy — is still
+    /// reachable from the logits. What is retained is measured in bytes and the
+    /// bytes are not testable here; reachability is the observable proxy.
+    ///
+    /// It bounds retention at the *last* block rather than at each one: a detach
+    /// on the final block alone would also pass, since it alone unroots every
+    /// earlier block. Reachability cannot distinguish the two — the peak the fix
+    /// actually targets is per-block and only a memory probe would see it.
+    ///
+    /// The names matter. `attn.c_{q,k,v}` would be vacuous — Part C's
+    /// `flash_attention_no_grad` already detaches those — so the probes are
+    /// `attn.c_proj` and the MLP, which sit outside the no-grad region, plus
+    /// `wte`, which the residual keeps live across blocks.
+    #[test]
+    fn cached_forward_leaves_no_gradient_into_the_blocks() -> Result<()> {
+        use crate::model::KvCache;
+        let dev = Device::Cpu;
+        let vm = VarMap::new();
+        let cfg = tiny_cfg();
+        let model = Gpt::new(cfg, builder(&vm, &dev))?;
+        let mut cache = KvCache::new(&cfg, 4)?;
+
+        let logits = model.forward_with_cache(&Tensor::new(&[[1u32, 2, 3]], &dev)?, &mut cache)?;
+        let grads = logits.sum_all()?.backward()?;
+
+        let data = vm.data().lock().unwrap();
+        let reaches = |name: &str| {
+            let var = data
+                .get(name)
+                .unwrap_or_else(|| panic!("no such var: {name}"));
+            grads.get(var.as_tensor()).is_some()
+        };
+        // Non-vacuity: `lm_head` sits after the last detach, so a forward that
+        // built no graph at all would also pass every assert below.
+        assert!(reaches("lm_head.weight"), "vacuous: no graph was built");
+        for name in [
+            "wte.weight",
+            "blocks.0.mlp.c_fc.weight",
+            "blocks.1.mlp.c_fc.weight",
+            "blocks.1.attn.c_proj.weight",
+        ] {
+            assert!(
+                !reaches(name),
+                "{name} is still retained by the cached graph"
+            );
+        }
         Ok(())
     }
 
