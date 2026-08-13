@@ -132,3 +132,29 @@ Each run writes three things under `--out`:
 | `run.json` | Run metadata: model config, batch sizing, learning rates, and start time. |
 | `metrics.jsonl` | Append-only per-step / per-eval telemetry (loss, grad norm, throughput, val bpb). |
 | `best/` | Checkpoint of the lowest-val-bpb model so far (`model.safetensors` + `meta.txt`), overwritten each time a new best is reached. |
+
+### Training a model on 6 H200's for ~1 hour
+
+```bash
+# Install dependencies and compile the project
+make bootstrap && source ~/.bashrc && make build-nccl
+
+# Download data and train a tokenizer
+target/release/rs-nanogpt download-data --out data --num 170 && \
+    mkdir tokenizer_in && \
+    mkdir tokenizer_out && \
+    cp data/shard_00000.parquet tokenizer_in/ && \
+    target/release/rs-nanogpt train-tokenizer --corpus tokenizer_in --output tokenizer_out/vocab.txt --vocab-size 32768 --max-chars 2000000000 --doc-cap 10000
+
+# Train a model
+target/release/rs-nanogpt pretrain \
+  --data data --vocab tokenizer_out/vocab.txt \
+  --n-layer 24 --n-embd 1536 --n-head 12 --sequence-len 2048 \
+  --num-iters 130 --total-batch 1032192 --device-batch 4 \
+  --gpus 6 \
+  --embedding-lr 0.4243 --unembedding-lr 0.01131 --matrix-lr 0.003 \
+  --warmup-steps 25 --warmdown-ratio 0.65 --final-lr-frac 0.05 \
+  --log-every 5 --eval-every 25 --eval-steps 20 \
+  --sample-every 0 \
+  --out out
+```
