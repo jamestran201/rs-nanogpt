@@ -158,3 +158,27 @@ target/release/rs-nanogpt pretrain \
   --sample-every 0 \
   --out out
 ```
+
+## Chat-finetuning (SFT) on a box with 1 GPU
+
+```bash
+make bootstrap && source ~/.bashrc && make build-cuda
+
+target/release/rs-nanogpt download-sft-data --out sft-data
+
+RS_NANOGPT_MEM_TRACE=1 target/release/rs-nanogpt sft \
+  --checkpoint /workspace/ \
+  --data sft-data \
+  --vocab /workspace/vocab.txt \
+  --embedding-lr 0.4243 --unembedding-lr 0.01131 --matrix-lr 0.003 \
+  --total-batch 1032192 --device-batch 4 \
+  --num-iters 20 \
+  --log-every 1 --eval-every 10 --eval-steps 20 \
+  --sample-every 10 --sample-tokens 128 \
+  --out out-sft
+
+# Talk to the result
+target/release/rs-nanogpt chat \
+  --checkpoint out-sft/<run>/best \
+  --vocab tokenizer_out/vocab.txt
+```
