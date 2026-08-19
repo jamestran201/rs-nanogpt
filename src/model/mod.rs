@@ -5,6 +5,7 @@ mod device;
 mod embedding;
 mod flash_attention;
 mod gpt;
+mod kv_cache;
 mod linear;
 mod loss;
 mod mlp;
@@ -22,6 +23,7 @@ pub use config::{
 pub use device::{compute_dtype, default_device};
 pub use embedding::TokenEmbedding;
 pub use gpt::Gpt;
+pub use kv_cache::KvCache;
 pub use linear::Linear;
 pub use loss::{Reduction, cross_entropy, cross_entropy_sum_count};
 pub use mlp::Mlp;

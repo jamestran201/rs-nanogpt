@@ -3,6 +3,7 @@ use candle_nn::VarBuilder;
 
 use super::attention::CausalSelfAttention;
 use super::config::GptConfig;
+use super::kv_cache::LayerKv;
 use super::mlp::Mlp;
 use super::rms_norm::rms_norm;
 use super::rope::Rope;
@@ -39,7 +40,21 @@ impl Block {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let x = (x + self.attn.forward(&rms_norm(x, self.norm_eps)?)?)?;
+        self.forward_inner(x, None, 0)
+    }
+
+    /// As [`Block::forward`], but for a span at absolute positions `t0..t0 + T`
+    /// whose K/V go into `cache`. Only attention wants either — the MLP is
+    /// position-independent and per-token, so it sees the new span unchanged.
+    pub(crate) fn forward_inner(
+        &self,
+        x: &Tensor,
+        cache: Option<&mut LayerKv>,
+        t0: usize,
+    ) -> Result<Tensor> {
+        let x = (x + self
+            .attn
+            .forward_inner(&rms_norm(x, self.norm_eps)?, cache, t0)?)?;
         let x = (&x + self.mlp.forward(&rms_norm(&x, self.norm_eps)?)?)?;
         Ok(x)
     }

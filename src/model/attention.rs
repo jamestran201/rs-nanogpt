@@ -2,7 +2,8 @@ use candle_core::{D, DType, Device, IndexOp, Result, Tensor};
 use candle_nn::{VarBuilder, ops::softmax};
 
 use super::config::GptConfig;
-use super::flash_attention::flash_attention;
+use super::flash_attention::{flash_attention, flash_attention_no_grad};
+use super::kv_cache::LayerKv;
 use super::linear::Linear;
 use super::rms_norm::rms_norm;
 use super::rope::Rope;
@@ -21,8 +22,9 @@ pub struct CausalSelfAttention {
     /// RoPE tables, shared from `Gpt::new` (a clone is a cheap handle).
     rope: Rope,
     /// Additive causal mask `(seq_len, seq_len)`: 0 on/below the diagonal,
-    /// `-inf` above. Shared from `Gpt::new`; stored fp32, narrowed to `(T, T)`
-    /// per call (the flash path does its masked-softmax math in fp32).
+    /// `-inf` above. Shared from `Gpt::new`; stored fp32, narrowed per call to
+    /// the `(T, T_kv)` rectangle whose rows are the span's absolute positions
+    /// (the flash path does its masked-softmax math in fp32).
     causal_mask: Tensor,
     n_head: usize,
     head_dim: usize,
@@ -53,6 +55,22 @@ impl CausalSelfAttention {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        self.forward_inner(x, None, 0)
+    }
+
+    /// The one copy of the attention trunk, cached or not.
+    ///
+    /// `x` is the *new span* `(B, T, C)`, sitting at absolute positions
+    /// `t0..t0 + T`; `t0` is `0` and `cache` is `None` on the training path. With
+    /// a cache, this span's K/V are appended to it and attention runs over the
+    /// whole cached prefix, so the returned contribution still covers only the
+    /// new span.
+    pub(crate) fn forward_inner(
+        &self,
+        x: &Tensor,
+        cache: Option<&mut LayerKv>,
+        t0: usize,
+    ) -> Result<Tensor> {
         let (b, t, c) = x.dims3()?;
         let (nh, hd) = (self.n_head, self.head_dim);
 
@@ -70,15 +88,27 @@ impl CausalSelfAttention {
         // linear, so rms_norm(rope(x)) == rope(rms_norm(x)) up to float
         // rounding. Holds only while rms_norm is scale-free; a learnable gain
         // would break it (pinned by `qk_norm_order_is_equivalent` in rope.rs).
-        let q = rms_norm(&self.rope.apply(&q)?, self.norm_eps)?;
-        let k = rms_norm(&self.rope.apply(&k)?, self.norm_eps)?;
+        let q = rms_norm(&self.rope.apply_at(&q, t0)?, self.norm_eps)?;
+        let k = rms_norm(&self.rope.apply_at(&k, t0)?, self.norm_eps)?;
+
+        // The `(T, T_kv)` rectangle of the shared mask whose rows are this
+        // span's absolute positions. At t0 == 0 this is exactly the `(T, T)`
+        // square the training path has always sliced.
+        let scale = 1.0 / (hd as f64).sqrt();
+        let mask = self.causal_mask.i((t0..t0 + t, ..t0 + t))?;
 
         // Chunked flash attention: same math as `naive_attention` below, but
         // nothing T² is retained in the autograd graph — see
         // `flash_attention.rs` / `writeups/flash-attention-plan.md`.
-        let scale = 1.0 / (hd as f64).sqrt();
-        let mask = self.causal_mask.i((..t, ..t))?;
-        let y = flash_attention(&q, &k, &v, &mask, scale)?;
+        let y = match cache {
+            // Cached: K/V are stored *post*-RoPE and post-QK-norm, so old keys
+            // are never re-rotated; attention then runs over the whole prefix.
+            Some(kv) => {
+                let (k, v) = kv.append(&k, &v, t0)?;
+                flash_attention_no_grad(&q, &k, &v, &mask, scale, t0)?
+            }
+            None => flash_attention(&q, &k, &v, &mask, scale)?,
+        };
 
         // Re-assemble heads, project back: (B,T,C).
         let y = y.transpose(1, 2)?.contiguous()?.reshape((b, t, c))?;
@@ -88,9 +118,11 @@ impl CausalSelfAttention {
 
 /// Materialized softmax(QKᵀ·scale + mask)V — the reference implementation.
 ///
-/// `q`/`k`/`v` are `(B, n_head, T, head_dim)`; `mask` is the additive fp32
-/// causal mask slice `(T, T)`, cast here to the scores' dtype (no-op on fp32;
-/// `-inf` is representable in bf16). Retains `(B, n_head, T, T)` tensors in
+/// `q` is `(B, n_head, T_q, head_dim)` and `k`/`v` are `(B, n_head, T_kv,
+/// head_dim)`; `mask` is the additive fp32 causal mask slice `(T_q, T_kv)`,
+/// cast here to the scores' dtype (no-op on fp32; `-inf` is representable in
+/// bf16). The rectangular case is what makes this the oracle for the KV-cache
+/// offset tests as well. Retains `(B, n_head, T_q, T_kv)` tensors in
 /// the autograd graph, so it is memory-bound in B·T² — the flash path exists
 /// to avoid exactly that; this stays as the parity oracle for its tests.
 #[cfg_attr(not(test), allow(dead_code))]
@@ -101,8 +133,9 @@ pub(crate) fn naive_attention(
     mask: &Tensor,
     scale: f64,
 ) -> Result<Tensor> {
-    // Scaled dot-product scores: (B, n_head, T, head_dim) @ (B, n_head, head_dim, T)
-    // Output shape: (B, n_head, T, T)
+    // Scaled dot-product scores:
+    // (B, n_head, T_q, head_dim) @ (B, n_head, head_dim, T_kv)
+    // Output shape: (B, n_head, T_q, T_kv)
     let scores = q
         .matmul(&k.transpose(2, 3)?.contiguous()?)?
         .affine(scale, 0.0)?;
@@ -116,7 +149,7 @@ pub(crate) fn naive_attention(
     let mask = mask.to_dtype(scores.dtype())?;
     let att = softmax(&scores.broadcast_add(&mask)?, D::Minus1)?;
 
-    // Mix values: (B, n_head, T, head_dim).
+    // Mix values: (B, n_head, T_q, head_dim).
     att.matmul(v)
 }
 
@@ -245,6 +278,39 @@ mod tests {
                 .unwrap_or_else(|| panic!("no grad reached {name}"));
             let sumsq = g.sqr()?.sum_all()?.to_scalar::<f32>()?;
             assert!(sumsq > 0.0, "{name} gradient is identically zero");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cached_attention_matches_full_forward() -> Result<()> {
+        // Feeding a sequence in spans through the cache must reproduce the
+        // one-shot forward exactly, span boundaries and all. Needs a non-zero
+        // c_proj, else the output is trivially zero and the test is vacuous.
+        use crate::model::KvCache;
+        use crate::test_support::assert_close;
+        let dev = Device::Cpu;
+        let cfg = tiny_cfg();
+        let mut vm = VarMap::new();
+        let attn = new_attn(&cfg, &vm, &dev)?;
+        let c = cfg.n_embd;
+        vm.set_one("c_proj.weight", Tensor::randn(0.0f32, 0.5, (c, c), &dev)?)?;
+
+        let t = 8;
+        let x = Tensor::randn(0.0f32, 1.0, (1, t, c), &dev)?;
+        let want = attn.forward(&x)?;
+
+        for spans in [vec![3usize, 1, 4], vec![1; t], vec![t]] {
+            let mut cache = KvCache::new(&cfg, t)?;
+            let mut t0 = 0;
+            let mut got = Vec::new();
+            for len in &spans {
+                let span = x.narrow(1, t0, *len)?;
+                got.push(attn.forward_inner(&span, Some(cache.layer_mut(0)), t0)?);
+                t0 += len;
+            }
+            let got = Tensor::cat(&got, 1)?;
+            assert_close(&got, &want, 1e-5, &format!("spans {spans:?}"))?;
         }
         Ok(())
     }

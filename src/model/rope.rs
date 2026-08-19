@@ -37,19 +37,30 @@ impl Rope {
     /// Apply RoPE to `x` of shape `(batch_size, n_head, T, head_dim)`, using positions
     /// `0..T`. Returns the rotated tensor of the same shape.
     pub fn apply(&self, x: &Tensor) -> Result<Tensor> {
+        self.apply_at(x, 0)
+    }
+
+    /// Apply RoPE to `x` of shape `(batch_size, n_head, T, head_dim)`, using absolute
+    /// positions `t0..t0 + T`. Returns the rotated tensor of the same shape.
+    ///
+    /// `t0` is non-zero only on the KV-cache decode path, where `x` is the new span
+    /// and the tokens before it are already cached with their own rotations baked in.
+    pub fn apply_at(&self, x: &Tensor, t0: usize) -> Result<Tensor> {
         let (_b, _h, t, head_dim) = x.dims4()?;
         let half = head_dim / 2;
 
-        // Slice the tables to the actual sequence length of (T, head_dim/2)
-        // and reshape so they broadcast over the batch and head axes
+        // Slice the tables to this span's positions, (T, head_dim/2), and reshape
+        // so they broadcast over the batch and head axes. The tables are
+        // contiguous and `narrow` on dim 0 only shifts the start and shrinks the
+        // dim, so the strides stay (half, 1) and the reshape is still legal.
         let cos = self
             .cos
-            .narrow(0, 0, t)?
+            .narrow(0, t0, t)?
             .reshape((1, 1, t, half))?
             .to_dtype(x.dtype())?;
         let sin = self
             .sin
-            .narrow(0, 0, t)?
+            .narrow(0, t0, t)?
             .reshape((1, 1, t, half))?
             .to_dtype(x.dtype())?;
 
@@ -140,6 +151,25 @@ mod tests {
         let norm_then_rope = rope.apply(&rms_norm(&x, 1e-6)?)?;
         let rope_then_norm = rms_norm(&rope.apply(&x)?, 1e-6)?;
         assert_close(&norm_then_rope, &rope_then_norm, 1e-5, "qk-norm order")
+    }
+
+    #[test]
+    fn apply_at_matches_a_narrowed_full_apply() -> Result<()> {
+        // `t0` *is* the position semantics: rotating a span that starts at t0
+        // must equal rotating the whole sequence and slicing that span out.
+        use crate::test_support::assert_close;
+        let dev = Device::Cpu;
+        let (b, h, hd, n) = (2usize, 3, 8, 4);
+        let seq = 16; // ≥ max(t0) + n, else `narrow` errors instead of mismatching.
+        let rope = Rope::new(seq, hd, BASE, &dev)?;
+        let x = Tensor::randn(0.0f32, 1.0, (b, h, seq, hd), &dev)?;
+        let full = rope.apply(&x)?;
+
+        for t0 in [0usize, 3, 7] {
+            let span = rope.apply_at(&x.narrow(2, t0, n)?, t0)?;
+            assert_close(&span, &full.narrow(2, t0, n)?, 1e-5, &format!("t0={t0}"))?;
+        }
+        Ok(())
     }
 
     #[test]
