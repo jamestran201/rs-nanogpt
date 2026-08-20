@@ -1,6 +1,8 @@
 ARG ?= default-value
+# Persistent nvcc/CUTLASS artifact cache for the vendored flash-attn kernels.
+FLASH_BUILD_DIR ?= $(CURDIR)/target/flash-attn-build
 
-.PHONY: bootstrap build-cpu build-cuda build-nccl build-metal covhtml covlcov lint bench memprofile
+.PHONY: bootstrap build-cpu build-cuda build-nccl build-flash-attn build-metal covhtml covlcov lint bench memprofile
 
 # Provision a fresh Lambda Labs GPU box: system deps, Rust, and CUDA env vars.
 # Idempotent; run `source ~/.bashrc` afterward to pick up the CUDA env.
@@ -21,6 +23,13 @@ build-cuda:
 # Additionally needs libnccl at build and run time (bootstrap.sh checks).
 build-nccl:
 	cargo build --release --features nccl
+
+# CUDA build with the vendored FlashAttention-2 kernels (crates/flash-attn).
+# Compiles 37 CUDA translation units against CUTLASS, so the first build is
+# slow; CANDLE_FLASH_ATTN_BUILD_DIR caches libflashattention.a between builds.
+build-flash-attn:
+	mkdir -p $(FLASH_BUILD_DIR)
+	CANDLE_FLASH_ATTN_BUILD_DIR=$(FLASH_BUILD_DIR) cargo build --release --features flash-attn
 
 # Release binary for Apple GPUs (Metal), for Mac dev/debug runs.
 build-metal:

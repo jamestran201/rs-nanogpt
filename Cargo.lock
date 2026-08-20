@@ -1953,6 +1953,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rs-flash-attn"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "candle-core",
+ "candle-nn",
+ "cudaforge",
+ "half",
+]
+
+[[package]]
 name = "rs-nanogpt"
 version = "0.1.0"
 dependencies = [
@@ -1967,6 +1978,7 @@ dependencies = [
  "rand 0.10.1",
  "rand_chacha 0.10.0",
  "rayon",
+ "rs-flash-attn",
  "serde",
  "serde_json",
  "tempfile",

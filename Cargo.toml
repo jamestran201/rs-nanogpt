@@ -3,6 +3,13 @@ name = "rs-nanogpt"
 version = "0.1.0"
 edition = "2024"
 
+# `crates/flash-attn` is a path dependency, so cargo would make it a member
+# implicitly; declaring it keeps `default-members` explicit — a bare
+# `cargo build`/`test` stays on the root package and never invokes nvcc.
+[workspace]
+members = ["crates/flash-attn"]
+default-members = ["."]
+
 [dependencies]
 arrow-array = "58.1.0"
 base64 = "0.22.1"
@@ -19,6 +26,10 @@ parquet = { version = "58.1.0", default-features = false, features = ["arrow", "
 rand = "0.10.1"
 rand_chacha = "0.10.0"
 rayon = "1.12.0"
+# Vendored FlashAttention-2 (crates/flash-attn), forward-only until the backward
+# kernels land. Optional and CUDA-only: building it runs nvcc over 37 translation
+# units, so it must never be pulled into a CPU or Metal build.
+rs-flash-attn = { path = "crates/flash-attn", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3.27.0"
@@ -36,3 +47,6 @@ cuda = ["candle-core/cuda", "candle-nn/cuda"]
 # Multi-GPU DDP over NCCL (one process per GPU). CUDA-only; needs libnccl on
 # the box at build and run time.
 nccl = ["cuda", "candle-core/nccl"]
+# Fused FlashAttention-2 kernels. CUDA-only and slow to build; set
+# CANDLE_FLASH_ATTN_BUILD_DIR to cache libflashattention.a between builds.
+flash-attn = ["cuda", "dep:rs-flash-attn"]
