@@ -1,5 +1,12 @@
 mod ffi;
 
+// Ours, not upstream's: the training-path pair (a forward that keeps the LSE
+// plus a backward). Kept out of this file so `lib.rs` stays a clean diff
+// against the vendored candle original — see README.md. No root re-export:
+// callers spell `rs_flash_attn::trainable::...`, which keeps the ours/upstream
+// split legible at the call site.
+pub mod trainable;
+
 use candle::backend::BackendStorage;
 use candle::cuda_backend::cudarc::driver::{DevicePtr, DevicePtrMut};
 use candle::{CpuStorage, DType, Layout, Result, Shape, Tensor};
