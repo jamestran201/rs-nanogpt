@@ -26,9 +26,10 @@ parquet = { version = "58.1.0", default-features = false, features = ["arrow", "
 rand = "0.10.1"
 rand_chacha = "0.10.0"
 rayon = "1.12.0"
-# Vendored FlashAttention-2 (crates/flash-attn), forward-only until the backward
-# kernels land. Optional and CUDA-only: building it runs nvcc over 37 translation
-# units, so it must never be pulled into a CPU or Metal build.
+# Vendored FlashAttention-2 (crates/flash-attn), forward + backward, trimmed to
+# the one configuration d24 runs (head_dim 128, bf16). Optional and CUDA-only:
+# building it runs nvcc over 5 translation units against CUTLASS, so it must
+# never be pulled into a CPU or Metal build.
 rs-flash-attn = { path = "crates/flash-attn", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

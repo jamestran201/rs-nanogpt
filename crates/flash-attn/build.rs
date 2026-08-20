@@ -11,10 +11,12 @@ const CUTLASS_COMMIT: &str = "7d49e6c7e2f8896c47f586706e67e1fb215529dc";
 // device) — so the other 34 are ~18x of nvcc time spent on kernels this project
 // never calls. `run_mha_fwd` in flash_api.cu was narrowed to match; adding a
 // head dim or dtype means restoring both. See README.md.
-const KERNEL_FILES: [&str; 3] = [
+const KERNEL_FILES: [&str; 5] = [
     "kernels/flash_api.cu",
     "kernels/flash_fwd_hdim128_bf16_sm80.cu",
     "kernels/flash_fwd_hdim128_bf16_causal_sm80.cu",
+    "kernels/flash_bwd_hdim128_bf16_sm80.cu",
+    "kernels/flash_bwd_hdim128_bf16_causal_sm80.cu",
 ];
 
 fn main() -> Result<()> {
@@ -24,6 +26,9 @@ fn main() -> Result<()> {
     }
     println!("cargo::rerun-if-changed=kernels/flash_fwd_kernel.h");
     println!("cargo::rerun-if-changed=kernels/flash_fwd_launch_template.h");
+    println!("cargo::rerun-if-changed=kernels/flash_bwd_kernel.h");
+    println!("cargo::rerun-if-changed=kernels/flash_bwd_launch_template.h");
+    println!("cargo::rerun-if-changed=kernels/flash_bwd_preprocess_kernel.h");
     println!("cargo::rerun-if-changed=kernels/flash.h");
     println!("cargo::rerun-if-changed=kernels/philox.cuh");
     println!("cargo::rerun-if-changed=kernels/softmax.h");
@@ -32,6 +37,12 @@ fn main() -> Result<()> {
     println!("cargo::rerun-if-changed=kernels/block_info.h");
     println!("cargo::rerun-if-changed=kernels/static_switch.h");
     println!("cargo::rerun-if-changed=kernels/hardware_info.h");
+    println!("cargo::rerun-if-changed=kernels/error.h");
+    println!("cargo::rerun-if-changed=kernels/mask.h");
+    println!("cargo::rerun-if-changed=kernels/dropout.h");
+    println!("cargo::rerun-if-changed=kernels/alibi.h");
+    println!("cargo::rerun-if-changed=kernels/kernels.h");
+    println!("cargo::rerun-if-changed=kernels/kernel_helpers.h");
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR not set"));
     let build_dir = match std::env::var("CANDLE_FLASH_ATTN_BUILD_DIR") {
         Err(_) =>

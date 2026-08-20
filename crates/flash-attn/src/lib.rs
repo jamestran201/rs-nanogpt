@@ -204,6 +204,10 @@ impl FlashAttn {
                 /* window_size_left */ window_size_left,
                 /* window_size_right */ window_size_right,
                 /* softcap */ self.softcap.unwrap_or(0f32),
+                // Candle's stream, not the null stream — see the note on
+                // `stream_ptr` in ffi.rs.
+                /* stream_ptr */
+                stream.cu_stream() as *mut core::ffi::c_void,
             )
         }
 
