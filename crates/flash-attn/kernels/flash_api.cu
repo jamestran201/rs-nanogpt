@@ -1,14 +1,27 @@
+#include <cstdio>
+#include <cstdlib>
+
 #include "kernels.h"
 #include "kernel_helpers.h"
 #include "flash_fwd_launch_template.h"
 
+// NARROWED (rs-nanogpt): only head_dim 128 / bf16 is instantiated in this build
+// (see KERNEL_FILES in build.rs). The upstream FP16_SWITCH/HEADDIM_SWITCH nest
+// expands to every combination, so leaving it would reference templates that no
+// longer have a translation unit — an undefined-symbol link error. Aborting
+// rather than falling back: there is no other kernel here to fall back to, and a
+// silent wrong-shape dispatch would be far worse than a loud stop.
 void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
-  FP16_SWITCH(!params.is_bf16, [&] {
-      HEADDIM_SWITCH(params.d, [&] {
-          BOOL_SWITCH(params.is_causal, Is_causal, [&] {
-              run_mha_fwd_<elem_type, kHeadDim, Is_causal>(params, stream);
-          });
-      });
+  if (params.d != 128 || !params.is_bf16) {
+    fprintf(stderr,
+            "rs-flash-attn: this build compiles only head_dim 128 / bf16 "
+            "(got head_dim %d, %s). Restore the instantiations in build.rs "
+            "and this dispatcher to widen it.\n",
+            params.d, params.is_bf16 ? "bf16" : "fp16");
+    abort();
+  }
+  BOOL_SWITCH(params.is_causal, Is_causal, [&] {
+      run_mha_fwd_<cutlass::bfloat16_t, 128, Is_causal>(params, stream);
   });
 }
 

@@ -1,6 +1,7 @@
 ARG ?= default-value
 # Persistent nvcc/CUTLASS artifact cache for the vendored flash-attn kernels.
-FLASH_BUILD_DIR ?= $(CURDIR)/target/flash-attn-build
+# Deliberately outside target/ so `cargo clean` does not throw away an hour of nvcc.
+FLASH_BUILD_DIR ?= $(CURDIR)/.flash-attn-build
 
 .PHONY: bootstrap build-cpu build-cuda build-nccl build-flash-attn build-metal covhtml covlcov lint bench memprofile
 

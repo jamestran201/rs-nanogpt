@@ -24,8 +24,25 @@ Phase 1 (this commit) changed **only `Cargo.toml`**:
   rev, so they resolve to the same `candle-core` instance as the root crate;
 - version reset to `0.1.0`.
 
-Everything under `kernels/`, `src/`, and `tests/`, plus `build.rs`, is byte-for-byte
-upstream. Later phases add backward kernels — record each change here.
+Then, to make the build tractable on a rented box:
+
+- **`build.rs` — `KERNEL_FILES` trimmed 37 → 3.** Upstream compiles 9 head dims
+  × 2 dtypes × 2 causal = 36 forward instantiations. d24 runs exactly one
+  configuration: head_dim 128 (`n_embd 1536 / n_head 12`) and bf16
+  (`compute_dtype` returns BF16 on every CUDA device). The other 34 are ~18× of
+  nvcc time for kernels this project never calls. **The `.cu` files are still on
+  disk** — widening is a matter of putting names back in the list.
+- **`kernels/flash_api.cu` — `run_mha_fwd` narrowed to match.** Upstream's
+  `FP16_SWITCH`/`HEADDIM_SWITCH` nest expands to every combination, so it would
+  reference templates that no longer have a translation unit (undefined-symbol
+  link error). Now: a hard `abort()` for anything but head_dim 128 / bf16, then
+  `BOOL_SWITCH` on causal. Restoring instantiations means restoring this too.
+- **`tests/` removed.** Upstream's tests exercise head_dim 8 and fp16, neither of
+  which is compiled here, so they no longer link. Phase 4 of the plan adds a
+  parity test at the shape this project actually runs.
+
+Everything else under `kernels/` and `src/`, plus the rest of `build.rs`, is
+byte-for-byte upstream. Later phases add backward kernels — record each change here.
 
 ## Licensing
 
