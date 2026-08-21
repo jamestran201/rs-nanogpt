@@ -27,10 +27,16 @@
 //! # Aborts
 //!
 //! The C side aborts the process on an unsupported configuration rather than
-//! returning a wrong gradient (see `kernels/flash_api.cu`). Every condition it
-//! aborts on is checked here first, so ordinary misuse surfaces as a candle
-//! `Error`; an abort that does fire means this module and the C guards
-//! disagree, which is a bug in one of them.
+//! returning a wrong gradient (see `kernels/flash_api.cu`). Every
+//! *precondition* it aborts on is checked here first, so ordinary misuse
+//! surfaces as a candle `Error`; a precondition abort that does fire means this
+//! module and the C guards disagree, which is a bug in one of them.
+//!
+//! Two of its aborts are **not** preconditions and cannot be pre-checked here:
+//! `C10_CUDA_CHECK` / `C10_CUDA_KERNEL_LAUNCH_CHECK` inside the launch
+//! templates, and the pending-async-error backstop after the launch returns.
+//! Those report a failure of the launch itself or of earlier work on the
+//! stream, so neither implies a guard mismatch.
 
 use core::ffi::{c_int, c_void};
 
@@ -102,6 +108,19 @@ fn check_bhtd(l: &Layout, dtype: DType, name: &str) -> Result<(usize, usize, usi
         candle::bail!("flash-attn (trainable): the last dim of {name} must be contiguous, got strides {stride:?}")
     }
     let (b, h, t, d) = l.shape().dims4()?;
+    if b == 0 || h == 0 || t == 0 {
+        // Both empty cases reach C as an `abort()` at best. `seqlen_q == 0` is
+        // refused outright by `run_mha_backward` (upstream instead skips the
+        // launch and zeroes dk/dv, a branch this crate does not carry), and
+        // `h == 0` is worse: the *forward* has no guard at all and computes
+        // `params.h_h_k_ratio = h / h_k`, an integer division by zero in C.
+        // Caught here so both stay a Rust `Error` — which is what the module
+        // docs promise, and what a training loop can act on.
+        candle::bail!(
+            "flash-attn (trainable): {name} has an empty dimension, got {:?}",
+            l.shape()
+        )
+    }
     if d != HEAD_DIM {
         candle::bail!(
             "flash-attn (trainable): {name} has head_dim {d}; this build compiles only {HEAD_DIM}"
@@ -233,6 +252,13 @@ pub fn flash_attn_fwd_lse(
     // is neither overrun nor under-filled. Candle's own dense forward asks for
     // `b * 128 * h * seqlen_q` here, which its varlen forward does not — a
     // quirk, and an expensive one when the LSE is retained across 24 layers.
+    //
+    // Zeroed even though the kernel writes every element (including the
+    // `n_block_max <= n_block_min` early exit, which stores `INFINITY`): unlike
+    // the scratch buffers below, this one survives the call and feeds the
+    // backward, so a zero here is cheap insurance that a hypothetical
+    // under-fill reads as a deterministic wrong number rather than as whatever
+    // the allocator last held.
     let mut softmax_lse = dev.alloc_zeros::<f32>(b * h * seqlen_q)?;
 
     let (q_batch_stride, q_row_stride, q_head_stride) = strides_bhtd(q_l);

@@ -377,28 +377,35 @@ impl FlashAttnOp {
     fn use_fa2(&self) -> bool {
         // `matches!`, not `==`: candle's `Error` has no `PartialEq`, so a
         // `Result` cannot be compared.
-        let ok = self.q.device().is_cuda()
+        self.q.device().is_cuda()
             && self.q.dtype() == DType::BF16
-            && matches!(self.q.dim(3), Ok(128));
-        if !ok {
-            // Silent fallback is the failure mode to design against: a user who
-            // builds --features flash-attn and quietly gets the composed path
-            // has no signal, and this whole work stream exists to move one
-            // number. Once per process, naming the reason.
-            static WARNED: OnceLock<()> = OnceLock::new();
-            WARNED.get_or_init(|| {
-                eprintln!(
-                    "warning: --features flash-attn is enabled but the vendored FA2 kernels \
-                     are not eligible here (device {:?}, dtype {:?}, head_dim {:?}); falling \
-                     back to the composed attention path. This build compiles CUDA + bf16 + \
-                     head_dim 128 only.",
-                    self.q.device().location(),
-                    self.q.dtype(),
-                    self.q.dim(3).ok(),
-                );
-            });
-        }
-        ok
+            && matches!(self.q.dim(3), Ok(128))
+    }
+
+    /// Say once, on stderr, that a `--features flash-attn` build fell back.
+    ///
+    /// Silent fallback is the failure mode to design against: a user who builds
+    /// the feature, runs at head_dim 64, and quietly gets the composed path has
+    /// no signal — and this whole work stream exists to move one number.
+    ///
+    /// Called from `cuda_fwd` only, never from `bwd`. `bwd` runs on every
+    /// backend, so under `cargo test --features flash-attn` the CPU tests would
+    /// burn this one-shot on a fallback that is entirely expected, leaving a
+    /// genuinely ineligible GPU run later in the same process silent.
+    #[cfg(feature = "flash-attn")]
+    fn warn_fa2_fallback(&self) {
+        static WARNED: OnceLock<()> = OnceLock::new();
+        WARNED.get_or_init(|| {
+            eprintln!(
+                "warning: --features flash-attn is enabled but the vendored FA2 kernels \
+                 are not eligible here (device {:?}, dtype {:?}, head_dim {:?}); falling \
+                 back to the composed attention path. This build compiles CUDA + bf16 + \
+                 head_dim 128 only.",
+                self.q.device().location(),
+                self.q.dtype(),
+                self.q.dim(3).ok(),
+            );
+        });
     }
 
     fn fwd(&self) -> Result<(Storage, Shape)> {
@@ -466,6 +473,8 @@ impl CustomOp3 for FlashAttnOp {
             )?;
             *self.lse.lock().expect("flash-attn lse mutex poisoned") = Some(lse);
             return Ok((o, shape));
+        } else {
+            self.warn_fa2_fallback();
         }
         match self.fwd()? {
             (Storage::Cuda(s), shape) => Ok((s, shape)),
@@ -778,18 +787,30 @@ mod tests {
     #[cfg(feature = "flash-attn")]
     #[test]
     fn fa2_wiring_matches_naive_on_cuda() -> Result<()> {
-        // Mixed tolerance: bf16 inputs against an f32 reference. Absolute term
-        // included because gradient entries pass through zero.
+        // Mixed tolerance: bf16 inputs against an f32 reference. The absolute
+        // term is scaled by the reference's own RMS rather than being a flat
+        // constant — dq/dk entries here have RMS ~0.05, so a flat 2e-2 would be
+        // ~40% of a typical entry and a systematically wrong gradient would
+        // pass. It cannot be dropped entirely (entries pass through zero). The
+        // Frobenius check then catches what no per-element bar can: a uniform
+        // scale error spread thinly over every entry. Same reasoning, and the
+        // same constants, as `crates/flash-attn/tests/parity.rs`.
         fn close(got: &Tensor, want: &Tensor, what: &str) -> Result<()> {
             assert_eq!(got.dims(), want.dims(), "{what}: shape mismatch");
             let g = got.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
             let w = want.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+            let sq: f32 = w.iter().map(|x| x * x).sum();
+            assert!(sq > 0.0, "{what}: reference is all zeros");
+            let atol = 2e-2 * (sq / w.len() as f32).sqrt();
             for (i, (g, w)) in g.iter().zip(&w).enumerate() {
                 assert!(
-                    (g - w).abs() <= 2e-2 + 2e-2 * w.abs(),
-                    "{what}[{i}]: {g} vs {w}"
+                    (g - w).abs() <= atol + 2e-2 * w.abs(),
+                    "{what}[{i}]: {g} vs {w} (atol {atol:e})"
                 );
             }
+            let err: f32 = g.iter().zip(&w).map(|(g, w)| (g - w) * (g - w)).sum();
+            let rel = (err / sq).sqrt();
+            assert!(rel <= 2e-2, "{what}: relative Frobenius error {rel:e}");
             Ok(())
         }
 
