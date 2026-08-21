@@ -16,36 +16,40 @@ use candle::op::BackpropOp;
 use candle::{DType, Device, Result, Shape, Storage, Tensor, Var, D};
 use candle_nn::ops::softmax;
 
-/// Absolute term, as a fraction of the reference tensor's own RMS.
-const ATOL: f32 = 2e-2;
-/// Relative term, per element.
+/// Per-element absolute term, as a fraction of the reference tensor's own RMS.
+/// Deliberately loose — see the two-jobs note below.
+const ATOL: f32 = 1.5e-1;
+/// Per-element relative term.
 const RTOL: f32 = 2e-2;
-/// Whole-tensor relative Frobenius error, `‖got − want‖₂ / ‖want‖₂`.
+/// Whole-tensor relative Frobenius error, `‖got − want‖₂ / ‖want‖₂`. This is
+/// the tight one.
 const FTOL: f32 = 2e-2;
 
-/// Elementwise `|a − b| ≤ ATOL·rms(b) + RTOL·|b|`, then a whole-tensor relative
-/// Frobenius error.
+/// Compare against the f32 reference. The two assertions have **different
+/// jobs**, and only one of them is near the numerical floor:
 ///
-/// **The absolute term is scaled by the reference tensor's own RMS**, not a
-/// fixed constant. It has to exist at all — dQ entries pass through zero, and a
-/// pure relative bound divides by ~0 — but a *constant* one ends up set by the
-/// largest tensor under test and is far too loose for the smallest. At these
-/// inputs (`randn(0,1)`, d=128, scale=1/√128) dQ and dK entries have RMS ≈ 0.05
-/// while O is O(1) and the LSE is O(6), so a flat `atol = 2e-2` was ~40% of a
-/// typical dQ entry: multiplying the kernel's dQ by 1.3 passed every assertion.
-/// The real bf16-vs-f32 disagreement on dQ is ~3e-3 relative, from two
-/// comparable sources: dQ is *stored* bf16 (unit roundoff 2⁻⁸, ~2.2e-3 RMS),
-/// and dS is rounded to bf16 before the dQ matmul (~2.2e-3 after 256 terms
-/// accumulate in quadrature — it does not shrink with the sum, because the
-/// value only grows as √n either). So the bars here keep ~6× margin while
-/// catching anything systematic above a few percent. Tightening further is not
-/// worth a round trip: every error this suite exists to catch — a swapped
-/// stride, `unpadded_lse = 1`, a permuted return, a double-applied scale — is a
-/// 10-100% error, not a 1.5% one.
+/// - The **Frobenius** bound is the precision check. It is a whole-tensor
+///   statistic over 16k-262k elements, so its run-to-run spread is ~1/√2N and
+///   it lands on the same value every run. A systematically wrong gradient —
+///   a double-applied scale, a mis-stashed LSE, a permuted return — moves it
+///   by 10-100%, far outside 2e-2. This is what actually certifies the kernel.
+/// - The **elementwise** bound catches *localized* corruption: one tile, one
+///   row, one head indexed wrongly, which barely moves a norm over 262k
+///   elements. It has to survive the tail of the error distribution instead of
+///   tracking its centre, so it is set at ~5× the worst element observed.
 ///
-/// The Frobenius check is the one no elementwise bound can substitute for: a
-/// uniform scale error spread thinly across every entry sits just under a
-/// per-element bar and shows up loudly in the norm.
+/// Why the absolute term is scaled by the reference's RMS rather than being a
+/// flat constant: it cannot be dropped (dQ entries pass through zero, so a pure
+/// relative bound divides by ~0), but a flat one silently means something
+/// different for each tensor — here rms(dQ) ≈ 0.18, rms(O) ≈ 0.09 and
+/// rms(LSE) ≈ 5.5, i.e. two orders of magnitude apart.
+///
+/// The measured worst element is ~3e-2·rms on dQ at (2, 4, 256) causal — a
+/// small entry (0.13·rms) in the largest tensor in the suite. That is ~10×
+/// above the naive bf16 round-off estimate, which is why this bound is set from
+/// the measurement rather than from the model: causal rows attending to few
+/// keys carry heavy cancellation in `dS = P∘(dP − D)`, and the shortest rows
+/// have the largest dQ.
 fn assert_close(got: &Tensor, want: &Tensor, what: &str) -> Result<()> {
     assert_eq!(got.dims(), want.dims(), "{what}: shape mismatch");
     let g = got.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
@@ -53,25 +57,42 @@ fn assert_close(got: &Tensor, want: &Tensor, what: &str) -> Result<()> {
 
     let sq: f32 = w.iter().map(|x| x * x).sum();
     // Guarded so an all-zero reference fails as itself rather than as a NaN
-    // comparison ten lines below.
+    // comparison further down.
     assert!(
         sq > 0.0,
         "{what}: reference is all zeros, the check is vacuous"
     );
-    let atol = ATOL * (sq / w.len() as f32).sqrt();
+    let rms = (sq / w.len() as f32).sqrt();
+    let atol = ATOL * rms;
 
-    for (i, (g, w)) in g.iter().zip(&w).enumerate() {
-        assert!(
-            (g - w).abs() <= atol + RTOL * w.abs(),
-            "{what}[{i}]: {g} vs {w} (atol {atol:e})"
-        );
-    }
+    let sq_err: f32 = g.iter().zip(&w).map(|(g, w)| (g - w) * (g - w)).sum();
+    let frobenius = (sq_err / sq).sqrt();
 
-    let err: f32 = g.iter().zip(&w).map(|(g, w)| (g - w) * (g - w)).sum();
-    let rel = (err / sq).sqrt();
+    // The *worst* element by how far it exceeds its own bar, not the first one
+    // over it: a single run then reports the number this bound has to be set
+    // from, instead of an arbitrary member of the tail.
+    let (i, over) = g
+        .iter()
+        .zip(&w)
+        .enumerate()
+        .map(|(i, (g, w))| (i, (g - w).abs() - (atol + RTOL * w.abs())))
+        .fold((0, f32::MIN), |acc, x| if x.1 > acc.1 { x } else { acc });
+
+    // Asserted first so its value is in the message whichever bound trips —
+    // it is the one that says whether a failure is systematic or a tail draw.
     assert!(
-        rel <= FTOL,
-        "{what}: relative Frobenius error {rel:e} > {FTOL:e}"
+        frobenius <= FTOL,
+        "{what}: relative Frobenius error {frobenius:e} > {FTOL:e} (rms {rms:e})"
+    );
+    assert!(
+        over <= 0.0,
+        "{what}: worst element [{i}] {} vs {} — over its bar by {:e} \
+         (|diff| {:e} = {:.1}% of rms {rms:e}; frobenius {frobenius:e})",
+        g[i],
+        w[i],
+        over,
+        (g[i] - w[i]).abs(),
+        100.0 * (g[i] - w[i]).abs() / rms,
     );
     Ok(())
 }

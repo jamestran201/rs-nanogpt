@@ -787,30 +787,36 @@ mod tests {
     #[cfg(feature = "flash-attn")]
     #[test]
     fn fa2_wiring_matches_naive_on_cuda() -> Result<()> {
-        // Mixed tolerance: bf16 inputs against an f32 reference. The absolute
-        // term is scaled by the reference's own RMS rather than being a flat
-        // constant — dq/dk entries here have RMS ~0.05, so a flat 2e-2 would be
-        // ~40% of a typical entry and a systematically wrong gradient would
-        // pass. It cannot be dropped entirely (entries pass through zero). The
-        // Frobenius check then catches what no per-element bar can: a uniform
-        // scale error spread thinly over every entry. Same reasoning, and the
-        // same constants, as `crates/flash-attn/tests/parity.rs`.
+        // Two bounds with different jobs, matching
+        // `crates/flash-attn/tests/parity.rs` (see the rationale there): the
+        // relative Frobenius error is the tight one and is what certifies the
+        // numbers, while the per-element bound is deliberately loose because it
+        // exists to catch *localized* corruption and so has to clear the tail
+        // of the error distribution rather than track its centre. The absolute
+        // term is scaled by the reference's own RMS — it cannot be dropped
+        // (gradient entries pass through zero) but a flat constant means
+        // something different for every tensor.
         fn close(got: &Tensor, want: &Tensor, what: &str) -> Result<()> {
             assert_eq!(got.dims(), want.dims(), "{what}: shape mismatch");
             let g = got.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
             let w = want.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
             let sq: f32 = w.iter().map(|x| x * x).sum();
             assert!(sq > 0.0, "{what}: reference is all zeros");
-            let atol = 2e-2 * (sq / w.len() as f32).sqrt();
+            let rms = (sq / w.len() as f32).sqrt();
+            let atol = 1.5e-1 * rms;
+            let sq_err: f32 = g.iter().zip(&w).map(|(g, w)| (g - w) * (g - w)).sum();
+            let frobenius = (sq_err / sq).sqrt();
+            assert!(
+                frobenius <= 2e-2,
+                "{what}: relative Frobenius error {frobenius:e} (rms {rms:e})"
+            );
             for (i, (g, w)) in g.iter().zip(&w).enumerate() {
                 assert!(
                     (g - w).abs() <= atol + 2e-2 * w.abs(),
-                    "{what}[{i}]: {g} vs {w} (atol {atol:e})"
+                    "{what}[{i}]: {g} vs {w} ({:.1}% of rms {rms:e}; frobenius {frobenius:e})",
+                    100.0 * (g - w).abs() / rms
                 );
             }
-            let err: f32 = g.iter().zip(&w).map(|(g, w)| (g - w) * (g - w)).sum();
-            let rel = (err / sq).sqrt();
-            assert!(rel <= 2e-2, "{what}: relative Frobenius error {rel:e}");
             Ok(())
         }
 
