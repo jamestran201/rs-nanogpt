@@ -253,7 +253,7 @@ pub fn decode_id_hex(hex: &str) -> std::result::Result<[u8; NCCL_ID_LEN], String
         ));
     }
     let mut bytes = [0u8; NCCL_ID_LEN];
-    for (i, chunk) in hex.as_bytes().chunks_exact(2).enumerate() {
+    for (i, chunk) in hex.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let pair =
             std::str::from_utf8(chunk).map_err(|_| "NCCL id hex is not ASCII".to_string())?;
         bytes[i] = u8::from_str_radix(pair, 16)

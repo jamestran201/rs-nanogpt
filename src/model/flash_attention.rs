@@ -241,6 +241,14 @@ fn accum_prefix(acc: Option<Tensor>, contrib: Tensor, c0: usize, len: usize) -> 
 ///
 /// `q`/`k`/`v`: `(B, n_head, T, head_dim)` with RoPE/QK-norm already applied;
 /// `mask`: additive causal `(T, T)` slice; `scale = 1/sqrt(head_dim)`.
+///
+/// **Precondition:** `mask` must be the standard causal square — `0` on and
+/// below the diagonal, `-inf` above, with row `i` meaning absolute position
+/// `i`. The composed path reads the tensor, but the FA2 path (`--features
+/// flash-attn` on an eligible op) ignores it and generates the mask from
+/// `causal = true`, so anything else would silently diverge between the two.
+/// Checking it here would be a full T² scan; the sole caller slices exactly
+/// that square.
 pub(crate) fn flash_attention(
     q: &Tensor,
     k: &Tensor,
@@ -356,6 +364,50 @@ struct FlashAttnOp {
 }
 
 impl FlashAttnOp {
+    /// Whether the vendored FlashAttention-2 kernels can serve this op.
+    ///
+    /// The feature flag is not enough: `crates/flash-attn` compiles exactly one
+    /// configuration — CUDA, bf16, head_dim 128 — while `head_dim = n_embd /
+    /// n_head` comes from two free CLI flags and `compute_dtype` is bf16 only
+    /// on CUDA. So eligibility is a *runtime* predicate.
+    ///
+    /// Computed from the stashed `q`, so `cuda_fwd` and `bwd` read the same
+    /// tensor and cannot disagree about which path ran.
+    #[cfg(feature = "flash-attn")]
+    fn use_fa2(&self) -> bool {
+        // `matches!`, not `==`: candle's `Error` has no `PartialEq`, so a
+        // `Result` cannot be compared.
+        self.q.device().is_cuda()
+            && self.q.dtype() == DType::BF16
+            && matches!(self.q.dim(3), Ok(128))
+    }
+
+    /// Say once, on stderr, that a `--features flash-attn` build fell back.
+    ///
+    /// Silent fallback is the failure mode to design against: a user who builds
+    /// the feature, runs at head_dim 64, and quietly gets the composed path has
+    /// no signal — and this whole work stream exists to move one number.
+    ///
+    /// Called from `cuda_fwd` only, never from `bwd`. `bwd` runs on every
+    /// backend, so under `cargo test --features flash-attn` the CPU tests would
+    /// burn this one-shot on a fallback that is entirely expected, leaving a
+    /// genuinely ineligible GPU run later in the same process silent.
+    #[cfg(feature = "flash-attn")]
+    fn warn_fa2_fallback(&self) {
+        static WARNED: OnceLock<()> = OnceLock::new();
+        WARNED.get_or_init(|| {
+            eprintln!(
+                "warning: --features flash-attn is enabled but the vendored FA2 kernels \
+                 are not eligible here (device {:?}, dtype {:?}, head_dim {:?}); falling \
+                 back to the composed attention path. This build compiles CUDA + bf16 + \
+                 head_dim 128 only.",
+                self.q.device().location(),
+                self.q.dtype(),
+                self.q.dim(3).ok(),
+            );
+        });
+    }
+
     fn fwd(&self) -> Result<(Storage, Shape)> {
         // kv_offset 0: this is the training path, which never caches — keeping
         // it explicit so the backward's matching omission reads as a decision.
@@ -398,6 +450,32 @@ impl CustomOp3 for FlashAttnOp {
         _: &CudaStorage,
         _: &Layout,
     ) -> Result<(CudaStorage, Shape)> {
+        // The vendored FA2 forward, when this op is eligible for it. It returns
+        // an owned `CudaStorage`, so unlike `self.fwd()` there is no
+        // `storage_and_layout` + `try_clone` deep copy of O on the way out.
+        //
+        // `self.mask` is unused on this branch: FA2 generates the causal mask
+        // internally from `causal = true`. Correct only because the sole caller
+        // of `flash_attention` builds the standard causal square — a documented
+        // precondition, since verifying it here would be a full T² scan.
+        //
+        // The scale is *not* pre-folded into Q here (as the composed forward
+        // does); FA2 takes it as a kernel parameter. Same math, different place
+        // — the two must not both apply it.
+        #[cfg(feature = "flash-attn")]
+        if self.use_fa2() {
+            let (o, shape, lse) = rs_flash_attn::trainable::flash_attn_fwd_lse(
+                &self.q,
+                &self.k,
+                &self.v,
+                self.scale as f32,
+                /* causal */ true,
+            )?;
+            *self.lse.lock().expect("flash-attn lse mutex poisoned") = Some(lse);
+            return Ok((o, shape));
+        } else {
+            self.warn_fa2_fallback();
+        }
         match self.fwd()? {
             (Storage::Cuda(s), shape) => Ok((s, shape)),
             _ => bail!("flash-attn cuda_fwd produced a non-cuda tensor"),
@@ -439,6 +517,25 @@ impl CustomOp3 for FlashAttnOp {
         let Some(lse) = lse else {
             bail!("flash-attn backward called before forward")
         };
+        // Fully qualified: this module already has a private `flash_attn_bwd`
+        // (the composed one, called just below), so a `use` would collide.
+        #[cfg(feature = "flash-attn")]
+        if self.use_fa2() {
+            let (dq, dk, dv) = rs_flash_attn::trainable::flash_attn_bwd(
+                &q.detach(),
+                &k.detach(),
+                &v.detach(),
+                &o.detach(),
+                &lse,
+                &d_o.detach(),
+                self.scale as f32,
+                /* causal */ true,
+            )?;
+            // dq/dk/dv arrive built with `BackpropOp::none()`, so nothing here
+            // pins a forward graph in the GradStore — which is what the detach
+            // discipline above buys on the composed branch.
+            return Ok((Some(dq), Some(dk), Some(dv)));
+        }
         let (dq, dk, dv) = flash_attn_bwd(
             &q.detach(),
             &k.detach(),
@@ -667,6 +764,95 @@ mod tests {
                 1e-5,
                 &format!("round {i} dq"),
             )?;
+        }
+        Ok(())
+    }
+
+    /// The *wiring* between `flash_attention` and the vendored FA2 kernels:
+    /// argument order, the scale, the causal flag, the LSE stash, and the
+    /// gradient shapes candle's autograd will accumulate into.
+    ///
+    /// Deliberately not a kernel test — `crates/flash-attn/tests/parity.rs`
+    /// covers correctness, including the stride mapping at `b = 2, h = 4`. What
+    /// only shows up here is same-shape and therefore numeric: a q/k/v swap, a
+    /// dq/dk/dv permutation, a double-applied scale, a mis-stashed LSE. Those
+    /// are invisible to the parity test (self-consistent by construction) and
+    /// to the eight CPU tests above (which never take this branch).
+    ///
+    /// The oracle runs in **f32**, not bf16: `naive_attention` casts the mask
+    /// to the scores' dtype and softmaxes at that dtype, so a bf16 oracle would
+    /// drift ~1e-2 on its own and set the tolerance by the reference's noise
+    /// rather than the kernel's — wide enough to hide the errors above. Both
+    /// paths under test already accumulate in fp32.
+    #[cfg(feature = "flash-attn")]
+    #[test]
+    fn fa2_wiring_matches_naive_on_cuda() -> Result<()> {
+        // Two bounds with different jobs, matching
+        // `crates/flash-attn/tests/parity.rs` (see the rationale there): the
+        // relative Frobenius error is the tight one and is what certifies the
+        // numbers, while the per-element bound is deliberately loose because it
+        // exists to catch *localized* corruption and so has to clear the tail
+        // of the error distribution rather than track its centre. The absolute
+        // term is scaled by the reference's own RMS — it cannot be dropped
+        // (gradient entries pass through zero) but a flat constant means
+        // something different for every tensor.
+        fn close(got: &Tensor, want: &Tensor, what: &str) -> Result<()> {
+            assert_eq!(got.dims(), want.dims(), "{what}: shape mismatch");
+            let g = got.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+            let w = want.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+            let sq: f32 = w.iter().map(|x| x * x).sum();
+            assert!(sq > 0.0, "{what}: reference is all zeros");
+            let rms = (sq / w.len() as f32).sqrt();
+            let atol = 1.5e-1 * rms;
+            let sq_err: f32 = g.iter().zip(&w).map(|(g, w)| (g - w) * (g - w)).sum();
+            let frobenius = (sq_err / sq).sqrt();
+            assert!(
+                frobenius <= 2e-2,
+                "{what}: relative Frobenius error {frobenius:e} (rms {rms:e})"
+            );
+            for (i, (g, w)) in g.iter().zip(&w).enumerate() {
+                assert!(
+                    (g - w).abs() <= atol + 2e-2 * w.abs(),
+                    "{what}[{i}]: {g} vs {w} ({:.1}% of rms {rms:e}; frobenius {frobenius:e})",
+                    100.0 * (g - w).abs() / rms
+                );
+            }
+            Ok(())
+        }
+
+        let (b, h, t, hd) = (1usize, 2, 256, 128);
+        let dev = Device::new_cuda(0)?;
+        let scale = 1.0 / (hd as f64).sqrt();
+        let mask = build_causal_mask(t, &dev)?;
+        let mk = || -> Result<Tensor> {
+            Tensor::randn(0f32, 1.0, (b, h, t, hd), &dev)?.to_dtype(DType::BF16)
+        };
+        let (q0, k0, v0, w) = (mk()?, mk()?, mk()?, mk()?);
+
+        // Reference: the same values, up-cast, through the naive path.
+        let qr = Var::from_tensor(&q0.to_dtype(DType::F32)?)?;
+        let kr = Var::from_tensor(&k0.to_dtype(DType::F32)?)?;
+        let vr = Var::from_tensor(&v0.to_dtype(DType::F32)?)?;
+        let out_ref =
+            naive_attention(qr.as_tensor(), kr.as_tensor(), vr.as_tensor(), &mask, scale)?;
+        let w32 = w.to_dtype(DType::F32)?;
+        let grads_ref = (&out_ref * &w32)?.sum_all()?.backward()?;
+
+        let q = Var::from_tensor(&q0)?;
+        let k = Var::from_tensor(&k0)?;
+        let v = Var::from_tensor(&v0)?;
+        let out = flash_attention(q.as_tensor(), k.as_tensor(), v.as_tensor(), &mask, scale)?;
+        assert_eq!(out.dtype(), DType::BF16, "fwd dtype");
+        close(&out, &out_ref, "fa2 fwd")?;
+
+        let grads = (&out * &w)?.sum_all()?.backward()?;
+        for (var, r, name) in [(&q, &qr, "dq"), (&k, &kr, "dk"), (&v, &vr, "dv")] {
+            let got = grads
+                .get(var.as_tensor())
+                .unwrap_or_else(|| panic!("no {name}"));
+            assert_eq!(got.dtype(), DType::BF16, "{name} dtype");
+            assert_eq!(got.dims(), &[b, h, t, hd], "{name} shape");
+            close(got, grads_ref.get(r.as_tensor()).unwrap(), name)?;
         }
         Ok(())
     }
